@@ -208,7 +208,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn list_windows(&self) -> rmcp::model::CallToolResult {
-        err_result("list_windows not yet implemented")
+        match crate::tools::window::list_windows() {
+            Ok(windows) => ok_text(serde_json::to_string_pretty(&windows).unwrap_or_default()),
+            Err(e) => err_result(&e),
+        }
     }
 
     #[tool(
@@ -217,7 +220,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn list_applications(&self) -> rmcp::model::CallToolResult {
-        err_result("list_applications not yet implemented")
+        match crate::tools::application::list_applications() {
+            Ok(apps) => ok_text(format!("Found {} applications", apps.len())),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -226,8 +232,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(app = %p.app), level = "info")]
     async fn open_application(&self, Parameters(p): Parameters<OpenAppParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("open_application not yet implemented")
+        match crate::tools::application::open_application(&p.app) {
+            Ok(()) => ok_text(format!("opened {}", p.app)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -236,7 +244,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn read_clipboard(&self) -> rmcp::model::CallToolResult {
-        err_result("read_clipboard not yet implemented")
+        match crate::tools::clipboard::read_clipboard() {
+            Ok(text) => ok_text(text),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -245,8 +256,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
     async fn write_clipboard(&self, Parameters(p): Parameters<TypeParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("write_clipboard not yet implemented")
+        match crate::tools::clipboard::write_clipboard(&p.text) {
+            Ok(()) => ok_text("written to clipboard"),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
