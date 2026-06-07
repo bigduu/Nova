@@ -55,3 +55,39 @@ impl ScreenCoord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_coord_to_logical_scales_up() {
+        let display = DisplayInfo {
+            id: 1,
+            width: 3840,
+            height: 2160,
+            scale_factor: 2.0,
+            is_primary: true,
+        };
+        let coord = ScreenCoord { x: 640.0, y: 360.0 };
+        let logical = coord.to_logical((1280.0, 720.0), &display);
+        // scale_x = 3840/1280 = 3.0, scale_y = 2160/720 = 3.0
+        assert_eq!(logical.x, 1920.0);
+        assert_eq!(logical.y, 1080.0);
+    }
+
+    #[test]
+    fn screen_coord_to_logical_at_origin() {
+        let display = DisplayInfo {
+            id: 1,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+            is_primary: true,
+        };
+        let coord = ScreenCoord { x: 0.0, y: 0.0 };
+        let logical = coord.to_logical((1920.0, 1080.0), &display);
+        assert_eq!(logical.x, 0.0);
+        assert_eq!(logical.y, 0.0);
+    }
+}

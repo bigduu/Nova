@@ -94,12 +94,14 @@ fn default_duration() -> f64 {
 impl NovaServer {
     #[tool(
         name = "screenshot",
-        description = "Take a screenshot of the primary display. Returns a base64-encoded PNG image."
+        description = "Take a screenshot of the primary display. Returns a base64-encoded JPEG image."
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn screenshot(&self, Parameters(_p): Parameters<ScreenshotParams>) -> rmcp::model::CallToolResult {
-        // TODO: implement with screencapturekit
-        err_result("screenshot not yet implemented")
+        match crate::tools::screenshot::take_screenshot() {
+            Ok(img) => ok_image(img.base64_data, img.mime_type),
+            Err(e) => err_result(&e),
+        }
     }
 
     #[tool(

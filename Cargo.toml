@@ -24,7 +24,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio = { version = "1", features = ["full"] }
 
 # Screenshot capture (Apple ScreenCaptureKit)
-screencapturekit = "7.0"
+screencapturekit = { version = "7.0", features = ["macos_14_0"] }
 
 # Mouse/keyboard events (CoreGraphics CGEvent)
 core-graphics = "0.25"

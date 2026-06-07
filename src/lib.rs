@@ -8,6 +8,8 @@
 //!
 //! Built on Apple's ScreenCaptureKit, CoreGraphics, and Accessibility APIs.
 
+pub mod capture;
+pub mod display;
 pub mod error;
 pub mod server;
 pub mod tools;
