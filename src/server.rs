@@ -16,10 +16,7 @@ pub fn err_result(msg: &str) -> rmcp::model::CallToolResult {
 
 /// Create a successful image result with proper MCP ImageContent.
 pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::success(vec![rmcp::model::Content::image(
-        base64_data,
-        mime_type,
-    )])
+    rmcp::model::CallToolResult::success(vec![rmcp::model::Content::image(base64_data, mime_type)])
 }
 
 // ── Server state ────────────────────────────────────────────────────
@@ -35,11 +32,23 @@ impl NovaServer {
     }
 }
 
+impl Default for NovaServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Convert screenshot-space coordinates (what the LLM sees) into the global
+/// logical points that mouse events are posted in.
+fn to_logical(x: f64, y: f64) -> (f64, f64) {
+    crate::display::geometry::screen_to_logical_coords(x, y)
+}
+
 // ── Tool implementations ────────────────────────────────────────────
 
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::tool;
 use rmcp::tool_router;
-use rmcp::handler::server::wrapper::Parameters;
 use serde::Deserialize;
 
 // Tool parameter types — all stub, to be fleshed out in implementation.
@@ -90,6 +99,12 @@ fn default_duration() -> f64 {
     1.0
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchParams {
+    /// Ordered list of input actions to execute in a single call.
+    pub actions: Vec<crate::tools::batch::BatchAction>,
+}
+
 #[tool_router(server_handler)]
 impl NovaServer {
     #[tool(
@@ -97,7 +112,10 @@ impl NovaServer {
         description = "Take a screenshot of the primary display. Returns a base64-encoded JPEG image."
     )]
     #[tracing::instrument(skip_all, level = "info")]
-    async fn screenshot(&self, Parameters(_p): Parameters<ScreenshotParams>) -> rmcp::model::CallToolResult {
+    async fn screenshot(
+        &self,
+        Parameters(_p): Parameters<ScreenshotParams>,
+    ) -> rmcp::model::CallToolResult {
         match crate::tools::screenshot::take_screenshot() {
             Ok(img) => ok_image(img.base64_data, img.mime_type),
             Err(e) => err_result(&e),
@@ -109,8 +127,12 @@ impl NovaServer {
         description = "Move the mouse cursor to the given (x, y) coordinates (in screenshot space)."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
-    async fn mouse_move(&self, Parameters(p): Parameters<MouseMoveParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::mouse_move(p.x, p.y) {
+    async fn mouse_move(
+        &self,
+        Parameters(p): Parameters<MouseMoveParams>,
+    ) -> rmcp::model::CallToolResult {
+        let (lx, ly) = to_logical(p.x, p.y);
+        match crate::tools::input::mouse_move(lx, ly) {
             Ok(()) => ok_text(format!("mouse moved to ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -121,8 +143,12 @@ impl NovaServer {
         description = "Left-click at the given (x, y) coordinates (in screenshot space)."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
-    async fn left_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::left_click_at(p.x, p.y) {
+    async fn left_click(
+        &self,
+        Parameters(p): Parameters<ClickParams>,
+    ) -> rmcp::model::CallToolResult {
+        let (lx, ly) = to_logical(p.x, p.y);
+        match crate::tools::input::left_click_at(lx, ly) {
             Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -133,8 +159,12 @@ impl NovaServer {
         description = "Right-click at the given (x, y) coordinates (in screenshot space)."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
-    async fn right_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::right_click_at(p.x, p.y) {
+    async fn right_click(
+        &self,
+        Parameters(p): Parameters<ClickParams>,
+    ) -> rmcp::model::CallToolResult {
+        let (lx, ly) = to_logical(p.x, p.y);
+        match crate::tools::input::right_click_at(lx, ly) {
             Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -145,10 +175,15 @@ impl NovaServer {
         description = "Double-click at the given (x, y) coordinates (in screenshot space)."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
-    async fn double_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::mouse_move(p.x, p.y)
-            .and_then(|_| { std::thread::sleep(std::time::Duration::from_millis(10)); crate::tools::input::double_click() })
-        {
+    async fn double_click(
+        &self,
+        Parameters(p): Parameters<ClickParams>,
+    ) -> rmcp::model::CallToolResult {
+        let (lx, ly) = to_logical(p.x, p.y);
+        match crate::tools::input::mouse_move(lx, ly).and_then(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::tools::input::double_click()
+        }) {
             Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -160,8 +195,15 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y, lines = %p.lines), level = "info")]
     async fn scroll(&self, Parameters(p): Parameters<ScrollParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::scroll(p.lines) {
-            Ok(()) => ok_text(format!("scrolled {} lines", p.lines)),
+        // Move to the requested position first so the scroll lands on the
+        // intended region, not wherever the cursor happened to be.
+        let (lx, ly) = to_logical(p.x, p.y);
+        let result = crate::tools::input::mouse_move(lx, ly).and_then(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::tools::input::scroll(p.lines)
+        });
+        match result {
+            Ok(()) => ok_text(format!("scrolled {} lines at ({}, {})", p.lines, p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -183,7 +225,10 @@ impl NovaServer {
         description = "Type a string of text into the currently focused element."
     )]
     #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
-    async fn type_text(&self, Parameters(p): Parameters<TypeParams>) -> rmcp::model::CallToolResult {
+    async fn type_text(
+        &self,
+        Parameters(p): Parameters<TypeParams>,
+    ) -> rmcp::model::CallToolResult {
         match crate::tools::input::type_text(&p.text) {
             Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
             Err(e) => err_result(&e.to_string()),
@@ -221,7 +266,7 @@ impl NovaServer {
     #[tracing::instrument(skip_all, level = "info")]
     async fn list_applications(&self) -> rmcp::model::CallToolResult {
         match crate::tools::application::list_applications() {
-            Ok(apps) => ok_text(format!("Found {} applications", apps.len())),
+            Ok(apps) => ok_text(serde_json::to_string_pretty(&apps).unwrap_or_default()),
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -231,7 +276,10 @@ impl NovaServer {
         description = "Launch or focus an application by name (e.g., \"Safari\", \"Slack\")."
     )]
     #[tracing::instrument(skip_all, fields(app = %p.app), level = "info")]
-    async fn open_application(&self, Parameters(p): Parameters<OpenAppParams>) -> rmcp::model::CallToolResult {
+    async fn open_application(
+        &self,
+        Parameters(p): Parameters<OpenAppParams>,
+    ) -> rmcp::model::CallToolResult {
         match crate::tools::application::open_application(&p.app) {
             Ok(()) => ok_text(format!("opened {}", p.app)),
             Err(e) => err_result(&e.to_string()),
@@ -255,7 +303,10 @@ impl NovaServer {
         description = "Write text to the system clipboard."
     )]
     #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
-    async fn write_clipboard(&self, Parameters(p): Parameters<TypeParams>) -> rmcp::model::CallToolResult {
+    async fn write_clipboard(
+        &self,
+        Parameters(p): Parameters<TypeParams>,
+    ) -> rmcp::model::CallToolResult {
         match crate::tools::clipboard::write_clipboard(&p.text) {
             Ok(()) => ok_text("written to clipboard"),
             Err(e) => err_result(&e.to_string()),
@@ -270,6 +321,24 @@ impl NovaServer {
     async fn wait(&self, Parameters(p): Parameters<WaitParams>) -> rmcp::model::CallToolResult {
         tokio::time::sleep(std::time::Duration::from_secs_f64(p.duration)).await;
         ok_text(format!("waited {:.1}s", p.duration))
+    }
+
+    #[tool(
+        name = "batch_actions",
+        description = "Execute a sequence of input actions (mouse_move, left_click, right_click, \
+                       double_click, scroll, key_combo, type_text, wait) in one call to reduce \
+                       round-trips. Coordinates are in screenshot space. Take a screenshot \
+                       separately afterwards to observe the result."
+    )]
+    #[tracing::instrument(skip_all, fields(count = %p.actions.len()), level = "info")]
+    async fn batch_actions(
+        &self,
+        Parameters(p): Parameters<BatchParams>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::tools::batch::execute_batch(p.actions).await {
+            Ok(results) => ok_text(results.join("\n")),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 }
 
@@ -291,8 +360,7 @@ pub async fn run_stdio() -> Result<()> {
 pub async fn run_http(addr: &str) -> Result<()> {
     use axum::Router;
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager,
-        tower::StreamableHttpService,
+        session::local::LocalSessionManager, tower::StreamableHttpService,
         StreamableHttpServerConfig,
     };
     use std::net::SocketAddr;
@@ -318,4 +386,69 @@ pub async fn run_http(addr: &str) -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tool the agent depends on must be registered. This is a hermetic
+    /// check (no system APIs) that guards against a handler being renamed,
+    /// dropped, or a new one being added without updating the contract.
+    #[test]
+    fn all_expected_tools_are_registered() {
+        let router = NovaServer::tool_router();
+        let expected = [
+            "screenshot",
+            "mouse_move",
+            "left_click",
+            "right_click",
+            "double_click",
+            "scroll",
+            "key_combo",
+            "type_text",
+            "cursor_position",
+            "list_windows",
+            "list_applications",
+            "open_application",
+            "read_clipboard",
+            "write_clipboard",
+            "wait",
+            "batch_actions",
+        ];
+        for name in expected {
+            assert!(router.has_route(name), "tool not registered: {name}");
+        }
+        assert_eq!(
+            router.list_all().len(),
+            expected.len(),
+            "tool count drifted from the documented contract"
+        );
+    }
+
+    #[test]
+    fn ok_text_is_success_with_payload() {
+        let result = ok_text("hello");
+        assert_eq!(result.is_error, Some(false));
+        let text = result.content[0].as_text().expect("text content");
+        assert_eq!(text.text, "hello");
+    }
+
+    #[test]
+    fn err_result_flags_is_error() {
+        let result = err_result("boom");
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().expect("text content");
+        assert_eq!(text.text, "boom");
+    }
+
+    #[test]
+    fn ok_image_carries_image_content() {
+        let result = ok_image("Zm9v".to_string(), "image/jpeg");
+        assert_eq!(result.is_error, Some(false));
+        assert!(
+            result.content[0].as_image().is_some(),
+            "expected image content"
+        );
+    }
 }

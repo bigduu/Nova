@@ -1,5 +1,7 @@
-# Needed because screencapturekit links against Swift libraries.
-# Without this, `cargo test` / `cargo run` will fail with
-#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
-[env]
-DYLD_FALLBACK_LIBRARY_PATH = { value = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx:/usr/lib/swift", relative = false }
+# The Swift-runtime load issue (screencapturekit references
+# @rpath/libswift_Concurrency.dylib) is handled by baking an LC_RPATH into the
+# binary from build.rs, so no DYLD_* environment shim is needed for `cargo
+# test`, `cargo run`, or a standalone binary. See build.rs for details.
+#
+# A `[env]` entry does NOT work for this: macOS strips DYLD_* variables that
+# cargo injects when spawning the test/run binary.

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    # Nova is macOS-only (ScreenCaptureKit / CoreGraphics), so CI must run on
+    # macOS. macos-15+ is required: a transitive dep (apple-metal) compiles a
+    # Swift bridge against macOS 15 Metal symbols (MTLLogState, MTLResidencySet,
+    # …) that the macos-14 SDK lacks.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # apple-metal's Swift bridge needs the macOS 15 SDK (Xcode 16+); the
+      # runner's default Xcode is older, so select the newest available.
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Runs unit + hermetic integration tests. The Screen-Recording e2e tests
+      # are #[ignore]d because GitHub runners have no granted capture permission;
+      # run them locally with `cargo test -- --include-ignored`.
+      - name: Test
+        run: cargo test --verbose

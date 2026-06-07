@@ -2,7 +2,7 @@
 ///
 /// Coordinates capture, image processing, and base64 encoding for MCP responses.
 use crate::capture::screenshot::capture_display;
-use crate::display::geometry::primary_display;
+use crate::display::geometry::screen_recording_available;
 
 /// Result of a screenshot tool call, ready for MCP.
 pub struct ScreenshotImage {
@@ -28,11 +28,12 @@ pub fn take_screenshot() -> Result<ScreenshotImage, String> {
 /// Check if screen recording permission is available.
 /// Call this early to give the user a clear error message.
 pub fn check_permission() -> Result<(), String> {
-    let _ = primary_display().ok_or_else(|| {
-        "Screen Recording permission not granted. \
-         Open System Settings → Privacy & Security → Screen Recording \
-         and enable the terminal/application running Nova."
-            .to_string()
-    })?;
-    Ok(())
+    if screen_recording_available() {
+        Ok(())
+    } else {
+        Err("Screen Recording permission not granted. \
+             Open System Settings → Privacy & Security → Screen Recording \
+             and enable the terminal/application running Nova."
+            .to_string())
+    }
 }

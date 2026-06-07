@@ -33,19 +33,10 @@ pub fn capture_display() -> Result<ScreenshotResult, String> {
     let display_width = display.width();
     let display_height = display.height();
 
-    // Compute target dimensions (max 1280px on longest edge)
-    let (target_w, target_h) = {
-        let max_edge = display_width.max(display_height);
-        if max_edge <= 1280 {
-            (display_width, display_height)
-        } else {
-            let scale = 1280.0 / max_edge as f64;
-            (
-                (display_width as f64 * scale).round() as u32,
-                (display_height as f64 * scale).round() as u32,
-            )
-        }
-    };
+    // Compute target dimensions (max 1280px on longest edge). Shared with the
+    // coordinate-conversion path so screenshot space and click space agree.
+    let target = crate::display::scaling::compute_target_dims(display_width, display_height);
+    let (target_w, target_h) = (target.width, target.height);
 
     // Build content filter for the display
     let filter = SCContentFilter::create()
@@ -66,13 +57,10 @@ pub fn capture_display() -> Result<ScreenshotResult, String> {
     let img_h = image.height() as u32;
 
     // Get RGBA raw data
-    let rgba = image
-        .rgba_data()
-        .map_err(|e| format!("rgba_data: {e}"))?;
+    let rgba = image.rgba_data().map_err(|e| format!("rgba_data: {e}"))?;
 
     // Convert RGBA to RGB JPEG using the image crate
-    let jpeg_bytes = rgb_to_jpeg(&rgba, img_w, img_h)
-        .map_err(|e| format!("encode: {e}"))?;
+    let jpeg_bytes = rgb_to_jpeg(&rgba, img_w, img_h).map_err(|e| format!("encode: {e}"))?;
 
     // Base64 encode
     let base64_image = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
@@ -89,8 +77,7 @@ fn rgb_to_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::I
     // Convert RGBA to RGB (discard alpha — CG renders opaque anyway)
     let rgb = rgba_to_rgb(rgba, width as usize, height as usize);
     let mut buf = Vec::new();
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
     encoder.encode(&rgb, width, height, image::ExtendedColorType::Rgb8)?;
     Ok(buf)
 }
@@ -101,7 +88,7 @@ pub(crate) fn rgba_to_rgb(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(pixel_count * 3);
     for i in 0..pixel_count {
         let offset = i * 4;
-        rgb.push(rgba[offset]);     // R
+        rgb.push(rgba[offset]); // R
         rgb.push(rgba[offset + 1]); // G
         rgb.push(rgba[offset + 2]); // B
     }

@@ -42,6 +42,14 @@ pub fn screen_to_logical(
     screenshot_dims: (f64, f64),
     display: &DisplayInfo,
 ) -> LogicalCoord {
+    // Guard against a degenerate (zero-sized) screenshot, which would otherwise
+    // produce inf/NaN coordinates and warp the cursor somewhere nonsensical.
+    if screenshot_dims.0 <= 0.0 || screenshot_dims.1 <= 0.0 {
+        return LogicalCoord {
+            x: coord.x,
+            y: coord.y,
+        };
+    }
     let scale_x = display.width as f64 / screenshot_dims.0;
     let scale_y = display.height as f64 / screenshot_dims.1;
     LogicalCoord {
@@ -108,6 +116,23 @@ mod tests {
         // y: 360 * (2160/720) = 360 * 3 = 1080
         assert_eq!(logical.x, 1920.0);
         assert_eq!(logical.y, 1080.0);
+    }
+
+    #[test]
+    fn screen_to_logical_zero_dims_returns_input_not_nan() {
+        let display = DisplayInfo {
+            id: 1,
+            width: 1920,
+            height: 1080,
+            scale_factor: 1.0,
+            is_primary: true,
+        };
+        let coord = ScreenCoord { x: 100.0, y: 200.0 };
+        let logical = screen_to_logical(coord, (0.0, 0.0), &display);
+        // Must not be inf/NaN — falls back to the input coordinate.
+        assert!(logical.x.is_finite() && logical.y.is_finite());
+        assert_eq!(logical.x, 100.0);
+        assert_eq!(logical.y, 200.0);
     }
 
     #[test]
