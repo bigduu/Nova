@@ -110,8 +110,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn mouse_move(&self, Parameters(p): Parameters<MouseMoveParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("mouse_move not yet implemented")
+        match crate::tools::input::mouse_move(p.x, p.y) {
+            Ok(()) => ok_text(format!("mouse moved to ({}, {})", p.x, p.y)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -120,8 +122,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn left_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("left_click not yet implemented")
+        match crate::tools::input::left_click_at(p.x, p.y) {
+            Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -130,8 +134,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn right_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("right_click not yet implemented")
+        match crate::tools::input::right_click_at(p.x, p.y) {
+            Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -140,8 +146,12 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn double_click(&self, Parameters(p): Parameters<ClickParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("double_click not yet implemented")
+        match crate::tools::input::mouse_move(p.x, p.y)
+            .and_then(|_| { std::thread::sleep(std::time::Duration::from_millis(10)); crate::tools::input::double_click() })
+        {
+            Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -150,8 +160,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y, lines = %p.lines), level = "info")]
     async fn scroll(&self, Parameters(p): Parameters<ScrollParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("scroll not yet implemented")
+        match crate::tools::input::scroll(p.lines) {
+            Ok(()) => ok_text(format!("scrolled {} lines", p.lines)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -160,8 +172,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(key = %p.key), level = "info")]
     async fn key_combo(&self, Parameters(p): Parameters<KeyParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("key_combo not yet implemented")
+        match crate::tools::input::key_combo(&p.key) {
+            Ok(()) => ok_text(format!("pressed {}", p.key)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
@@ -170,17 +184,22 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
     async fn type_text(&self, Parameters(p): Parameters<TypeParams>) -> rmcp::model::CallToolResult {
-        let _ = p;
-        err_result("type_text not yet implemented")
+        match crate::tools::input::type_text(&p.text) {
+            Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
         name = "cursor_position",
-        description = "Get the current mouse cursor position. Returns (x, y) in screenshot-space coordinates."
+        description = "Get the current mouse cursor position. Returns (x, y) in logical coordinates."
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn cursor_position(&self) -> rmcp::model::CallToolResult {
-        err_result("cursor_position not yet implemented")
+        match crate::tools::input::cursor_position() {
+            Ok((x, y)) => ok_text(format!("cursor at ({:.0}, {:.0})", x, y)),
+            Err(e) => err_result(&e.to_string()),
+        }
     }
 
     #[tool(
