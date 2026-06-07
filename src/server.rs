@@ -58,6 +58,30 @@ impl NovaServer {
     }
 }
 
+/// Render the Set-of-Mark list appended to the screenshot's text note.
+fn format_marks(marks: &[crate::capture::screenshot::Mark]) -> String {
+    if marks.is_empty() {
+        return "\nNo actionable elements detected (Accessibility permission may be missing)."
+            .to_string();
+    }
+    let mut s = format!(
+        "\n{} actionable elements (click a mark's center):",
+        marks.len()
+    );
+    for m in marks {
+        let label = if m.label.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", m.label)
+        };
+        s.push_str(&format!(
+            "\n  [{}] {}{} at ({:.0}, {:.0})",
+            m.number, m.role, label, m.x, m.y
+        ));
+    }
+    s
+}
+
 // ── Tool implementations ────────────────────────────────────────────
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -78,6 +102,12 @@ pub struct ScreenshotParams {
     /// click precision. Subsequent clicks map to this window automatically.
     #[serde(default)]
     pub window: Option<String>,
+    /// Set-of-Mark: draw numbered boxes over actionable UI elements (buttons,
+    /// links, fields) and return a list with each element's exact center. Click
+    /// a mark's listed center instead of estimating coordinates — the most
+    /// reliable targeting. Needs Accessibility permission. Defaults to false.
+    #[serde(default)]
+    pub marks: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -143,14 +173,14 @@ impl NovaServer {
                        context, better precision. Pass grid=true to overlay a labeled coordinate \
                        grid (pixel labels every 100px) to pin down a precise position."
     )]
-    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid), level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid, marks = %p.marks), level = "info")]
     async fn screenshot(
         &self,
         Parameters(p): Parameters<ScreenshotParams>,
     ) -> rmcp::model::CallToolResult {
         let captured = match &p.window {
-            Some(query) => crate::tools::screenshot::take_window_screenshot(query, p.grid),
-            None => crate::tools::screenshot::take_screenshot(p.grid),
+            Some(query) => crate::tools::screenshot::take_window_screenshot(query, p.grid, p.marks),
+            None => crate::tools::screenshot::take_screenshot(p.grid, p.marks),
         };
         match captured {
             Ok(img) => {
@@ -164,12 +194,15 @@ impl NovaServer {
                     Some(q) => format!("window matching {q:?}"),
                     None => "the main display".to_string(),
                 };
-                let note = format!(
+                let mut note = format!(
                     "Screenshot of {subject}, {w}x{h} px. Click/move/scroll coordinates use this \
                      image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left.",
                     w = img.width,
                     h = img.height,
                 );
+                if p.marks {
+                    note.push_str(&format_marks(&img.marks));
+                }
                 rmcp::model::CallToolResult::success(vec![
                     rmcp::model::Content::text(note),
                     rmcp::model::Content::image(img.base64_data, img.mime_type),

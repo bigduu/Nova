@@ -31,6 +31,8 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 
 # macOS Accessibility API (window/app introspection)
 accessibility = "0.2"
+accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
+core-foundation = "0.10"            # CFString/CFType — must match accessibility's
 
 # Image processing
 image = "0.25"

@@ -105,7 +105,7 @@ fn e2e_window_screenshot_produces_view_frame() {
         return;
     };
 
-    let shot = take_window_screenshot(&w.app_name, false).expect("window screenshot");
+    let shot = take_window_screenshot(&w.app_name, false, false).expect("window screenshot");
     assert!(shot.width > 0 && shot.height > 0, "empty window capture");
     assert!(
         shot.view.region.0 > 0.0 && shot.view.region.1 > 0.0,

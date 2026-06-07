@@ -31,6 +31,19 @@ impl ViewFrame {
             self.origin.1 + y / self.screenshot.1 * self.region.1,
         )
     }
+
+    /// Inverse of [`to_logical`](Self::to_logical): map a global logical point
+    /// to this image's pixel space. Used to place Set-of-Mark overlays for AX
+    /// elements (whose frames are in global logical points) onto the screenshot.
+    pub fn to_screenshot(&self, lx: f64, ly: f64) -> (f64, f64) {
+        if self.region.0 <= 0.0 || self.region.1 <= 0.0 {
+            return (lx - self.origin.0, ly - self.origin.1);
+        }
+        (
+            (lx - self.origin.0) / self.region.0 * self.screenshot.0,
+            (ly - self.origin.1) / self.region.1 * self.screenshot.1,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -62,6 +75,21 @@ mod tests {
         assert_eq!(f.to_logical(400.0, 300.0), (1400.0, 500.0));
         // Top-left of the image -> the window's origin.
         assert_eq!(f.to_logical(0.0, 0.0), (1000.0, 200.0));
+    }
+
+    #[test]
+    fn to_screenshot_is_inverse_of_to_logical() {
+        let f = ViewFrame {
+            origin: (100.0, 50.0),
+            region: (1600.0, 1000.0),
+            screenshot: (1280.0, 800.0),
+        };
+        // A logical point round-trips back to the same screenshot pixel.
+        let (lx, ly) = f.to_logical(640.0, 400.0);
+        let (sx, sy) = f.to_screenshot(lx, ly);
+        assert!((sx - 640.0).abs() < 1e-6 && (sy - 400.0).abs() < 1e-6);
+        // The region origin maps to the image origin.
+        assert_eq!(f.to_screenshot(100.0, 50.0), (0.0, 0.0));
     }
 
     #[test]

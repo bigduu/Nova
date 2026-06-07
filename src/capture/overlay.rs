@@ -17,6 +17,7 @@ const LABEL_SCALE: u32 = 2;
 const GRID_COLOR: Rgb<u8> = Rgb([255, 0, 255]); // magenta rules
 const LABEL_FG: Rgb<u8> = Rgb([255, 255, 0]); // yellow digits
 const LABEL_BG: Rgb<u8> = Rgb([0, 0, 0]); // dark backing for legibility
+const MARK_COLOR: Rgb<u8> = Rgb([0, 230, 0]); // green Set-of-Mark boxes
 
 /// 3x5 bitmaps for digits 0-9. Each row's low 3 bits are pixels (bit2=left).
 const DIGITS: [[u8; 5]; 10] = [
@@ -97,6 +98,34 @@ fn draw_number(img: &mut RgbImage, x: u32, y: u32, n: u32, scale: u32) {
     }
 }
 
+/// Draw the outline of a rectangle (inclusive corners).
+fn draw_rect_outline(img: &mut RgbImage, x0: u32, y0: u32, x1: u32, y1: u32, color: Rgb<u8>) {
+    for x in x0..=x1 {
+        set_px(img, x, y0, color);
+        set_px(img, x, y1, color);
+    }
+    for y in y0..=y1 {
+        set_px(img, x0, y, color);
+        set_px(img, x1, y, color);
+    }
+}
+
+/// Draw a Set-of-Mark annotation: a box around an element's screenshot-space
+/// bounds plus its `number` label in the top-left corner. Coordinates are
+/// clamped to the image; off-image marks are skipped.
+pub fn draw_mark(img: &mut RgbImage, x: f64, y: f64, w: f64, h: f64, number: u32) {
+    let (iw, ih) = (img.width() as f64, img.height() as f64);
+    let x0 = x.clamp(0.0, iw - 1.0) as u32;
+    let y0 = y.clamp(0.0, ih - 1.0) as u32;
+    let x1 = (x + w).clamp(0.0, iw - 1.0) as u32;
+    let y1 = (y + h).clamp(0.0, ih - 1.0) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    draw_rect_outline(img, x0, y0, x1, y1, MARK_COLOR);
+    draw_number(img, x0 + 1, y0 + 1, number, LABEL_SCALE);
+}
+
 /// Overlay a labeled coordinate grid on the image, in place.
 pub fn draw_grid(img: &mut RgbImage) {
     let (w, h) = (img.width(), img.height());
@@ -154,5 +183,25 @@ mod tests {
         // Smaller than one grid step — must not panic, just no rules.
         let mut img = RgbImage::from_pixel(40, 30, Rgb([0, 0, 0]));
         draw_grid(&mut img);
+    }
+
+    #[test]
+    fn draw_mark_outlines_and_labels() {
+        let mut img = RgbImage::from_pixel(200, 150, Rgb([0, 0, 0]));
+        draw_mark(&mut img, 50.0, 40.0, 60.0, 30.0, 7);
+        // Top edge of the box should be green at the mark color.
+        assert_eq!(img.get_pixel(80, 40).0, MARK_COLOR.0);
+        // A label was drawn inside the top-left corner.
+        let labeled = (51..63).any(|x| (41..53).any(|y| img.get_pixel(x, y).0 != [0, 0, 0]));
+        assert!(labeled, "expected a number label inside the mark");
+    }
+
+    #[test]
+    fn draw_mark_clamps_offscreen_without_panicking() {
+        let mut img = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
+        // Partly off the right/bottom edge — must clamp, not panic.
+        draw_mark(&mut img, 80.0, 80.0, 100.0, 100.0, 12);
+        // Fully off-screen — skipped.
+        draw_mark(&mut img, 500.0, 500.0, 20.0, 20.0, 99);
     }
 }
