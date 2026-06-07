@@ -28,8 +28,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    tracing::info!("Nova Computer Use MCP Server v{}", env!("CARGO_PKG_VERSION"));
-    tracing::info!("Transport: {}", if cli.http { "Streamable HTTP" } else { "stdio" });
+    tracing::info!(
+        "Nova Computer Use MCP Server v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    tracing::info!(
+        "Transport: {}",
+        if cli.http { "Streamable HTTP" } else { "stdio" }
+    );
 
     if cli.http {
         nova::server::run_http(&cli.addr).await

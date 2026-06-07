@@ -22,10 +22,14 @@ pub fn list_applications() -> Result<Vec<ApplicationInfo>> {
     let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
+        // The `application-bundle` content type also matches non-`.app`
+        // directories Spotlight has tagged (e.g. CocoaPods test fixtures), which
+        // are not launchable apps. Keep only real `.app` bundles.
+        .filter(|l| l.ends_with(".app"))
         .map(|l| l.to_string())
         .collect();
 
-    let apps: Vec<ApplicationInfo> = paths
+    let mut apps: Vec<ApplicationInfo> = paths
         .into_iter()
         .filter_map(|path| {
             let name = std::path::Path::new(&path)
@@ -39,6 +43,10 @@ pub fn list_applications() -> Result<Vec<ApplicationInfo>> {
             })
         })
         .collect();
+
+    // Stable, de-duplicated ordering so the agent gets a predictable list.
+    apps.sort_by_key(|a| a.name.to_lowercase());
+    apps.dedup_by(|a, b| a.name == b.name && a.path == b.path);
 
     Ok(apps)
 }

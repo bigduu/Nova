@@ -43,11 +43,7 @@ pub fn cursor_position() -> Result<(f64, f64)> {
 // ── Mouse clicks ────────────────────────────────────────────────────
 
 /// Create and post a mouse event at the given position.
-fn post_mouse_event(
-    event_type: CGEventType,
-    button: CGMouseButton,
-    pos: CGPoint,
-) -> Result<()> {
+fn post_mouse_event(event_type: CGEventType, button: CGMouseButton, pos: CGPoint) -> Result<()> {
     let source = event_source()?;
     let event = CGEvent::new_mouse_event(source, event_type, pos, button)
         .map_err(|_| NovaError::Input("failed to create mouse event".into()))?;
@@ -144,34 +140,38 @@ pub fn left_click_drag(start: (f64, f64), end: (f64, f64), steps: Option<u32>) -
 
 // ── Scrolling ───────────────────────────────────────────────────────
 
-/// Scroll by the given number of lines.
+/// Scroll vertically by the given number of lines.
 /// Positive lines = up (content moves up, scrollbar moves down).
 /// Negative lines = down.
+///
+/// CGEvent scroll wheels are ordered (wheel1 = vertical/y, wheel2 =
+/// horizontal/x, wheel3 = z), so the vertical delta goes in wheel1.
 pub fn scroll(lines: i32) -> Result<()> {
     let source = event_source()?;
     let event = CGEvent::new_scroll_event(
         source,
         ScrollEventUnit::LINE,
-        2,      // wheel_count: 2 axes (vertical only for now)
-        0,      // wheel1: horizontal (unused)
-        lines,  // wheel2: vertical
-        0,      // wheel3: unused
+        2,     // wheel_count
+        lines, // wheel1: vertical
+        0,     // wheel2: horizontal (unused)
+        0,     // wheel3: unused
     )
     .map_err(|_| NovaError::Input("failed to create scroll event".into()))?;
     event.post(CGEventTapLocation::HID);
     Ok(())
 }
 
-/// Horizontal scroll by the given number of lines.
+/// Scroll horizontally by the given number of lines.
+/// Positive lines = right, negative = left. (wheel2 = horizontal/x axis.)
 pub fn scroll_horizontal(lines: i32) -> Result<()> {
     let source = event_source()?;
     let event = CGEvent::new_scroll_event(
         source,
         ScrollEventUnit::LINE,
-        2,
-        lines, // wheel1: horizontal
-        0,     // wheel2: vertical (unused)
-        0,
+        2,     // wheel_count
+        0,     // wheel1: vertical (unused)
+        lines, // wheel2: horizontal
+        0,     // wheel3: unused
     )
     .map_err(|_| NovaError::Input("failed to create scroll event".into()))?;
     event.post(CGEventTapLocation::HID);
@@ -184,18 +184,53 @@ pub fn scroll_horizontal(lines: i32) -> Result<()> {
 /// See: <https://web.archive.org/web/20100501161453/http://www.classicteck.com/rbarticles/mackeyboard.php>
 fn key_name_to_code(name: &str) -> Option<u16> {
     match name.to_lowercase().as_str() {
-        "a" => Some(0), "s" => Some(1), "d" => Some(2), "f" => Some(3),
-        "h" => Some(4), "g" => Some(5), "z" => Some(6), "x" => Some(7),
-        "c" => Some(8), "v" => Some(9), "b" => Some(11), "q" => Some(12),
-        "w" => Some(13), "e" => Some(14), "r" => Some(15), "y" => Some(16),
-        "t" => Some(17), "1" => Some(18), "2" => Some(19), "3" => Some(20),
-        "4" => Some(21), "6" => Some(22), "5" => Some(23), "=" => Some(24),
-        "9" => Some(25), "7" => Some(26), "-" => Some(27), "8" => Some(28),
-        "0" => Some(29), "]" => Some(30), "o" => Some(31), "u" => Some(32),
-        "[" => Some(33), "i" => Some(34), "p" => Some(35), "l" => Some(37),
-        "j" => Some(38), "'" => Some(39), "k" => Some(40), ";" => Some(41),
-        "\\" => Some(42), "," => Some(43), "/" => Some(44), "n" => Some(45),
-        "m" => Some(46), "." => Some(47), "`" => Some(50),
+        "a" => Some(0),
+        "s" => Some(1),
+        "d" => Some(2),
+        "f" => Some(3),
+        "h" => Some(4),
+        "g" => Some(5),
+        "z" => Some(6),
+        "x" => Some(7),
+        "c" => Some(8),
+        "v" => Some(9),
+        "b" => Some(11),
+        "q" => Some(12),
+        "w" => Some(13),
+        "e" => Some(14),
+        "r" => Some(15),
+        "y" => Some(16),
+        "t" => Some(17),
+        "1" => Some(18),
+        "2" => Some(19),
+        "3" => Some(20),
+        "4" => Some(21),
+        "6" => Some(22),
+        "5" => Some(23),
+        "=" => Some(24),
+        "9" => Some(25),
+        "7" => Some(26),
+        "-" => Some(27),
+        "8" => Some(28),
+        "0" => Some(29),
+        "]" => Some(30),
+        "o" => Some(31),
+        "u" => Some(32),
+        "[" => Some(33),
+        "i" => Some(34),
+        "p" => Some(35),
+        "l" => Some(37),
+        "j" => Some(38),
+        "'" => Some(39),
+        "k" => Some(40),
+        ";" => Some(41),
+        "\\" => Some(42),
+        "," => Some(43),
+        "/" => Some(44),
+        "n" => Some(45),
+        "m" => Some(46),
+        "." => Some(47),
+        "`" => Some(50),
         "return" | "enter" => Some(36),
         "tab" => Some(48),
         "space" => Some(49),
@@ -210,13 +245,24 @@ fn key_name_to_code(name: &str) -> Option<u16> {
         "right_option" | "right_alt" => Some(61),
         "right_control" | "right_ctrl" => Some(62),
         "fn" | "function" => Some(63),
-        "f1" => Some(122), "f2" => Some(120), "f3" => Some(99),
-        "f4" => Some(118), "f5" => Some(96), "f6" => Some(97),
-        "f7" => Some(98), "f8" => Some(100), "f9" => Some(101),
-        "f10" => Some(109), "f11" => Some(103), "f12" => Some(111),
-        "left" => Some(123), "right" => Some(124),
-        "down" => Some(125), "up" => Some(126),
-        "home" => Some(115), "end" => Some(119),
+        "f1" => Some(122),
+        "f2" => Some(120),
+        "f3" => Some(99),
+        "f4" => Some(118),
+        "f5" => Some(96),
+        "f6" => Some(97),
+        "f7" => Some(98),
+        "f8" => Some(100),
+        "f9" => Some(101),
+        "f10" => Some(109),
+        "f11" => Some(103),
+        "f12" => Some(111),
+        "left" => Some(123),
+        "right" => Some(124),
+        "down" => Some(125),
+        "up" => Some(126),
+        "home" => Some(115),
+        "end" => Some(119),
         "page_up" | "pgup" => Some(116),
         "page_down" | "pgdn" => Some(121),
         _ => None,
@@ -243,22 +289,37 @@ fn tap_key(keycode: u16) -> Result<()> {
 fn is_modifier(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "cmd" | "command" | "shift" | "option" | "alt" | "control" | "ctrl"
-            | "right_shift" | "right_option" | "right_alt" | "right_control" | "right_ctrl"
+        "cmd"
+            | "command"
+            | "shift"
+            | "option"
+            | "alt"
+            | "control"
+            | "ctrl"
+            | "right_shift"
+            | "right_option"
+            | "right_alt"
+            | "right_control"
+            | "right_ctrl"
     )
 }
 
-/// Simulate a key combination (e.g., "cmd+c", "shift+tab", "ctrl+cmd+f").
-pub fn key_combo(combo: &str) -> Result<()> {
-    let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
-    let mut modifiers: Vec<&str> = Vec::new();
-    let mut keys: Vec<&str> = Vec::new();
+/// Parse a key combination string into (modifier keycodes, main keycodes).
+///
+/// Splits on `+`, classifies each token as modifier or main key, and resolves
+/// keycodes. Errors on an unknown key or when no main (non-modifier) key is
+/// present (e.g. `"cmd"` alone). Empty tokens (from a trailing `+`) are ignored.
+fn parse_combo(combo: &str) -> Result<(Vec<u16>, Vec<u16>)> {
+    let mut modifiers: Vec<u16> = Vec::new();
+    let mut keys: Vec<u16> = Vec::new();
 
-    for &k in &parts {
-        if is_modifier(k) {
-            modifiers.push(k);
+    for token in combo.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let code = key_name_to_code(token)
+            .ok_or_else(|| NovaError::Input(format!("unknown key: {token}")))?;
+        if is_modifier(token) {
+            modifiers.push(code);
         } else {
-            keys.push(k);
+            keys.push(code);
         }
     }
 
@@ -266,29 +327,28 @@ pub fn key_combo(combo: &str) -> Result<()> {
         return Err(NovaError::Input(format!("no main key in combo: {combo}")));
     }
 
+    Ok((modifiers, keys))
+}
+
+/// Simulate a key combination (e.g., "cmd+c", "shift+tab", "ctrl+cmd+f").
+pub fn key_combo(combo: &str) -> Result<()> {
+    let (modifiers, keys) = parse_combo(combo)?;
+
     // Press modifiers
-    for &m in &modifiers {
-        if let Some(code) = key_name_to_code(m) {
-            post_key(code, true)?;
-        }
+    for &code in &modifiers {
+        post_key(code, true)?;
     }
     thread::sleep(Duration::from_millis(2));
 
     // Press and release main keys
-    for &k in &keys {
-        if let Some(code) = key_name_to_code(k) {
-            tap_key(code)?;
-        } else {
-            return Err(NovaError::Input(format!("unknown key: {k}")));
-        }
+    for &code in &keys {
+        tap_key(code)?;
     }
     thread::sleep(Duration::from_millis(2));
 
     // Release modifiers (reverse order)
-    for &m in modifiers.iter().rev() {
-        if let Some(code) = key_name_to_code(m) {
-            post_key(code, false)?;
-        }
+    for &code in modifiers.iter().rev() {
+        post_key(code, false)?;
     }
 
     Ok(())
@@ -296,8 +356,8 @@ pub fn key_combo(combo: &str) -> Result<()> {
 
 /// Hold a key down for N milliseconds, then release.
 pub fn hold_key(key: &str, duration_ms: u64) -> Result<()> {
-    let code = key_name_to_code(key)
-        .ok_or_else(|| NovaError::Input(format!("unknown key: {key}")))?;
+    let code =
+        key_name_to_code(key).ok_or_else(|| NovaError::Input(format!("unknown key: {key}")))?;
 
     post_key(code, true)?;
     thread::sleep(Duration::from_millis(duration_ms));
@@ -306,41 +366,196 @@ pub fn hold_key(key: &str, duration_ms: u64) -> Result<()> {
 
 // ── Type text ───────────────────────────────────────────────────────
 
+/// Map a printable character to a (keycode, needs_shift) pair on a US layout.
+///
+/// Covers letters, digits, whitespace, and the ASCII punctuation reachable from
+/// the US keyboard — including the shifted symbols (`@ : ? "` …) that an agent
+/// routinely needs to type emails, URLs, and JSON. Returns `None` for anything
+/// not directly typable (e.g. non-ASCII), which the caller surfaces as an error.
+fn char_to_keystroke(ch: char) -> Option<(u16, bool)> {
+    // Whitespace and direct keys.
+    match ch {
+        ' ' => return Some((49, false)),         // space
+        '\n' | '\r' => return Some((36, false)), // return
+        '\t' => return Some((48, false)),        // tab
+        _ => {}
+    }
+
+    // Uppercase letters: lowercase keycode + shift.
+    if ch.is_ascii_uppercase() {
+        return key_name_to_code(&ch.to_ascii_lowercase().to_string()).map(|c| (c, true));
+    }
+
+    // Shifted symbols map onto an unshifted base key + shift.
+    let shifted_base = match ch {
+        '!' => Some("1"),
+        '@' => Some("2"),
+        '#' => Some("3"),
+        '$' => Some("4"),
+        '%' => Some("5"),
+        '^' => Some("6"),
+        '&' => Some("7"),
+        '*' => Some("8"),
+        '(' => Some("9"),
+        ')' => Some("0"),
+        '_' => Some("-"),
+        '+' => Some("="),
+        '{' => Some("["),
+        '}' => Some("]"),
+        '|' => Some("\\"),
+        ':' => Some(";"),
+        '"' => Some("'"),
+        '<' => Some(","),
+        '>' => Some("."),
+        '?' => Some("/"),
+        '~' => Some("`"),
+        _ => None,
+    };
+    if let Some(base) = shifted_base {
+        return key_name_to_code(base).map(|c| (c, true));
+    }
+
+    // Everything else (lowercase letters, digits, and unshifted punctuation
+    // like `- = [ ] ; ' \ , . / ` `) resolves directly.
+    key_name_to_code(&ch.to_string()).map(|c| (c, false))
+}
+
 /// Type a string of text into the currently focused element.
 ///
-/// This sends raw keyboard events for each character.
-/// For more reliable text input, consider using the accessibility API
-/// or clipboard paste approach for long strings.
+/// This sends raw keyboard events for each character (US layout). For long
+/// strings or non-ASCII text, prefer setting the clipboard and pasting.
 pub fn type_text(text: &str) -> Result<()> {
+    let shift = key_name_to_code("shift").expect("shift keycode is defined");
     for ch in text.chars() {
-        let key_str = match ch {
-            ' ' => "space",
-            '\n' | '\r' => "return",
-            '\t' => "tab",
-            _ => {
-                // For uppercase letters, we need shift
-                if ch.is_ascii_uppercase() {
-                    let lower = ch.to_ascii_lowercase();
-                    let code = key_name_to_code(&lower.to_string())
-                        .ok_or_else(|| NovaError::Input(format!("cannot type: {ch}")))?;
-                    // Press shift
-                    if let Some(shift_code) = key_name_to_code("shift") {
-                        post_key(shift_code, true)?;
-                        thread::sleep(Duration::from_millis(1));
-                        tap_key(code)?;
-                        post_key(shift_code, false)?;
-                    }
-                    continue;
-                } else {
-                    &ch.to_string()
-                }
-            }
-        };
-        if let Some(code) = key_name_to_code(key_str) {
+        let (code, needs_shift) = char_to_keystroke(ch)
+            .ok_or_else(|| NovaError::Input(format!("cannot type character: {ch:?}")))?;
+        if needs_shift {
+            post_key(shift, true)?;
+            thread::sleep(Duration::from_millis(1));
             tap_key(code)?;
+            post_key(shift, false)?;
         } else {
-            return Err(NovaError::Input(format!("cannot type character: {ch}")));
+            tap_key(code)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── key_name_to_code / is_modifier ──────────────────────────────
+
+    #[test]
+    fn key_name_to_code_is_case_insensitive_and_aliased() {
+        assert_eq!(key_name_to_code("a"), Some(0));
+        assert_eq!(key_name_to_code("A"), Some(0));
+        assert_eq!(key_name_to_code("Return"), key_name_to_code("enter"));
+        assert_eq!(key_name_to_code("esc"), key_name_to_code("escape"));
+        assert_eq!(key_name_to_code("ctrl"), key_name_to_code("control"));
+        assert_eq!(key_name_to_code("not_a_key"), None);
+    }
+
+    #[test]
+    fn is_modifier_recognizes_modifier_aliases_only() {
+        for m in [
+            "cmd", "command", "shift", "option", "alt", "ctrl", "control",
+        ] {
+            assert!(is_modifier(m), "{m} should be a modifier");
+        }
+        for k in ["a", "enter", "f1", "space"] {
+            assert!(!is_modifier(k), "{k} should not be a modifier");
+        }
+    }
+
+    // ── parse_combo ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_combo_splits_modifiers_and_main_key() {
+        let (mods, keys) = parse_combo("cmd+c").unwrap();
+        assert_eq!(mods, vec![55]); // cmd
+        assert_eq!(keys, vec![8]); // c
+    }
+
+    #[test]
+    fn parse_combo_supports_multiple_modifiers() {
+        let (mods, keys) = parse_combo("ctrl+cmd+f").unwrap();
+        assert_eq!(mods, vec![59, 55]); // ctrl, cmd
+        assert_eq!(keys, vec![3]); // f
+    }
+
+    #[test]
+    fn parse_combo_is_whitespace_and_trailing_plus_tolerant() {
+        let (mods, keys) = parse_combo(" shift + tab +").unwrap();
+        assert_eq!(mods, vec![56]); // shift
+        assert_eq!(keys, vec![48]); // tab
+    }
+
+    #[test]
+    fn parse_combo_rejects_modifier_only() {
+        let err = parse_combo("cmd").unwrap_err();
+        assert!(err.to_string().contains("no main key"), "{err}");
+    }
+
+    #[test]
+    fn parse_combo_rejects_unknown_key() {
+        let err = parse_combo("cmd+nope").unwrap_err();
+        assert!(err.to_string().contains("unknown key"), "{err}");
+    }
+
+    // ── char_to_keystroke ───────────────────────────────────────────
+
+    #[test]
+    fn char_to_keystroke_letters_and_case() {
+        assert_eq!(char_to_keystroke('a'), Some((0, false)));
+        assert_eq!(char_to_keystroke('A'), Some((0, true)));
+    }
+
+    #[test]
+    fn char_to_keystroke_digits_unshifted() {
+        assert_eq!(char_to_keystroke('1'), Some((18, false)));
+        assert_eq!(char_to_keystroke('0'), Some((29, false)));
+    }
+
+    #[test]
+    fn char_to_keystroke_whitespace() {
+        assert_eq!(char_to_keystroke(' '), Some((49, false)));
+        assert_eq!(char_to_keystroke('\n'), Some((36, false)));
+        assert_eq!(char_to_keystroke('\t'), Some((48, false)));
+    }
+
+    #[test]
+    fn char_to_keystroke_shifted_symbols() {
+        // These are exactly the chars the old type_text could not produce.
+        assert_eq!(char_to_keystroke('@'), Some((19, true))); // shift+2
+        assert_eq!(char_to_keystroke('!'), Some((18, true))); // shift+1
+        assert_eq!(char_to_keystroke(':'), Some((41, true))); // shift+;
+        assert_eq!(char_to_keystroke('?'), Some((44, true))); // shift+/
+        assert_eq!(char_to_keystroke('"'), Some((39, true))); // shift+'
+        assert_eq!(char_to_keystroke('_'), Some((27, true))); // shift+-
+    }
+
+    #[test]
+    fn char_to_keystroke_unshifted_punctuation() {
+        assert_eq!(char_to_keystroke('-'), Some((27, false)));
+        assert_eq!(char_to_keystroke('.'), Some((47, false)));
+        assert_eq!(char_to_keystroke(';'), Some((41, false)));
+        assert_eq!(char_to_keystroke('/'), Some((44, false)));
+    }
+
+    #[test]
+    fn char_to_keystroke_covers_a_realistic_email() {
+        // Regression guard: "user.name@example.com" must be fully typable.
+        for ch in "user.name@example.com".chars() {
+            assert!(char_to_keystroke(ch).is_some(), "cannot type {ch:?}");
+        }
+    }
+
+    #[test]
+    fn char_to_keystroke_rejects_non_ascii() {
+        assert_eq!(char_to_keystroke('é'), None);
+        assert_eq!(char_to_keystroke('中'), None);
+        assert_eq!(char_to_keystroke('€'), None);
+    }
 }
