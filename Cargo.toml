@@ -1,0 +1,57 @@
+[package]
+name = "nova"
+version = "0.1.0"
+edition = "2021"
+description = "Computer Use MCP server — macOS desktop control for LLM agents. Screenshots, mouse, keyboard, window management, and app introspection."
+license = "MIT"
+repository = "https://github.com/bigduu/Nova"
+keywords = ["mcp", "macos", "computer-use", "automation", "screenshot"]
+categories = ["command-line-utilities", "os::macos-apis"]
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+# MCP protocol
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+
+# HTTP server (for Streamable HTTP transport)
+axum = "0.8"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Screenshot capture (Apple ScreenCaptureKit)
+screencapturekit = "7.0"
+
+# Mouse/keyboard events (CoreGraphics CGEvent)
+core-graphics = "0.25"
+
+# macOS Accessibility API (window/app introspection)
+accessibility = "0.2"
+
+# Image processing
+image = "0.25"
+
+# Encoding
+base64 = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error helpers
+anyhow = "1"
