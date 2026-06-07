@@ -19,6 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # apple-metal's Swift bridge needs the macOS 15 SDK (Xcode 16+); the
+      # runner's default Xcode is older, so select the newest available.
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
