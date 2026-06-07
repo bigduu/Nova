@@ -348,10 +348,17 @@ impl NovaServer {
 pub async fn run_stdio() -> Result<()> {
     tracing::info!("Starting Nova MCP server on stdio...");
 
-    let _server = NovaServer::new()
+    // `serve` only completes the initialize handshake and returns a running
+    // service handle; the serve loop lives on that handle. Dropping it cancels
+    // the service (RunningService's Drop), so we must await `waiting()` to keep
+    // the process alive until the client disconnects.
+    let service = NovaServer::new()
         .serve(rmcp::transport::io::stdio())
         .await
-        .context("stdio server failed")?;
+        .context("stdio server failed to initialize")?;
+
+    let quit_reason = service.waiting().await.context("stdio server error")?;
+    tracing::info!("Nova MCP server stopped: {quit_reason:?}");
 
     Ok(())
 }
