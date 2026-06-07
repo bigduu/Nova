@@ -86,3 +86,31 @@ fn e2e_capture_dims_match_target_dims_contract() {
         display.height,
     );
 }
+
+/// Single-window capture should produce a valid image and a view frame whose
+/// region matches the window's logical size, so clicks map back correctly.
+/// Smoke test: picks the first reasonably-sized on-screen window.
+#[test]
+#[ignore = "requires Screen Recording permission in System Settings"]
+fn e2e_window_screenshot_produces_view_frame() {
+    use nova::tools::screenshot::take_window_screenshot;
+    use nova::tools::window::list_windows;
+
+    let windows = list_windows().expect("list_windows");
+    let Some(w) = windows
+        .iter()
+        .find(|w| !w.app_name.is_empty() && w.width > 80.0 && w.height > 80.0)
+    else {
+        eprintln!("no suitable window to capture; skipping");
+        return;
+    };
+
+    let shot = take_window_screenshot(&w.app_name, false).expect("window screenshot");
+    assert!(shot.width > 0 && shot.height > 0, "empty window capture");
+    assert!(
+        shot.view.region.0 > 0.0 && shot.view.region.1 > 0.0,
+        "view frame region must be positive"
+    );
+    // The image must fit within the 1280px cap like display captures.
+    assert!(shot.width.max(shot.height) <= 1280);
+}

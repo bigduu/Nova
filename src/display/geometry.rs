@@ -6,6 +6,7 @@
 /// Screen-recording *permission* is a separate concern, detected via
 /// ScreenCaptureKit (see [`screen_recording_available`]).
 use crate::display::scaling::{compute_target_dims, screen_to_logical};
+use crate::display::view::ViewFrame;
 use crate::types::{DisplayInfo, ScreenCoord};
 use core_graphics::display::CGDisplay;
 use screencapturekit::shareable_content::SCShareableContent;
@@ -49,6 +50,19 @@ pub fn screen_to_logical_coords(x: f64, y: f64) -> (f64, f64) {
         &display,
     );
     (logical.x, logical.y)
+}
+
+/// The [`ViewFrame`] for a full-display screenshot of the main display — the
+/// default coordinate frame when no window has been captured.
+pub fn display_view_frame() -> ViewFrame {
+    let display = primary_display();
+    let dims = compute_target_dims(display.width, display.height);
+    ViewFrame {
+        // The main display is at the global origin by macOS definition.
+        origin: (0.0, 0.0),
+        region: (display.width as f64, display.height as f64),
+        screenshot: (dims.width as f64, dims.height as f64),
+    }
 }
 
 /// Whether Screen Recording permission is granted (and capture is possible).
