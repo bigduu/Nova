@@ -26,6 +26,25 @@ cargo run -- --http --addr 0.0.0.0:8080
 > baked in by `build.rs`, so no `DYLD_*` environment variable is needed for
 > `cargo run`/`cargo test` or the standalone binary.
 
+## Coordinate grounding
+
+A general LLM judging pixel coordinates off a downscaled screenshot is the main
+source of mis-clicks. The `screenshot` tool returns a text note with the image's
+exact dimensions and the coordinate contract, and offers three options to make
+targeting precise. **All click/move/scroll tools work in the pixel space of the
+last screenshot** — the server remembers that frame and maps clicks back to the
+real screen, so the model just "clicks what it sees".
+
+- `window: "<name>"` — capture a single window (substring of its title or app
+  name) instead of the whole display. Smaller, sharper image → less context and
+  far less downscaling → better precision. Later clicks map into that window.
+- `grid: true` — overlay a labeled coordinate grid (rules + pixel labels every
+  100px) so the model can read positions straight off the axes.
+- `marks: true` — **Set-of-Mark**: draw numbered boxes over actionable UI
+  elements (via the Accessibility tree) and return a list with each element's
+  exact center. The model clicks a mark's listed center — the most reliable
+  targeting. Needs Accessibility permission; degrades to no marks without it.
+
 ## Testing
 
 The suite is split into fast, hermetic tests (run by default) and side-effecting
