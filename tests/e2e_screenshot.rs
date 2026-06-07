@@ -11,7 +11,7 @@ use nova::capture::screenshot::capture_display;
 #[ignore = "requires Screen Recording permission in System Settings"]
 fn e2e_capture_display_returns_valid_jpeg() {
     let result = capture_display().expect("capture_display should succeed with permissions");
-    
+
     // Verify dimensions
     assert!(result.width > 0, "image width must be positive");
     assert!(result.height > 0, "image height must be positive");
@@ -23,7 +23,10 @@ fn e2e_capture_display_returns_valid_jpeg() {
     );
 
     // Verify base64 is non-empty
-    assert!(!result.base64_image.is_empty(), "base64 image must not be empty");
+    assert!(
+        !result.base64_image.is_empty(),
+        "base64 image must not be empty"
+    );
 
     // Decode and verify it's a valid JPEG
     let jpeg_bytes = base64::engine::general_purpose::STANDARD
@@ -32,12 +35,17 @@ fn e2e_capture_display_returns_valid_jpeg() {
     assert!(!jpeg_bytes.is_empty(), "decoded JPEG must not be empty");
 
     // JPEG magic bytes
-    assert_eq!(jpeg_bytes[0], 0xFF, "JPEG must start with SOI marker byte 0xFF");
-    assert_eq!(jpeg_bytes[1], 0xD8, "JPEG must start with SOI marker byte 0xD8");
+    assert_eq!(
+        jpeg_bytes[0], 0xFF,
+        "JPEG must start with SOI marker byte 0xFF"
+    );
+    assert_eq!(
+        jpeg_bytes[1], 0xD8,
+        "JPEG must start with SOI marker byte 0xD8"
+    );
 
     // Try to decode with image crate
-    let img = image::load_from_memory(&jpeg_bytes)
-        .expect("decoded bytes should be a valid image");
+    let img = image::load_from_memory(&jpeg_bytes).expect("decoded bytes should be a valid image");
     assert_eq!(img.width(), result.width);
     assert_eq!(img.height(), result.height);
 
@@ -49,30 +57,32 @@ fn e2e_capture_display_returns_valid_jpeg() {
     );
 }
 
+/// The screenshot the agent sees and the click coordinate space MUST be derived
+/// from the same target-dimension computation, otherwise clicks land in the
+/// wrong place. This verifies the live capture matches `compute_target_dims` for
+/// the real primary display — the contract the coordinate-conversion path relies
+/// on. Requires Screen Recording permission.
 #[test]
-fn e2e_capture_display_fails_gracefully_without_permission() {
-    // Without Screen Recording permission, this should return an error
-    // (but NOT panic or segfault — graceful failure is the important part)
-    match capture_display() {
-        Ok(result) => {
-            // If we happen to have permission, that's fine — verify data looks ok
-            eprintln!(
-                "Permission granted! Got {}x{} screenshot, {} base64 chars",
-                result.width,
-                result.height,
-                result.base64_image.len()
-            );
-        }
-        Err(e) => {
-            // The error should mention Screen Recording or shareable content
-            eprintln!("Expected no-permission error: {e}");
-            assert!(
-                e.to_lowercase().contains("screen")
-                    || e.to_lowercase().contains("permission")
-                    || e.to_lowercase().contains("display")
-                    || e.to_lowercase().contains("shareable"),
-                "Error should mention screen/permission/display, got: {e}"
-            );
-        }
-    }
+#[ignore = "requires Screen Recording permission in System Settings"]
+fn e2e_capture_dims_match_target_dims_contract() {
+    use nova::display::geometry::primary_display;
+    use nova::display::scaling::compute_target_dims;
+
+    let display = primary_display();
+    let expected = compute_target_dims(display.width, display.height);
+
+    let result = capture_display().expect("capture_display should succeed with permissions");
+
+    assert_eq!(
+        (result.width, result.height),
+        (expected.width, expected.height),
+        "screenshot dims {}x{} diverged from compute_target_dims {}x{} \
+         (logical display {}x{}); click coordinate mapping would be wrong",
+        result.width,
+        result.height,
+        expected.width,
+        expected.height,
+        display.width,
+        display.height,
+    );
 }
