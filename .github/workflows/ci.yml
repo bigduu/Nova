@@ -11,8 +11,11 @@ env:
 
 jobs:
   test:
-    # Nova is macOS-only (ScreenCaptureKit / CoreGraphics), so CI must run on macOS.
-    runs-on: macos-14
+    # Nova is macOS-only (ScreenCaptureKit / CoreGraphics), so CI must run on
+    # macOS. macos-15+ is required: a transitive dep (apple-metal) compiles a
+    # Swift bridge against macOS 15 Metal symbols (MTLLogState, MTLResidencySet,
+    # …) that the macos-14 SDK lacks.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
