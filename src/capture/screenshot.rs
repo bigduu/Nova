@@ -1,6 +1,8 @@
 /// Screenshot capture — captures the primary display using ScreenCaptureKit.
 ///
 /// Returns raw RGBA pixel data along with the capture dimensions.
+use crate::display::scaling::{compute_target_dims, TargetDims};
+use crate::display::view::ViewFrame;
 use base64::Engine;
 use screencapturekit::{
     screenshot_manager::{CGImageExt, SCScreenshotManager},
@@ -18,68 +20,226 @@ pub struct ScreenshotResult {
     pub height: u32,
 }
 
-/// Capture the primary display as a JPEG screenshot.
+/// Options controlling how the display is rendered for the model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureOptions {
+    /// Overlay a labeled coordinate grid to help the model read off positions.
+    pub grid: bool,
+    /// Set-of-Mark: draw numbered boxes over actionable UI elements (via the
+    /// Accessibility API) so the model can pick a target by its mark.
+    pub marks: bool,
+}
+
+/// A Set-of-Mark annotation drawn on a capture: a numbered actionable element
+/// with its center in screenshot-pixel coordinates (ready to click).
+#[derive(Debug, Clone)]
+pub struct Mark {
+    pub number: u32,
+    pub role: String,
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A capture plus the metadata clicks and Set-of-Mark depend on.
+pub struct Capture {
+    pub result: ScreenshotResult,
+    /// Maps this image's pixels back to global logical points.
+    pub view: ViewFrame,
+    /// Set-of-Mark annotations (empty unless `marks` was requested).
+    pub marks: Vec<Mark>,
+}
+
+/// Capture the main display as a JPEG screenshot (no overlays).
 ///
 /// Returns base64-encoded JPEG data ready for MCP ImageContent.
 /// The image is resized to fit within 1280px max dimension.
 pub fn capture_display() -> Result<ScreenshotResult, String> {
-    // Get shareable content and pick the primary display
+    Ok(capture_display_with(CaptureOptions::default())?.result)
+}
+
+/// Capture the main display, applying any requested overlays before encoding.
+pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
+    let (filter, target) = main_display_filter()?;
+    let img = capture_rgb_via(filter, target)?;
+
+    let display = crate::display::geometry::primary_display();
+    let view = ViewFrame {
+        origin: (0.0, 0.0),
+        region: (display.width as f64, display.height as f64),
+        screenshot: (img.width() as f64, img.height() as f64),
+    };
+    // Set-of-Mark on a full-display shot marks the frontmost app's elements.
+    let pid = if opts.marks {
+        crate::tools::window::frontmost_app_pid()
+    } else {
+        None
+    };
+    finish(img, opts, view, pid)
+}
+
+/// Capture a single on-screen window matching `query` — a case-insensitive
+/// substring of the window title or its owning application name. Returns the
+/// screenshot plus the [`ViewFrame`] that maps the image's pixels back to global
+/// logical points, so clicks against this image land on the real window.
+///
+/// Capturing just the relevant window cuts the image (and thus LLM context) down
+/// to what matters and reduces downscaling, which improves coordinate precision.
+pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture, String> {
+    let content = SCShareableContent::create()
+        .with_on_screen_windows_only(true)
+        .with_exclude_desktop_windows(true)
+        .get()
+        .map_err(|e| format!("SCShareableContent::get: {e}"))?;
+
+    let q = query.to_lowercase();
+    let window = content
+        .windows()
+        .into_iter()
+        .find(|w| {
+            let title = w.title().unwrap_or_default();
+            if title.is_empty() {
+                return false;
+            }
+            let app = w
+                .owning_application()
+                .map(|a| a.application_name())
+                .unwrap_or_default();
+            title.to_lowercase().contains(&q) || app.to_lowercase().contains(&q)
+        })
+        .ok_or_else(|| format!("no on-screen window matching {query:?}"))?;
+
+    let frame = window.frame();
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        return Err(format!("window {query:?} has zero size"));
+    }
+    let pid = window.owning_application().map(|a| a.process_id());
+
+    let target = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
+    let filter = SCContentFilter::create().with_window(&window).build();
+    let img = capture_rgb_via(filter, target)?;
+
+    let view = ViewFrame {
+        origin: (frame.origin.x, frame.origin.y),
+        region: (frame.size.width, frame.size.height),
+        screenshot: (img.width() as f64, img.height() as f64),
+    };
+    finish(img, opts, view, pid)
+}
+
+/// Apply overlays (grid, Set-of-Mark) and encode the final capture.
+fn finish(
+    mut img: image::RgbImage,
+    opts: CaptureOptions,
+    view: ViewFrame,
+    pid: Option<i32>,
+) -> Result<Capture, String> {
+    if opts.grid {
+        crate::capture::overlay::draw_grid(&mut img);
+    }
+    let marks = match (opts.marks, pid) {
+        (true, Some(pid)) => build_marks(&mut img, view, pid),
+        _ => Vec::new(),
+    };
+
+    let (width, height) = (img.width(), img.height());
+    let base64_image = encode_jpeg_base64(&img)?;
+    Ok(Capture {
+        result: ScreenshotResult {
+            base64_image,
+            width,
+            height,
+        },
+        view,
+        marks,
+    })
+}
+
+/// Maximum number of Set-of-Mark boxes to draw (avoid clutter).
+const MAX_MARKS: usize = 60;
+
+/// Enumerate actionable elements of `pid`, draw numbered boxes for those visible
+/// in `view`, and return the mark list with screenshot-pixel centers.
+fn build_marks(img: &mut image::RgbImage, view: ViewFrame, pid: i32) -> Vec<Mark> {
+    let (sw, sh) = (img.width() as f64, img.height() as f64);
+    let mut marks = Vec::new();
+    for el in crate::tools::elements::actionable_elements(pid, 400) {
+        let (cx, cy) = el.center();
+        let (px, py) = view.to_screenshot(cx, cy);
+        // Keep only elements whose center is inside the captured image.
+        if px < 0.0 || py < 0.0 || px > sw || py > sh {
+            continue;
+        }
+        let (tlx, tly) = view.to_screenshot(el.x, el.y);
+        let (brx, bry) = view.to_screenshot(el.x + el.width, el.y + el.height);
+        let number = marks.len() as u32 + 1;
+        crate::capture::overlay::draw_mark(img, tlx, tly, brx - tlx, bry - tly, number);
+        marks.push(Mark {
+            number,
+            role: el.role,
+            label: el.label,
+            x: px,
+            y: py,
+        });
+        if marks.len() >= MAX_MARKS {
+            break;
+        }
+    }
+    marks
+}
+
+/// Build a content filter + target dims for the *main* display — the same one
+/// `display::geometry::primary_display` (CGDisplay::main) maps click coordinates
+/// against. SCK's `displays()` order is not guaranteed to put the main display
+/// first, so on a multi-monitor setup `.first()` could capture a different
+/// screen than clicks target; match by display id.
+fn main_display_filter() -> Result<(SCContentFilter, TargetDims), String> {
     let content = SCShareableContent::get().map_err(|e| format!("SCShareableContent::get: {e}"))?;
     let displays = content.displays();
+    let main_id = core_graphics::display::CGDisplay::main().id;
     let display = displays
-        .first()
+        .iter()
+        .find(|d| d.display_id() == main_id)
+        .or_else(|| displays.first())
         .ok_or_else(|| "no displays found".to_string())?;
 
-    let display_width = display.width();
-    let display_height = display.height();
-
-    // Compute target dimensions (max 1280px on longest edge). Shared with the
-    // coordinate-conversion path so screenshot space and click space agree.
-    let target = crate::display::scaling::compute_target_dims(display_width, display_height);
-    let (target_w, target_h) = (target.width, target.height);
-
-    // Build content filter for the display
+    let target = compute_target_dims(display.width(), display.height());
     let filter = SCContentFilter::create()
         .with_display(display)
         .with_excluding_windows(&[])
         .build();
+    Ok((filter, target))
+}
 
-    // Configure the capture
+/// Capture `filter` at `target` dims into an in-memory RGB image (no overlays).
+fn capture_rgb_via(filter: SCContentFilter, target: TargetDims) -> Result<image::RgbImage, String> {
     let config = SCStreamConfiguration::new()
-        .with_width(target_w)
-        .with_height(target_h);
+        .with_width(target.width)
+        .with_height(target.height);
 
-    // Capture the image
     let image = SCScreenshotManager::capture_image(&filter, &config)
         .map_err(|e| format!("capture_image: {e}"))?;
 
     let img_w = image.width() as u32;
     let img_h = image.height() as u32;
-
-    // Get RGBA raw data
     let rgba = image.rgba_data().map_err(|e| format!("rgba_data: {e}"))?;
-
-    // Convert RGBA to RGB JPEG using the image crate
-    let jpeg_bytes = rgb_to_jpeg(&rgba, img_w, img_h).map_err(|e| format!("encode: {e}"))?;
-
-    // Base64 encode
-    let base64_image = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
-
-    Ok(ScreenshotResult {
-        base64_image,
-        width: img_w,
-        height: img_h,
-    })
+    let rgb = rgba_to_rgb(&rgba, img_w as usize, img_h as usize);
+    image::RgbImage::from_raw(img_w, img_h, rgb)
+        .ok_or_else(|| "captured buffer size did not match dimensions".to_string())
 }
 
-/// Encode raw RGBA pixel data as a JPEG image with quality 80.
-fn rgb_to_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
-    // Convert RGBA to RGB (discard alpha — CG renders opaque anyway)
-    let rgb = rgba_to_rgb(rgba, width as usize, height as usize);
+/// Encode an RGB image as base64 JPEG (quality 80).
+fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
     let mut buf = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
-    encoder.encode(&rgb, width, height, image::ExtendedColorType::Rgb8)?;
-    Ok(buf)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80)
+        .encode(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| format!("encode: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
 /// Convert RGBA raw bytes to RGB (dropping alpha channel).

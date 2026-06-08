@@ -38,3 +38,43 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
 
     Ok(windows)
 }
+
+/// System UI layers to skip when guessing the frontmost user app.
+fn is_system_ui(app: &str) -> bool {
+    matches!(
+        app,
+        "" | "Window Server"
+            | "Dock"
+            | "SystemUIServer"
+            | "Spotlight"
+            | "Control Center"
+            | "控制中心"
+            | "Notification Center"
+            | "通知中心"
+    )
+}
+
+/// Best-effort process id of the frontmost user application — the first
+/// on-screen, titled window that isn't a system UI layer. Used to scope
+/// Set-of-Mark element discovery. Returns `None` if nothing suitable is found
+/// (e.g. no Screen Recording permission).
+pub fn frontmost_app_pid() -> Option<i32> {
+    let content = SCShareableContent::create()
+        .with_on_screen_windows_only(true)
+        .with_exclude_desktop_windows(true)
+        .get()
+        .ok()?;
+
+    content.windows().into_iter().find_map(|w| {
+        let title = w.title()?;
+        if title.is_empty() {
+            return None;
+        }
+        let app = w.owning_application()?;
+        if is_system_ui(&app.application_name()) {
+            return None;
+        }
+        let pid = app.process_id();
+        (pid > 0).then_some(pid)
+    })
+}

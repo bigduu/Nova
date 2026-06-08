@@ -23,25 +23,63 @@ pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolRe
 
 /// Shared state for the Nova MCP server.
 /// All tool handlers receive `&self` to this struct.
-#[derive(Debug, Clone)]
-pub struct NovaServer;
+#[derive(Debug, Clone, Default)]
+pub struct NovaServer {
+    /// Coordinate frame of the most recent screenshot (full display or a single
+    /// window). Click/move/scroll map their screenshot-space input through this,
+    /// so the model always works in "the pixels of the last image it saw".
+    /// `None` until the first screenshot — clicks then assume the full display.
+    view: std::sync::Arc<std::sync::Mutex<Option<crate::display::view::ViewFrame>>>,
+}
 
 impl NovaServer {
     pub fn new() -> Self {
-        NovaServer
+        Self::default()
+    }
+
+    /// Record the coordinate frame of the screenshot just returned.
+    fn set_view(&self, frame: crate::display::view::ViewFrame) {
+        *self.view.lock().expect("view mutex") = Some(frame);
+    }
+
+    /// The active coordinate frame — the last screenshot's, or the full main
+    /// display if no screenshot has been taken yet.
+    fn current_view(&self) -> crate::display::view::ViewFrame {
+        self.view
+            .lock()
+            .expect("view mutex")
+            .unwrap_or_else(crate::display::geometry::display_view_frame)
+    }
+
+    /// Convert screenshot-space coordinates (what the LLM sees) into the global
+    /// logical points that mouse events are posted in, via the active view frame.
+    fn to_logical(&self, x: f64, y: f64) -> (f64, f64) {
+        self.current_view().to_logical(x, y)
     }
 }
 
-impl Default for NovaServer {
-    fn default() -> Self {
-        Self::new()
+/// Render the Set-of-Mark list appended to the screenshot's text note.
+fn format_marks(marks: &[crate::capture::screenshot::Mark]) -> String {
+    if marks.is_empty() {
+        return "\nNo actionable elements detected (Accessibility permission may be missing)."
+            .to_string();
     }
-}
-
-/// Convert screenshot-space coordinates (what the LLM sees) into the global
-/// logical points that mouse events are posted in.
-fn to_logical(x: f64, y: f64) -> (f64, f64) {
-    crate::display::geometry::screen_to_logical_coords(x, y)
+    let mut s = format!(
+        "\n{} actionable elements (click a mark's center):",
+        marks.len()
+    );
+    for m in marks {
+        let label = if m.label.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", m.label)
+        };
+        s.push_str(&format!(
+            "\n  [{}] {}{} at ({:.0}, {:.0})",
+            m.number, m.role, label, m.x, m.y
+        ));
+    }
+    s
 }
 
 // ── Tool implementations ────────────────────────────────────────────
@@ -53,7 +91,24 @@ use serde::Deserialize;
 
 // Tool parameter types — all stub, to be fleshed out in implementation.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ScreenshotParams {}
+pub struct ScreenshotParams {
+    /// Overlay a labeled coordinate grid (rules + pixel labels every 100px) to
+    /// help read off precise click coordinates. Defaults to false.
+    #[serde(default)]
+    pub grid: bool,
+    /// Capture only a single on-screen window instead of the whole display —
+    /// a case-insensitive substring of the window title or app name (e.g.
+    /// "Safari", "Settings"). Smaller, sharper image = less context and better
+    /// click precision. Subsequent clicks map to this window automatically.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Set-of-Mark: draw numbered boxes over actionable UI elements (buttons,
+    /// links, fields) and return a list with each element's exact center. Click
+    /// a mark's listed center instead of estimating coordinates — the most
+    /// reliable targeting. Needs Accessibility permission. Defaults to false.
+    #[serde(default)]
+    pub marks: bool,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseMoveParams {
@@ -109,15 +164,50 @@ pub struct BatchParams {
 impl NovaServer {
     #[tool(
         name = "screenshot",
-        description = "Take a screenshot of the primary display. Returns a base64-encoded JPEG image."
+        description = "Take a screenshot and return a base64 JPEG plus a text note with its pixel \
+                       dimensions. ALL coordinate-taking tools (mouse_move, *_click, scroll) expect \
+                       coordinates in THIS image's pixel space — origin (0,0) top-left, x right, y \
+                       down — so read target positions directly off the returned image; subsequent \
+                       clicks are mapped through it automatically. Pass window=\"<name>\" to capture \
+                       just one window (substring of its title or app name) — smaller, sharper, less \
+                       context, better precision. Pass grid=true to overlay a labeled coordinate \
+                       grid (pixel labels every 100px) to pin down a precise position."
     )]
-    #[tracing::instrument(skip_all, level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid, marks = %p.marks), level = "info")]
     async fn screenshot(
         &self,
-        Parameters(_p): Parameters<ScreenshotParams>,
+        Parameters(p): Parameters<ScreenshotParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::screenshot::take_screenshot() {
-            Ok(img) => ok_image(img.base64_data, img.mime_type),
+        let captured = match &p.window {
+            Some(query) => crate::tools::screenshot::take_window_screenshot(query, p.grid, p.marks),
+            None => crate::tools::screenshot::take_screenshot(p.grid, p.marks),
+        };
+        match captured {
+            Ok(img) => {
+                // Record this image's coordinate frame so later clicks map back
+                // to the right physical spot (essential for window captures).
+                self.set_view(img.view);
+                // Give the model an explicit coordinate frame of reference: without
+                // the image dimensions it has to guess the pixel range, which is a
+                // major source of mis-clicks.
+                let subject = match &p.window {
+                    Some(q) => format!("window matching {q:?}"),
+                    None => "the main display".to_string(),
+                };
+                let mut note = format!(
+                    "Screenshot of {subject}, {w}x{h} px. Click/move/scroll coordinates use this \
+                     image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left.",
+                    w = img.width,
+                    h = img.height,
+                );
+                if p.marks {
+                    note.push_str(&format_marks(&img.marks));
+                }
+                rmcp::model::CallToolResult::success(vec![
+                    rmcp::model::Content::text(note),
+                    rmcp::model::Content::image(img.base64_data, img.mime_type),
+                ])
+            }
             Err(e) => err_result(&e),
         }
     }
@@ -131,7 +221,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<MouseMoveParams>,
     ) -> rmcp::model::CallToolResult {
-        let (lx, ly) = to_logical(p.x, p.y);
+        let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::tools::input::mouse_move(lx, ly) {
             Ok(()) => ok_text(format!("mouse moved to ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
@@ -147,7 +237,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
-        let (lx, ly) = to_logical(p.x, p.y);
+        let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::tools::input::left_click_at(lx, ly) {
             Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
@@ -163,7 +253,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
-        let (lx, ly) = to_logical(p.x, p.y);
+        let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::tools::input::right_click_at(lx, ly) {
             Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
@@ -179,7 +269,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
-        let (lx, ly) = to_logical(p.x, p.y);
+        let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::tools::input::mouse_move(lx, ly).and_then(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
             crate::tools::input::double_click()
@@ -197,7 +287,7 @@ impl NovaServer {
     async fn scroll(&self, Parameters(p): Parameters<ScrollParams>) -> rmcp::model::CallToolResult {
         // Move to the requested position first so the scroll lands on the
         // intended region, not wherever the cursor happened to be.
-        let (lx, ly) = to_logical(p.x, p.y);
+        let (lx, ly) = self.to_logical(p.x, p.y);
         let result = crate::tools::input::mouse_move(lx, ly).and_then(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
             crate::tools::input::scroll(p.lines)
@@ -335,7 +425,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::batch::execute_batch(p.actions).await {
+        match crate::tools::batch::execute_batch(p.actions, self.current_view()).await {
             Ok(results) => ok_text(results.join("\n")),
             Err(e) => err_result(&e.to_string()),
         }

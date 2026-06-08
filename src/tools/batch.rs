@@ -4,6 +4,7 @@
 /// field, type, press return). Screenshots are intentionally *not* part of a
 /// batch: they return image content rather than a status string, so an agent
 /// takes a screenshot with the dedicated `screenshot` tool after a batch runs.
+use crate::display::view::ViewFrame;
 use crate::error::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,37 +34,37 @@ pub enum BatchAction {
 }
 
 /// Execute a sequence of actions in order, stopping at the first failure.
-/// Returns a status line for each action that ran.
-pub async fn execute_batch(actions: Vec<BatchAction>) -> Result<Vec<String>> {
+/// Returns a status line for each action that ran. Coordinates are mapped to
+/// logical points through `view` — the active screenshot's coordinate frame.
+pub async fn execute_batch(actions: Vec<BatchAction>, view: ViewFrame) -> Result<Vec<String>> {
     let mut results = Vec::with_capacity(actions.len());
     for action in actions {
-        results.push(execute_action(action).await?);
+        results.push(execute_action(action, view).await?);
     }
     Ok(results)
 }
 
-async fn execute_action(action: BatchAction) -> Result<String> {
-    use crate::display::geometry::screen_to_logical_coords;
+async fn execute_action(action: BatchAction, view: ViewFrame) -> Result<String> {
     use crate::tools::input;
 
     match action {
         BatchAction::MouseMove { x, y } => {
-            let (lx, ly) = screen_to_logical_coords(x, y);
+            let (lx, ly) = view.to_logical(x, y);
             input::mouse_move(lx, ly)?;
             Ok(format!("moved to ({x}, {y})"))
         }
         BatchAction::LeftClick { x, y } => {
-            let (lx, ly) = screen_to_logical_coords(x, y);
+            let (lx, ly) = view.to_logical(x, y);
             input::left_click_at(lx, ly)?;
             Ok(format!("left clicked at ({x}, {y})"))
         }
         BatchAction::RightClick { x, y } => {
-            let (lx, ly) = screen_to_logical_coords(x, y);
+            let (lx, ly) = view.to_logical(x, y);
             input::right_click_at(lx, ly)?;
             Ok(format!("right clicked at ({x}, {y})"))
         }
         BatchAction::DoubleClick { x, y } => {
-            let (lx, ly) = screen_to_logical_coords(x, y);
+            let (lx, ly) = view.to_logical(x, y);
             input::mouse_move(lx, ly)?;
             std::thread::sleep(Duration::from_millis(10));
             input::double_click()?;
@@ -119,10 +120,15 @@ mod tests {
     async fn wait_only_batch_executes_without_touching_input_apis() {
         // Hermetic: `wait` posts no system events, so this exercises the
         // dispatch/aggregation path without moving the real mouse/keyboard.
-        let out = execute_batch(vec![
-            BatchAction::Wait { ms: 1 },
-            BatchAction::Wait { ms: 1 },
-        ])
+        let view = ViewFrame {
+            origin: (0.0, 0.0),
+            region: (1280.0, 720.0),
+            screenshot: (1280.0, 720.0),
+        };
+        let out = execute_batch(
+            vec![BatchAction::Wait { ms: 1 }, BatchAction::Wait { ms: 1 }],
+            view,
+        )
         .await
         .unwrap();
         assert_eq!(
