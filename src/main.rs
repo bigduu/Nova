@@ -20,10 +20,12 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Init logging
+    // Init logging — MUST go to stderr. In stdio transport, stdout is the
+    // JSON-RPC channel; any log line written there corrupts the protocol stream
+    // and makes clients (e.g. when RUST_LOG is set) hang waiting for a response.
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let cli = Cli::parse();
