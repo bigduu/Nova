@@ -127,6 +127,75 @@ pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture,
     finish(img, opts, view, pid)
 }
 
+/// Zoom: capture the global-logical rectangle `(x, y, w, h)` at the display's
+/// *native* resolution and crop to it, so a small region fills the model's
+/// resolution budget and becomes legible. This is the grounding tool for apps
+/// that expose no Accessibility tree (WeChat, Electron, games): the model takes
+/// an overview, then zooms a region to read exact positions. Clicks against the
+/// zoomed image map back through its [`ViewFrame`].
+pub fn capture_region_with(
+    rect: (f64, f64, f64, f64),
+    opts: CaptureOptions,
+) -> Result<Capture, String> {
+    let (x, y, w, h) = rect;
+    if w <= 0.0 || h <= 0.0 {
+        return Err("region has zero size".to_string());
+    }
+
+    // Capture the whole main display at native pixel resolution.
+    let main = core_graphics::display::CGDisplay::main();
+    let logical = main.bounds().size;
+    if logical.width <= 0.0 || logical.height <= 0.0 {
+        return Err("main display has no geometry".to_string());
+    }
+    let native_w = main.pixels_wide() as u32;
+    let native_h = (native_w as f64 * logical.height / logical.width).round() as u32;
+
+    let (filter, _) = main_display_filter()?;
+    let img = capture_rgb_via(
+        filter,
+        TargetDims {
+            width: native_w,
+            height: native_h,
+        },
+    )?;
+
+    // Map the logical rect to actual captured pixels (robust to SCK rounding).
+    let sx = img.width() as f64 / logical.width;
+    let sy = img.height() as f64 / logical.height;
+    let cx = (x * sx).clamp(0.0, img.width() as f64 - 1.0) as u32;
+    let cy = (y * sy).clamp(0.0, img.height() as f64 - 1.0) as u32;
+    let cw = ((w * sx).round() as u32).clamp(1, img.width() - cx);
+    let ch = ((h * sy).round() as u32).clamp(1, img.height() - cy);
+
+    let crop = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
+
+    // Downscale the crop only if it still exceeds the max dimension.
+    let target = compute_target_dims(crop.width(), crop.height());
+    let out = if target.width == crop.width() && target.height == crop.height() {
+        crop
+    } else {
+        image::imageops::resize(
+            &crop,
+            target.width,
+            target.height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+
+    let view = ViewFrame {
+        origin: (x, y),
+        region: (w, h),
+        screenshot: (out.width() as f64, out.height() as f64),
+    };
+    let pid = if opts.marks {
+        crate::tools::window::frontmost_app_pid()
+    } else {
+        None
+    };
+    finish(out, opts, view, pid)
+}
+
 /// Apply overlays (grid, Set-of-Mark) and encode the final capture.
 fn finish(
     mut img: image::RgbImage,

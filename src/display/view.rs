@@ -93,6 +93,22 @@ mod tests {
     }
 
     #[test]
+    fn region_in_image_px_resolves_to_logical_rect() {
+        // A window view: 800x600 window at global (1000, 200), shown 1:1.
+        let f = ViewFrame {
+            origin: (1000.0, 200.0),
+            region: (800.0, 600.0),
+            screenshot: (800.0, 600.0),
+        };
+        // Model asks to zoom image-rect [100,100, 200,150]; this is how the
+        // server resolves it to a global-logical rectangle.
+        let (tlx, tly) = f.to_logical(100.0, 100.0);
+        let (brx, bry) = f.to_logical(100.0 + 200.0, 100.0 + 150.0);
+        assert_eq!((tlx, tly), (1100.0, 300.0));
+        assert_eq!((brx - tlx, bry - tly), (200.0, 150.0));
+    }
+
+    #[test]
     fn zero_screenshot_is_finite() {
         let f = ViewFrame {
             origin: (10.0, 20.0),

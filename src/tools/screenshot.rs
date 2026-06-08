@@ -2,7 +2,7 @@
 ///
 /// Coordinates capture, image processing, and base64 encoding for MCP responses.
 use crate::capture::screenshot::{
-    capture_display_with, capture_window_with, Capture, CaptureOptions, Mark,
+    capture_display_with, capture_region_with, capture_window_with, Capture, CaptureOptions, Mark,
 };
 use crate::display::geometry::screen_recording_available;
 use crate::display::view::ViewFrame;
@@ -46,6 +46,16 @@ pub fn take_window_screenshot(
     marks: bool,
 ) -> Result<ScreenshotImage, String> {
     Ok(capture_window_with(query, CaptureOptions { grid, marks })?.into())
+}
+
+/// Zoom into `rect` (x, y, w, h in global logical points), captured at native
+/// resolution for a sharp, legible crop.
+pub fn take_region_screenshot(
+    rect: (f64, f64, f64, f64),
+    grid: bool,
+    marks: bool,
+) -> Result<ScreenshotImage, String> {
+    Ok(capture_region_with(rect, CaptureOptions { grid, marks })?.into())
 }
 
 /// Check if screen recording permission is available.

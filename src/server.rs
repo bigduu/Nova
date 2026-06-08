@@ -108,6 +108,13 @@ pub struct ScreenshotParams {
     /// reliable targeting. Needs Accessibility permission. Defaults to false.
     #[serde(default)]
     pub marks: bool,
+    /// Zoom into a rectangle `[x, y, width, height]` of the CURRENT image (the
+    /// last screenshot's pixel space) and re-capture it at native resolution.
+    /// The crop is sharp and legible — use it to read exact positions in apps
+    /// with no Accessibility tree (WeChat, Electron, games) before clicking.
+    /// Clicks afterward map into the zoomed region automatically.
+    #[serde(default)]
+    pub region: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -170,33 +177,62 @@ impl NovaServer {
                        down — so read target positions directly off the returned image; subsequent \
                        clicks are mapped through it automatically. Pass window=\"<name>\" to capture \
                        just one window (substring of its title or app name) — smaller, sharper, less \
-                       context, better precision. Pass grid=true to overlay a labeled coordinate \
-                       grid (pixel labels every 100px) to pin down a precise position."
+                       context, better precision. Pass grid=true for a labeled coordinate grid, \
+                       marks=true to box+number actionable elements (needs Accessibility), or \
+                       region=[x,y,w,h] to zoom into part of the current image at native resolution \
+                       — the way to read small targets in apps with no accessibility (WeChat, \
+                       Electron, games)."
     )]
-    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid, marks = %p.marks), level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid, marks = %p.marks, region = ?p.region), level = "info")]
     async fn screenshot(
         &self,
         Parameters(p): Parameters<ScreenshotParams>,
     ) -> rmcp::model::CallToolResult {
-        let captured = match &p.window {
-            Some(query) => crate::tools::screenshot::take_window_screenshot(query, p.grid, p.marks),
-            None => crate::tools::screenshot::take_screenshot(p.grid, p.marks),
+        // `region` zooms into the CURRENT image's pixel space, so resolve it
+        // against the active view frame into a global-logical rectangle.
+        let region_logical = match &p.region {
+            Some(r) if r.len() == 4 && r[2] > 0.0 && r[3] > 0.0 => {
+                let view = self.current_view();
+                let (tlx, tly) = view.to_logical(r[0], r[1]);
+                let (brx, bry) = view.to_logical(r[0] + r[2], r[1] + r[3]);
+                Some((tlx, tly, brx - tlx, bry - tly))
+            }
+            Some(_) => {
+                return err_result("region must be [x, y, width, height] with width,height > 0")
+            }
+            None => None,
+        };
+
+        let captured = match (region_logical, &p.window) {
+            (Some(rect), _) => {
+                crate::tools::screenshot::take_region_screenshot(rect, p.grid, p.marks)
+            }
+            (None, Some(query)) => {
+                crate::tools::screenshot::take_window_screenshot(query, p.grid, p.marks)
+            }
+            (None, None) => crate::tools::screenshot::take_screenshot(p.grid, p.marks),
         };
         match captured {
             Ok(img) => {
                 // Record this image's coordinate frame so later clicks map back
-                // to the right physical spot (essential for window captures).
+                // to the right physical spot (essential for window/region captures).
                 self.set_view(img.view);
                 // Give the model an explicit coordinate frame of reference: without
                 // the image dimensions it has to guess the pixel range, which is a
                 // major source of mis-clicks.
-                let subject = match &p.window {
-                    Some(q) => format!("window matching {q:?}"),
-                    None => "the main display".to_string(),
+                let subject = if region_logical.is_some() {
+                    "a zoomed region".to_string()
+                } else {
+                    match &p.window {
+                        Some(q) => format!("window matching {q:?}"),
+                        None => "the main display".to_string(),
+                    }
                 };
                 let mut note = format!(
                     "Screenshot of {subject}, {w}x{h} px. Click/move/scroll coordinates use this \
-                     image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left.",
+                     image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left. If a \
+                     target is too small to locate precisely, retry with region=[x,y,w,h] to zoom \
+                     in, grid=true for a coordinate ruler, or marks=true for clickable elements.",
                     w = img.width,
                     h = img.height,
                 );
