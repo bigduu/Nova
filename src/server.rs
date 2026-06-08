@@ -203,14 +203,31 @@ impl NovaServer {
             None => None,
         };
 
-        let captured = match (region_logical, &p.window) {
-            (Some(rect), _) => {
-                crate::tools::screenshot::take_region_screenshot(rect, p.grid, p.marks)
-            }
+        // ScreenCaptureKit / CoreGraphics calls are blocking and can stall (or
+        // hang) when the host process's window-server session is busy. Run them
+        // on a blocking thread with a hard timeout so a stuck capture returns an
+        // error fast instead of starving the async runtime — which would make
+        // the MCP client drop the connection.
+        let (grid, marks, window) = (p.grid, p.marks, p.window.clone());
+        let capture = tokio::task::spawn_blocking(move || match (region_logical, &window) {
+            (Some(rect), _) => crate::tools::screenshot::take_region_screenshot(rect, grid, marks),
             (None, Some(query)) => {
-                crate::tools::screenshot::take_window_screenshot(query, p.grid, p.marks)
+                crate::tools::screenshot::take_window_screenshot(query, grid, marks)
             }
-            (None, None) => crate::tools::screenshot::take_screenshot(p.grid, p.marks),
+            (None, None) => crate::tools::screenshot::take_screenshot(grid, marks),
+        });
+        let captured = match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => {
+                return err_result(&format!("screenshot task failed: {join_err}"))
+            }
+            Err(_) => {
+                return err_result(
+                    "screenshot timed out after 20s (the display capture or accessibility walk \
+                     did not complete; try again, or without marks)",
+                )
+            }
         };
         match captured {
             Ok(img) => {
