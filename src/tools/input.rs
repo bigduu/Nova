@@ -1,11 +1,18 @@
 /// Input tools — mouse and keyboard control via CoreGraphics CGEvent.
 ///
 /// All coordinates are in macOS logical points.
-/// Events are posted to the HID (Human Interface Device) level
-/// so applications receive them as normal input events.
+///
+/// Events can be delivered two ways (see [`InputTarget`]):
+/// - `Global`: posted to the HID event stream — the OS routes it to the
+///   frontmost app and the real cursor moves. Works anywhere but needs the
+///   target foreground and takes over the user's mouse/keyboard.
+/// - `Pid`: posted directly to a process via `CGEventPostToPid` — the global
+///   cursor is not moved and the app usually need not be frontmost (as close to
+///   "background" input as macOS allows). Apps that do their own event handling
+///   may ignore it, so it is best-effort for those.
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -14,7 +21,7 @@ use std::time::Duration;
 
 use crate::error::{NovaError, Result};
 
-// ── Event source ────────────────────────────────────────────────────
+// ── Event source & delivery target ──────────────────────────────────
 
 /// Create a private event source. Using `Private` state means the events
 /// are treated as if they came from a physical device.
@@ -23,9 +30,40 @@ fn event_source() -> Result<CGEventSource> {
         .map_err(|_| NovaError::Input("failed to create event source".into()))
 }
 
+/// Where an input event is delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputTarget {
+    /// Global HID event stream: routed to the frontmost app; the real cursor
+    /// moves. Works for any app but requires foreground and takes over the
+    /// user's mouse/keyboard.
+    Global,
+    /// Delivered directly to a specific process via `CGEventPostToPid`. The
+    /// global cursor is NOT moved and the app usually need not be frontmost —
+    /// i.e. as close to background input as macOS allows. Apps that handle their
+    /// own events (some Electron/custom-rendered apps) may ignore these.
+    Pid(i32),
+}
+
+impl InputTarget {
+    /// Whether this is the global HID stream (which moves the real cursor).
+    fn is_global(self) -> bool {
+        matches!(self, InputTarget::Global)
+    }
+}
+
+/// Post an already-built event to the chosen target.
+fn post_event(event: &CGEvent, target: InputTarget) {
+    match target {
+        InputTarget::Global => event.post(CGEventTapLocation::HID),
+        InputTarget::Pid(pid) => event.post_to_pid(pid),
+    }
+}
+
 // ── Mouse movement ──────────────────────────────────────────────────
 
-/// Move the mouse cursor to the given logical coordinates.
+/// Move the real (global) mouse cursor to the given logical coordinates.
+/// Used only for `Global` delivery; `Pid` clicks carry their own location and
+/// deliberately leave the user's cursor where it is.
 pub fn mouse_move(x: f64, y: f64) -> Result<()> {
     let point = CGPoint { x, y };
     CGDisplay::warp_mouse_cursor_position(point)
@@ -42,111 +80,72 @@ pub fn cursor_position() -> Result<(f64, f64)> {
 
 // ── Mouse clicks ────────────────────────────────────────────────────
 
-/// Create and post a mouse event at the given position.
-fn post_mouse_event(event_type: CGEventType, button: CGMouseButton, pos: CGPoint) -> Result<()> {
+/// Build and post a mouse event at `pos` to `target`.
+fn post_mouse_event(
+    event_type: CGEventType,
+    button: CGMouseButton,
+    pos: CGPoint,
+    target: InputTarget,
+) -> Result<()> {
     let source = event_source()?;
     let event = CGEvent::new_mouse_event(source, event_type, pos, button)
         .map_err(|_| NovaError::Input("failed to create mouse event".into()))?;
-    event.post(CGEventTapLocation::HID);
-    // Small delay to let the event be processed
+    post_event(&event, target);
+    // Small delay to let the event be processed.
     thread::sleep(Duration::from_millis(1));
     Ok(())
 }
 
-/// Left click at the current position.
-pub fn left_click() -> Result<()> {
-    let (x, y) = cursor_position()?;
-    let pos = CGPoint { x, y };
-    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos)?;
-    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos)
-}
-
-/// Right click at the current position.
-pub fn right_click() -> Result<()> {
-    let (x, y) = cursor_position()?;
-    let pos = CGPoint { x, y };
-    post_mouse_event(CGEventType::RightMouseDown, CGMouseButton::Right, pos)?;
-    post_mouse_event(CGEventType::RightMouseUp, CGMouseButton::Right, pos)
-}
-
-/// Double click at the current position.
-pub fn double_click() -> Result<()> {
-    let (x, y) = cursor_position()?;
-    let pos = CGPoint { x, y };
-    // First click
-    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos)?;
-    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos)?;
-    // Double-click interval (~200ms is standard)
-    thread::sleep(Duration::from_millis(50));
-    // Second click
-    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos)?;
-    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos)
-}
-
-/// Left click at specific coordinates.
-pub fn left_click_at(x: f64, y: f64) -> Result<()> {
-    mouse_move(x, y)?;
-    thread::sleep(Duration::from_millis(10));
-    left_click()
-}
-
-/// Right click at specific coordinates.
-pub fn right_click_at(x: f64, y: f64) -> Result<()> {
-    mouse_move(x, y)?;
-    thread::sleep(Duration::from_millis(10));
-    right_click()
-}
-
-/// Press left mouse button down (no release until mouse_up is called).
-pub fn left_mouse_down() -> Result<()> {
-    let (x, y) = cursor_position()?;
-    let pos = CGPoint { x, y };
-    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos)
-}
-
-/// Release left mouse button.
-pub fn left_mouse_up() -> Result<()> {
-    let (x, y) = cursor_position()?;
-    let pos = CGPoint { x, y };
-    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos)
-}
-
-// ── Click and drag ──────────────────────────────────────────────────
-
-/// Click and drag from start to end, with optional animation step count.
-pub fn left_click_drag(start: (f64, f64), end: (f64, f64), steps: Option<u32>) -> Result<()> {
-    let steps = steps.unwrap_or(20);
-    let (sx, sy) = start;
-    let (ex, ey) = end;
-
-    // Move to start and press
-    mouse_move(sx, sy)?;
-    thread::sleep(Duration::from_millis(5));
-    left_mouse_down()?;
-    thread::sleep(Duration::from_millis(5));
-
-    // Animate to end
-    for i in 1..=steps {
-        let t = i as f64 / steps as f64;
-        let x = sx + (ex - sx) * t;
-        let y = sy + (ey - sy) * t;
+/// For `Global` delivery, move the real cursor to `(x, y)` so the click is
+/// visible and lands under the pointer. For a `Pid` target, leave the cursor
+/// alone — the click event carries its own location.
+fn position_cursor_if_global(x: f64, y: f64, target: InputTarget) -> Result<()> {
+    if target.is_global() {
         mouse_move(x, y)?;
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(10));
     }
+    Ok(())
+}
 
-    // Release at end
-    left_mouse_up()
+/// Left click at specific coordinates, delivered to `target`.
+pub fn left_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
+    let pos = CGPoint { x, y };
+    position_cursor_if_global(x, y, target)?;
+    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos, target)?;
+    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos, target)
+}
+
+/// Right click at specific coordinates, delivered to `target`.
+pub fn right_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
+    let pos = CGPoint { x, y };
+    position_cursor_if_global(x, y, target)?;
+    post_mouse_event(CGEventType::RightMouseDown, CGMouseButton::Right, pos, target)?;
+    post_mouse_event(CGEventType::RightMouseUp, CGMouseButton::Right, pos, target)
+}
+
+/// Double click at specific coordinates, delivered to `target`.
+pub fn double_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
+    let pos = CGPoint { x, y };
+    position_cursor_if_global(x, y, target)?;
+    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos, target)?;
+    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos, target)?;
+    // Double-click interval (~200ms is standard; 50ms is well within it).
+    thread::sleep(Duration::from_millis(50));
+    post_mouse_event(CGEventType::LeftMouseDown, CGMouseButton::Left, pos, target)?;
+    post_mouse_event(CGEventType::LeftMouseUp, CGMouseButton::Left, pos, target)
 }
 
 // ── Scrolling ───────────────────────────────────────────────────────
 
-/// Scroll vertically by the given number of lines.
-/// Positive lines = up (content moves up, scrollbar moves down).
-/// Negative lines = down.
+/// Scroll vertically by `lines` at logical position `(x, y)`, delivered to
+/// `target`. Positive lines = up (content moves up), negative = down.
 ///
-/// CGEvent scroll wheels are ordered (wheel1 = vertical/y, wheel2 =
-/// horizontal/x, wheel3 = z), so the vertical delta goes in wheel1.
-pub fn scroll(lines: i32) -> Result<()> {
+/// For `Global`, the cursor is moved to `(x, y)` first so the scroll lands on
+/// the intended view. For `Pid`, the event's location is set to `(x, y)` as a
+/// hint (the app scrolls the view there / its focused scroller) without moving
+/// the user's cursor.
+pub fn scroll_at(x: f64, y: f64, lines: i32, target: InputTarget) -> Result<()> {
+    position_cursor_if_global(x, y, target)?;
     let source = event_source()?;
     let event = CGEvent::new_scroll_event(
         source,
@@ -157,24 +156,10 @@ pub fn scroll(lines: i32) -> Result<()> {
         0,     // wheel3: unused
     )
     .map_err(|_| NovaError::Input("failed to create scroll event".into()))?;
-    event.post(CGEventTapLocation::HID);
-    Ok(())
-}
-
-/// Scroll horizontally by the given number of lines.
-/// Positive lines = right, negative = left. (wheel2 = horizontal/x axis.)
-pub fn scroll_horizontal(lines: i32) -> Result<()> {
-    let source = event_source()?;
-    let event = CGEvent::new_scroll_event(
-        source,
-        ScrollEventUnit::LINE,
-        2,     // wheel_count
-        0,     // wheel1: vertical (unused)
-        lines, // wheel2: horizontal
-        0,     // wheel3: unused
-    )
-    .map_err(|_| NovaError::Input("failed to create scroll event".into()))?;
-    event.post(CGEventTapLocation::HID);
+    if let InputTarget::Pid(_) = target {
+        event.set_location(CGPoint { x, y });
+    }
+    post_event(&event, target);
     Ok(())
 }
 
@@ -269,20 +254,32 @@ fn key_name_to_code(name: &str) -> Option<u16> {
     }
 }
 
-/// Post a key down or up event.
-fn post_key(keycode: u16, keydown: bool) -> Result<()> {
+/// The `CGEventFlags` bit a modifier keycode contributes. Synthesized key events
+/// do NOT inherit a global modifier state, so for an app to recognize e.g.
+/// `cmd+c` the COMMAND flag must be set on the `c` event itself — posting a bare
+/// keycode-55 (command) key-down does not do that. `key_combo` ORs these together
+/// and stamps them on every event it posts.
+fn modifier_flag(keycode: u16) -> CGEventFlags {
+    match keycode {
+        55 => CGEventFlags::CGEventFlagCommand,
+        56 | 60 => CGEventFlags::CGEventFlagShift, // shift, right_shift
+        58 | 61 => CGEventFlags::CGEventFlagAlternate, // option, right_option
+        59 | 62 => CGEventFlags::CGEventFlagControl, // control, right_control
+        63 => CGEventFlags::CGEventFlagSecondaryFn, // fn
+        _ => CGEventFlags::empty(),
+    }
+}
+
+/// Post a key down or up event to `target`, with `flags` stamped on it (the
+/// active modifier bits the receiving app reads to recognize the chord).
+fn post_key(keycode: u16, keydown: bool, flags: CGEventFlags, target: InputTarget) -> Result<()> {
     let source = event_source()?;
     let event = CGEvent::new_keyboard_event(source, keycode, keydown)
         .map_err(|_| NovaError::Input("failed to create keyboard event".into()))?;
-    event.post(CGEventTapLocation::HID);
+    event.set_flags(flags);
+    post_event(&event, target);
     thread::sleep(Duration::from_millis(1));
     Ok(())
-}
-
-/// Press and release a single key.
-fn tap_key(keycode: u16) -> Result<()> {
-    post_key(keycode, true)?;
-    post_key(keycode, false)
 }
 
 /// Check if a key name is a modifier key.
@@ -330,113 +327,64 @@ fn parse_combo(combo: &str) -> Result<(Vec<u16>, Vec<u16>)> {
     Ok((modifiers, keys))
 }
 
-/// Simulate a key combination (e.g., "cmd+c", "shift+tab", "ctrl+cmd+f").
-pub fn key_combo(combo: &str) -> Result<()> {
+/// Simulate a key combination (e.g., "cmd+c", "shift+tab", "ctrl+cmd+f")
+/// delivered to `target`.
+pub fn key_combo(combo: &str, target: InputTarget) -> Result<()> {
     let (modifiers, keys) = parse_combo(combo)?;
 
-    // Press modifiers
+    // The cumulative modifier flag set. This — not the bare modifier key-down
+    // events — is what makes an app see `cmd+c` rather than a plain `c`.
+    let flags = modifiers
+        .iter()
+        .fold(CGEventFlags::empty(), |acc, &c| acc | modifier_flag(c));
+
+    // Press modifiers (each carries the cumulative flags so the held state is
+    // coherent as more modifiers go down).
     for &code in &modifiers {
-        post_key(code, true)?;
+        post_key(code, true, flags, target)?;
     }
     thread::sleep(Duration::from_millis(2));
 
-    // Press and release main keys
+    // Press+release each main key WITH the modifier flags stamped on it.
     for &code in &keys {
-        tap_key(code)?;
+        post_key(code, true, flags, target)?;
+        post_key(code, false, flags, target)?;
     }
     thread::sleep(Duration::from_millis(2));
 
-    // Release modifiers (reverse order)
+    // Release modifiers (reverse order), flags clearing back to empty.
     for &code in modifiers.iter().rev() {
-        post_key(code, false)?;
+        post_key(code, false, CGEventFlags::empty(), target)?;
     }
 
     Ok(())
 }
 
-/// Hold a key down for N milliseconds, then release.
-pub fn hold_key(key: &str, duration_ms: u64) -> Result<()> {
-    let code =
-        key_name_to_code(key).ok_or_else(|| NovaError::Input(format!("unknown key: {key}")))?;
-
-    post_key(code, true)?;
-    thread::sleep(Duration::from_millis(duration_ms));
-    post_key(code, false)
-}
-
 // ── Type text ───────────────────────────────────────────────────────
 
-/// Map a printable character to a (keycode, needs_shift) pair on a US layout.
+/// Type a string into the focused element of `target`, supporting ANY Unicode
+/// (including CJK / emoji) via `CGEventKeyboardSetUnicodeString`.
 ///
-/// Covers letters, digits, whitespace, and the ASCII punctuation reachable from
-/// the US keyboard — including the shifted symbols (`@ : ? "` …) that an agent
-/// routinely needs to type emails, URLs, and JSON. Returns `None` for anything
-/// not directly typable (e.g. non-ASCII), which the caller surfaces as an error.
-fn char_to_keystroke(ch: char) -> Option<(u16, bool)> {
-    // Whitespace and direct keys.
-    match ch {
-        ' ' => return Some((49, false)),         // space
-        '\n' | '\r' => return Some((36, false)), // return
-        '\t' => return Some((48, false)),        // tab
-        _ => {}
-    }
-
-    // Uppercase letters: lowercase keycode + shift.
-    if ch.is_ascii_uppercase() {
-        return key_name_to_code(&ch.to_ascii_lowercase().to_string()).map(|c| (c, true));
-    }
-
-    // Shifted symbols map onto an unshifted base key + shift.
-    let shifted_base = match ch {
-        '!' => Some("1"),
-        '@' => Some("2"),
-        '#' => Some("3"),
-        '$' => Some("4"),
-        '%' => Some("5"),
-        '^' => Some("6"),
-        '&' => Some("7"),
-        '*' => Some("8"),
-        '(' => Some("9"),
-        ')' => Some("0"),
-        '_' => Some("-"),
-        '+' => Some("="),
-        '{' => Some("["),
-        '}' => Some("]"),
-        '|' => Some("\\"),
-        ':' => Some(";"),
-        '"' => Some("'"),
-        '<' => Some(","),
-        '>' => Some("."),
-        '?' => Some("/"),
-        '~' => Some("`"),
-        _ => None,
-    };
-    if let Some(base) = shifted_base {
-        return key_name_to_code(base).map(|c| (c, true));
-    }
-
-    // Everything else (lowercase letters, digits, and unshifted punctuation
-    // like `- = [ ] ; ' \ , . / ` `) resolves directly.
-    key_name_to_code(&ch.to_string()).map(|c| (c, false))
-}
-
-/// Type a string of text into the currently focused element.
-///
-/// This sends raw keyboard events for each character (US layout). For long
-/// strings or non-ASCII text, prefer setting the clipboard and pasting.
-pub fn type_text(text: &str) -> Result<()> {
-    let shift = key_name_to_code("shift").expect("shift keycode is defined");
+/// Unlike a keycode-based approach, this carries the literal character payload
+/// on each key event, so it does not depend on the active keyboard layout and
+/// can produce characters (e.g. 中文) that have no key on a US layout. Each
+/// character is sent as its own key-down/key-up pair for broad app compatibility.
+pub fn type_text(text: &str, target: InputTarget) -> Result<()> {
     for ch in text.chars() {
-        let (code, needs_shift) = char_to_keystroke(ch)
-            .ok_or_else(|| NovaError::Input(format!("cannot type character: {ch:?}")))?;
-        if needs_shift {
-            post_key(shift, true)?;
-            thread::sleep(Duration::from_millis(1));
-            tap_key(code)?;
-            post_key(shift, false)?;
-        } else {
-            tap_key(code)?;
-        }
+        let mut buf = [0u16; 2];
+        let utf16: &[u16] = ch.encode_utf16(&mut buf);
+
+        let down = CGEvent::new_keyboard_event(event_source()?, 0, true)
+            .map_err(|_| NovaError::Input("failed to create keyboard event".into()))?;
+        down.set_string_from_utf16_unchecked(utf16);
+        post_event(&down, target);
+
+        let up = CGEvent::new_keyboard_event(event_source()?, 0, false)
+            .map_err(|_| NovaError::Input("failed to create keyboard event".into()))?;
+        up.set_string_from_utf16_unchecked(utf16);
+        post_event(&up, target);
+
+        thread::sleep(Duration::from_millis(2));
     }
     Ok(())
 }
@@ -504,58 +452,36 @@ mod tests {
         assert!(err.to_string().contains("unknown key"), "{err}");
     }
 
-    // ── char_to_keystroke ───────────────────────────────────────────
+    // ── modifier flags ──────────────────────────────────────────────
 
     #[test]
-    fn char_to_keystroke_letters_and_case() {
-        assert_eq!(char_to_keystroke('a'), Some((0, false)));
-        assert_eq!(char_to_keystroke('A'), Some((0, true)));
+    fn modifier_flag_maps_modifier_keycodes() {
+        // The chord only works if the modifier keycode contributes its flag —
+        // this is the bit that was missing (bare keycodes set no flag).
+        assert_eq!(modifier_flag(55), CGEventFlags::CGEventFlagCommand);
+        assert_eq!(modifier_flag(59), CGEventFlags::CGEventFlagControl);
+        assert_eq!(modifier_flag(60), CGEventFlags::CGEventFlagShift); // right_shift
+        assert_eq!(modifier_flag(58), CGEventFlags::CGEventFlagAlternate);
+        // A non-modifier (main) key contributes nothing.
+        assert_eq!(modifier_flag(8), CGEventFlags::empty()); // 'c'
     }
 
     #[test]
-    fn char_to_keystroke_digits_unshifted() {
-        assert_eq!(char_to_keystroke('1'), Some((18, false)));
-        assert_eq!(char_to_keystroke('0'), Some((29, false)));
+    fn parsed_combo_folds_into_expected_flags() {
+        let (mods, _keys) = parse_combo("ctrl+cmd+f").unwrap();
+        let flags = mods
+            .iter()
+            .fold(CGEventFlags::empty(), |acc, &c| acc | modifier_flag(c));
+        assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(flags.contains(CGEventFlags::CGEventFlagControl));
+        assert!(!flags.contains(CGEventFlags::CGEventFlagShift));
     }
 
-    #[test]
-    fn char_to_keystroke_whitespace() {
-        assert_eq!(char_to_keystroke(' '), Some((49, false)));
-        assert_eq!(char_to_keystroke('\n'), Some((36, false)));
-        assert_eq!(char_to_keystroke('\t'), Some((48, false)));
-    }
+    // ── InputTarget ─────────────────────────────────────────────────
 
     #[test]
-    fn char_to_keystroke_shifted_symbols() {
-        // These are exactly the chars the old type_text could not produce.
-        assert_eq!(char_to_keystroke('@'), Some((19, true))); // shift+2
-        assert_eq!(char_to_keystroke('!'), Some((18, true))); // shift+1
-        assert_eq!(char_to_keystroke(':'), Some((41, true))); // shift+;
-        assert_eq!(char_to_keystroke('?'), Some((44, true))); // shift+/
-        assert_eq!(char_to_keystroke('"'), Some((39, true))); // shift+'
-        assert_eq!(char_to_keystroke('_'), Some((27, true))); // shift+-
-    }
-
-    #[test]
-    fn char_to_keystroke_unshifted_punctuation() {
-        assert_eq!(char_to_keystroke('-'), Some((27, false)));
-        assert_eq!(char_to_keystroke('.'), Some((47, false)));
-        assert_eq!(char_to_keystroke(';'), Some((41, false)));
-        assert_eq!(char_to_keystroke('/'), Some((44, false)));
-    }
-
-    #[test]
-    fn char_to_keystroke_covers_a_realistic_email() {
-        // Regression guard: "user.name@example.com" must be fully typable.
-        for ch in "user.name@example.com".chars() {
-            assert!(char_to_keystroke(ch).is_some(), "cannot type {ch:?}");
-        }
-    }
-
-    #[test]
-    fn char_to_keystroke_rejects_non_ascii() {
-        assert_eq!(char_to_keystroke('é'), None);
-        assert_eq!(char_to_keystroke('中'), None);
-        assert_eq!(char_to_keystroke('€'), None);
+    fn input_target_is_global_only_for_global() {
+        assert!(InputTarget::Global.is_global());
+        assert!(!InputTarget::Pid(123).is_global());
     }
 }

@@ -20,6 +20,29 @@ struct Cli {
     /// Self-test: do a direct capture (no MCP server) and print timing, then exit.
     #[arg(long)]
     selftest: bool,
+
+    /// DEBUG: dump the Accessibility tree of the app whose window/name matches
+    /// this substring (e.g. "Arc"), then exit. No MCP needed. Stdout = the tree.
+    #[arg(long, value_name = "APP")]
+    dump_ax: Option<String>,
+
+    /// DEBUG: list the Set-of-Mark actionable elements nova would mark for the
+    /// app matching this substring, then exit. No MCP needed.
+    #[arg(long, value_name = "APP")]
+    marks: Option<String>,
+
+    /// DEBUG: hit-test a grid over the content area of the app matching this
+    /// substring and print, per distinct element, its role/actions and whether
+    /// the actionable-ancestor climb accepts it. Shows WHY visible rows aren't
+    /// marked. No MCP needed.
+    #[arg(long, value_name = "APP")]
+    hit_dump: Option<String>,
+
+    /// DEBUG: in ONE process, enable web-AX then probe the app repeatedly over
+    /// several rounds — tests whether a long-lived process stabilizes Chromium's
+    /// full semantic tree (the "Homerow way"). No MCP needed.
+    #[arg(long, value_name = "APP")]
+    ax_warm: Option<String>,
 }
 
 #[tokio::main]
@@ -83,6 +106,66 @@ async fn main() -> Result<()> {
                 "[SELFTEST] TIMED OUT after 20s ({:.0} ms)",
                 t.elapsed().as_secs_f64() * 1000.0
             ),
+        }
+        return Ok(());
+    }
+
+    // ── DEBUG CLI subcommands (no MCP) ──────────────────────────────
+    if let Some(app) = cli.dump_ax.as_deref() {
+        match nova::tools::window::pid_for_window(app) {
+            Some((pid, _frame)) => {
+                eprintln!("[dump-ax] {app:?} -> pid {pid}");
+                print!("{}", nova::tools::elements::dump_tree(pid, 4000));
+            }
+            None => eprintln!("[dump-ax] no on-screen window matching {app:?}"),
+        }
+        return Ok(());
+    }
+    if let Some(app) = cli.marks.as_deref() {
+        match nova::tools::window::pid_for_window(app) {
+            Some((pid, frame)) => {
+                eprintln!("[marks] {app:?} -> pid {pid} clip={frame:?}");
+                let els = nova::tools::elements::collect_actionable(pid, 400, Some(frame));
+                eprintln!("[marks] {} actionable elements:", els.len());
+                for (i, (el, _)) in els.iter().enumerate() {
+                    println!(
+                        "[{}] {} {:?} @({:.0},{:.0} {:.0}x{:.0})",
+                        i + 1,
+                        el.role,
+                        el.label,
+                        el.x,
+                        el.y,
+                        el.width,
+                        el.height
+                    );
+                }
+            }
+            None => eprintln!("[marks] no on-screen window matching {app:?}"),
+        }
+        return Ok(());
+    }
+    if let Some(app) = cli.hit_dump.as_deref() {
+        match nova::tools::window::pid_for_window(app) {
+            Some((pid, frame)) => {
+                eprintln!("[hit-dump] {app:?} -> pid {pid} clip={frame:?}");
+                // Skip the left ~280px (native sidebar) so we probe just the
+                // web/content region whose rows aren't getting marked.
+                print!(
+                    "{}",
+                    nova::tools::elements::hit_dump(pid, frame, 24.0, 280.0)
+                );
+            }
+            None => eprintln!("[hit-dump] no on-screen window matching {app:?}"),
+        }
+        return Ok(());
+    }
+    if let Some(app) = cli.ax_warm.as_deref() {
+        match nova::tools::window::pid_for_window(app) {
+            Some((pid, frame)) => {
+                eprintln!("[ax-warm] {app:?} -> pid {pid} clip={frame:?}");
+                print!("{}", nova::tools::elements::ax_warm_probe(pid, frame, 12));
+            }
+            None => eprintln!("[ax-warm] no on-screen window matching {app:?}"),
         }
         return Ok(());
     }

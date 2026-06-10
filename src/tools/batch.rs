@@ -6,6 +6,7 @@
 /// takes a screenshot with the dedicated `screenshot` tool after a batch runs.
 use crate::display::view::ViewFrame;
 use crate::error::Result;
+use crate::tools::input::InputTarget;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -36,15 +37,19 @@ pub enum BatchAction {
 /// Execute a sequence of actions in order, stopping at the first failure.
 /// Returns a status line for each action that ran. Coordinates are mapped to
 /// logical points through `view` — the active screenshot's coordinate frame.
-pub async fn execute_batch(actions: Vec<BatchAction>, view: ViewFrame) -> Result<Vec<String>> {
+pub async fn execute_batch(
+    actions: Vec<BatchAction>,
+    view: ViewFrame,
+    target: InputTarget,
+) -> Result<Vec<String>> {
     let mut results = Vec::with_capacity(actions.len());
     for action in actions {
-        results.push(execute_action(action, view).await?);
+        results.push(execute_action(action, view, target).await?);
     }
     Ok(results)
 }
 
-async fn execute_action(action: BatchAction, view: ViewFrame) -> Result<String> {
+async fn execute_action(action: BatchAction, view: ViewFrame, target: InputTarget) -> Result<String> {
     use crate::tools::input;
 
     match action {
@@ -55,31 +60,31 @@ async fn execute_action(action: BatchAction, view: ViewFrame) -> Result<String> 
         }
         BatchAction::LeftClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::left_click_at(lx, ly)?;
+            input::left_click_at(lx, ly, target)?;
             Ok(format!("left clicked at ({x}, {y})"))
         }
         BatchAction::RightClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::right_click_at(lx, ly)?;
+            input::right_click_at(lx, ly, target)?;
             Ok(format!("right clicked at ({x}, {y})"))
         }
         BatchAction::DoubleClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::mouse_move(lx, ly)?;
-            std::thread::sleep(Duration::from_millis(10));
-            input::double_click()?;
+            input::double_click_at(lx, ly, target)?;
             Ok(format!("double clicked at ({x}, {y})"))
         }
         BatchAction::Scroll { lines } => {
-            input::scroll(lines)?;
+            // Scroll at the view's center when no explicit position is given.
+            let (cx, cy) = view.to_logical(view.screenshot.0 / 2.0, view.screenshot.1 / 2.0);
+            input::scroll_at(cx, cy, lines, target)?;
             Ok(format!("scrolled {lines} lines"))
         }
         BatchAction::KeyCombo { key } => {
-            input::key_combo(&key)?;
+            input::key_combo(&key, target)?;
             Ok(format!("pressed {key}"))
         }
         BatchAction::TypeText { text } => {
-            input::type_text(&text)?;
+            input::type_text(&text, target)?;
             Ok(format!("typed {text:?}"))
         }
         BatchAction::Wait { ms } => {
@@ -128,6 +133,7 @@ mod tests {
         let out = execute_batch(
             vec![BatchAction::Wait { ms: 1 }, BatchAction::Wait { ms: 1 }],
             view,
+            InputTarget::Global,
         )
         .await
         .unwrap();

@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["full"] }
 screencapturekit = { version = "7.0", features = ["macos_14_0"] }
 
 # Mouse/keyboard events (CoreGraphics CGEvent)
-core-graphics = { version = "0.25", features = ["highsierra"] }
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 
 # macOS Accessibility API (window/app introspection)
 accessibility = "0.2"

@@ -17,6 +17,12 @@ pub struct ScreenshotImage {
     pub view: ViewFrame,
     /// Set-of-Mark annotations (empty unless `marks` was requested).
     pub marks: Vec<Mark>,
+    /// The marked elements' live AX handles + centers, for clicking by mark
+    /// number (empty unless `marks` was requested).
+    pub mark_targets: Vec<crate::tools::elements::CachedElement>,
+    /// Owning process id for a single-window capture (for background input
+    /// routing); `None` for full-display captures.
+    pub target_pid: Option<i32>,
 }
 
 impl From<Capture> for ScreenshotImage {
@@ -28,6 +34,8 @@ impl From<Capture> for ScreenshotImage {
             mime_type: "image/jpeg",
             view: c.view,
             marks: c.marks,
+            mark_targets: c.mark_targets,
+            target_pid: c.target_pid,
         }
     }
 }

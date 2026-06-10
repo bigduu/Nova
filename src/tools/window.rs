@@ -39,6 +39,32 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
     Ok(windows)
 }
 
+/// Process id and global-logical frame `(x, y, w, h)` of the first on-screen
+/// window whose title OR owning-app name contains `query` (case-insensitive).
+/// For CLI debugging (`--dump-ax`, `--marks`) where we target an app by name.
+/// The frame is used as the off-screen cull clip. Needs Screen Recording.
+pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
+    let q = query.to_lowercase();
+    let content = SCShareableContent::create()
+        .with_on_screen_windows_only(true)
+        .with_exclude_desktop_windows(true)
+        .get()
+        .ok()?;
+
+    content.windows().into_iter().find_map(|w| {
+        let title = w.title().unwrap_or_default();
+        let app = w.owning_application()?;
+        let app_name = app.application_name();
+        if title.to_lowercase().contains(&q) || app_name.to_lowercase().contains(&q) {
+            let pid = app.process_id();
+            let f = w.frame();
+            (pid > 0).then_some((pid, (f.origin.x, f.origin.y, f.size.width, f.size.height)))
+        } else {
+            None
+        }
+    })
+}
+
 /// System UI layers to skip when guessing the frontmost user app.
 fn is_system_ui(app: &str) -> bool {
     matches!(

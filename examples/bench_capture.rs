@@ -31,7 +31,7 @@ fn bench_plain(rounds: usize) {
 }
 
 fn bench_region(rounds: usize) {
-    eprintln!("\n== region zoom (native full-res capture + crop) x{rounds} ==");
+    eprintln!("\n== region zoom (sourceRect — captures only the region) x{rounds} ==");
     let rect = (100.0, 100.0, 400.0, 300.0);
     for i in 0..rounds {
         let t = Instant::now();

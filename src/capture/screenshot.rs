@@ -5,6 +5,7 @@ use crate::display::scaling::{compute_target_dims, TargetDims};
 use crate::display::view::ViewFrame;
 use base64::Engine;
 use screencapturekit::{
+    cg::CGRect,
     screenshot_manager::{CGImageExt, SCScreenshotManager},
     shareable_content::SCShareableContent,
     stream::{configuration::SCStreamConfiguration, content_filter::SCContentFilter},
@@ -48,6 +49,15 @@ pub struct Capture {
     pub view: ViewFrame,
     /// Set-of-Mark annotations (empty unless `marks` was requested).
     pub marks: Vec<Mark>,
+    /// The marked elements' live AX handles + centers, keyed by mark number, so
+    /// the server can click by mark number (AX action, coordinate fallback).
+    /// Parallel to `marks`; empty unless `marks` was requested.
+    pub mark_targets: Vec<crate::tools::elements::CachedElement>,
+    /// Owning process id of the captured window, when this is a single-window
+    /// capture. Lets the server deliver subsequent input directly to that
+    /// process (background-style) instead of the global event stream. `None`
+    /// for full-display captures.
+    pub target_pid: Option<i32>,
 }
 
 /// Capture the main display as a JPEG screenshot (no overlays).
@@ -61,7 +71,7 @@ pub fn capture_display() -> Result<ScreenshotResult, String> {
 /// Capture the main display, applying any requested overlays before encoding.
 pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
     let (filter, target) = main_display_filter()?;
-    let img = capture_rgb_via(filter, target)?;
+    let img = capture_rgb_via(filter, target, None)?;
 
     let display = crate::display::geometry::primary_display();
     let view = ViewFrame {
@@ -117,22 +127,30 @@ pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture,
 
     let target = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
     let filter = SCContentFilter::create().with_window(&window).build();
-    let img = capture_rgb_via(filter, target)?;
+    let img = capture_rgb_via(filter, target, None)?;
 
     let view = ViewFrame {
         origin: (frame.origin.x, frame.origin.y),
         region: (frame.size.width, frame.size.height),
         screenshot: (img.width() as f64, img.height() as f64),
     };
-    finish(img, opts, view, pid)
+    let mut capture = finish(img, opts, view, pid)?;
+    // This is a single-window capture: remember the owning process so the server
+    // can deliver clicks/scroll/typing straight to it (background input).
+    capture.target_pid = pid;
+    Ok(capture)
 }
 
 /// Zoom: capture the global-logical rectangle `(x, y, w, h)` at the display's
-/// *native* resolution and crop to it, so a small region fills the model's
-/// resolution budget and becomes legible. This is the grounding tool for apps
-/// that expose no Accessibility tree (WeChat, Electron, games): the model takes
-/// an overview, then zooms a region to read exact positions. Clicks against the
-/// zoomed image map back through its [`ViewFrame`].
+/// *native* resolution, so a small region fills the model's resolution budget
+/// and becomes legible. This is the grounding tool for apps that expose no
+/// Accessibility tree (WeChat, Electron, games): the model takes an overview,
+/// then zooms a region to read exact positions. Clicks against the zoomed image
+/// map back through its [`ViewFrame`].
+///
+/// Only the region itself is captured (ScreenCaptureKit `sourceRect`), not the
+/// whole display followed by a crop — fewer pixels to composite and encode, so a
+/// focused capture is cheaper than a full-display shot.
 pub fn capture_region_with(
     rect: (f64, f64, f64, f64),
     opts: CaptureOptions,
@@ -142,46 +160,32 @@ pub fn capture_region_with(
         return Err("region has zero size".to_string());
     }
 
-    // Capture the whole main display at native pixel resolution.
     let main = core_graphics::display::CGDisplay::main();
     let logical = main.bounds().size;
     if logical.width <= 0.0 || logical.height <= 0.0 {
         return Err("main display has no geometry".to_string());
     }
-    let native_w = main.pixels_wide() as u32;
-    let native_h = (native_w as f64 * logical.height / logical.width).round() as u32;
 
+    // Clamp the rect to the display so the sourceRect stays in-bounds.
+    let x = x.clamp(0.0, logical.width);
+    let y = y.clamp(0.0, logical.height);
+    let w = (w).min(logical.width - x);
+    let h = (h).min(logical.height - y);
+    if w <= 0.0 || h <= 0.0 {
+        return Err("region lies outside the display".to_string());
+    }
+
+    // Native pixels-per-point of the main display. The output buffer is sized to
+    // the region's native pixels (capped at the model budget), and SCK scales the
+    // captured sourceRect into it — preserving aspect ratio, so no letterboxing.
+    let scale = main.pixels_wide() as f64 / logical.width;
+    let region_native_w = (w * scale).round().max(1.0) as u32;
+    let region_native_h = (h * scale).round().max(1.0) as u32;
+    let target = compute_target_dims(region_native_w, region_native_h);
+
+    // Capture ONLY the region via sourceRect (display points, top-left origin).
     let (filter, _) = main_display_filter()?;
-    let img = capture_rgb_via(
-        filter,
-        TargetDims {
-            width: native_w,
-            height: native_h,
-        },
-    )?;
-
-    // Map the logical rect to actual captured pixels (robust to SCK rounding).
-    let sx = img.width() as f64 / logical.width;
-    let sy = img.height() as f64 / logical.height;
-    let cx = (x * sx).clamp(0.0, img.width() as f64 - 1.0) as u32;
-    let cy = (y * sy).clamp(0.0, img.height() as f64 - 1.0) as u32;
-    let cw = ((w * sx).round() as u32).clamp(1, img.width() - cx);
-    let ch = ((h * sy).round() as u32).clamp(1, img.height() - cy);
-
-    let crop = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
-
-    // Downscale the crop only if it still exceeds the max dimension.
-    let target = compute_target_dims(crop.width(), crop.height());
-    let out = if target.width == crop.width() && target.height == crop.height() {
-        crop
-    } else {
-        image::imageops::resize(
-            &crop,
-            target.width,
-            target.height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    };
+    let out = capture_rgb_via(filter, target, Some(CGRect::new(x, y, w, h)))?;
 
     let view = ViewFrame {
         origin: (x, y),
@@ -206,9 +210,9 @@ fn finish(
     if opts.grid {
         crate::capture::overlay::draw_grid(&mut img);
     }
-    let marks = match (opts.marks, pid) {
+    let (marks, mark_targets) = match (opts.marks, pid) {
         (true, Some(pid)) => build_marks(&mut img, view, pid),
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
 
     let (width, height) = (img.width(), img.height());
@@ -221,18 +225,32 @@ fn finish(
         },
         view,
         marks,
+        mark_targets,
+        // Set by the window-capture path; full-display/region captures leave it
+        // None (no single owning process to target).
+        target_pid: None,
     })
 }
 
-/// Maximum number of Set-of-Mark boxes to draw (avoid clutter).
-const MAX_MARKS: usize = 60;
+/// Maximum number of Set-of-Mark boxes to draw. Raised from 60 so a dense web
+/// view (e.g. a full mail list) gets numbered comprehensively rather than cut
+/// off after the chrome; still bounded to keep the overlay legible.
+const MAX_MARKS: usize = 150;
 
 /// Enumerate actionable elements of `pid`, draw numbered boxes for those visible
 /// in `view`, and return the mark list with screenshot-pixel centers.
-fn build_marks(img: &mut image::RgbImage, view: ViewFrame, pid: i32) -> Vec<Mark> {
+fn build_marks(
+    img: &mut image::RgbImage,
+    view: ViewFrame,
+    pid: i32,
+) -> (Vec<Mark>, Vec<crate::tools::elements::CachedElement>) {
     let (sw, sh) = (img.width() as f64, img.height() as f64);
     let mut marks = Vec::new();
-    for el in crate::tools::elements::actionable_elements(pid, 400) {
+    let mut targets = Vec::new();
+    // Clip element discovery to the captured view's global-logical rectangle so
+    // the walk skips off-screen subtrees (background tabs, scrolled-off rows).
+    let clip = (view.origin.0, view.origin.1, view.region.0, view.region.1);
+    for (el, handle) in crate::tools::elements::collect_actionable(pid, 400, Some(clip)) {
         let (cx, cy) = el.center();
         let (px, py) = view.to_screenshot(cx, cy);
         // Keep only elements whose center is inside the captured image.
@@ -245,16 +263,26 @@ fn build_marks(img: &mut image::RgbImage, view: ViewFrame, pid: i32) -> Vec<Mark
         crate::capture::overlay::draw_mark(img, tlx, tly, brx - tlx, bry - tly, number);
         marks.push(Mark {
             number,
-            role: el.role,
-            label: el.label,
+            role: el.role.clone(),
+            label: el.label.clone(),
             x: px,
             y: py,
+        });
+        // Cache the live handle + global-logical center so the server can click
+        // this mark by number (AX action first, coordinate fallback).
+        targets.push(crate::tools::elements::CachedElement {
+            number,
+            handle,
+            center: (cx, cy),
+            role: el.role,
+            label: el.label,
+            pid,
         });
         if marks.len() >= MAX_MARKS {
             break;
         }
     }
-    marks
+    (marks, targets)
 }
 
 /// Build a content filter + target dims for the *main* display — the same one
@@ -281,10 +309,21 @@ fn main_display_filter() -> Result<(SCContentFilter, TargetDims), String> {
 }
 
 /// Capture `filter` at `target` dims into an in-memory RGB image (no overlays).
-fn capture_rgb_via(filter: SCContentFilter, target: TargetDims) -> Result<image::RgbImage, String> {
-    let config = SCStreamConfiguration::new()
+///
+/// `source_rect` (in display points, top-left origin) restricts ScreenCaptureKit
+/// to compositing+encoding only that rectangle, so a region capture is cheaper
+/// than grabbing the whole display. `None` captures the full filter content.
+fn capture_rgb_via(
+    filter: SCContentFilter,
+    target: TargetDims,
+    source_rect: Option<CGRect>,
+) -> Result<image::RgbImage, String> {
+    let mut config = SCStreamConfiguration::new()
         .with_width(target.width)
         .with_height(target.height);
+    if let Some(rect) = source_rect {
+        config = config.with_source_rect(rect);
+    }
 
     let image = SCScreenshotManager::capture_image(&filter, &config)
         .map_err(|e| format!("capture_image: {e}"))?;

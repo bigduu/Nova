@@ -30,6 +30,21 @@ pub struct NovaServer {
     /// so the model always works in "the pixels of the last image it saw".
     /// `None` until the first screenshot — clicks then assume the full display.
     view: std::sync::Arc<std::sync::Mutex<Option<crate::display::view::ViewFrame>>>,
+    /// Owning process id of the most recently window-captured app. When set,
+    /// input is delivered straight to that process (background-style, without
+    /// moving the user's cursor); when `None`, input goes to the global event
+    /// stream (frontmost app). Set by `window=` captures, cleared by full-display
+    /// captures, preserved across `region=` zooms.
+    target_pid: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
+    /// Actionable elements from the most recent `marks=true` screenshot, keyed by
+    /// mark number. Lets `click_mark` drive a control by the number the model saw
+    /// (AX action straight on the cached handle, coordinate fallback to its
+    /// center) instead of re-matching a guessed label. Replaced on each
+    /// `marks=true` capture; the numbers go stale once the UI changes, so the
+    /// model is told to re-shoot with `marks=true` before clicking.
+    marks: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u32, crate::tools::elements::CachedElement>>,
+    >,
 }
 
 impl NovaServer {
@@ -56,6 +71,176 @@ impl NovaServer {
     fn to_logical(&self, x: f64, y: f64) -> (f64, f64) {
         self.current_view().to_logical(x, y)
     }
+
+    /// The input delivery target. Default is the global event stream (foreground)
+    /// — it works for every app, including browsers/Electron that ignore
+    /// process-targeted events. When `background` is requested AND a window has
+    /// been captured, deliver straight to that window's process instead (no
+    /// cursor movement, app need not be frontmost) — reliable for native apps.
+    fn current_target(&self, background: bool) -> crate::tools::input::InputTarget {
+        match (background, *self.target_pid.lock().expect("target_pid mutex")) {
+            (true, Some(pid)) => crate::tools::input::InputTarget::Pid(pid),
+            _ => crate::tools::input::InputTarget::Global,
+        }
+    }
+
+    /// Record (or clear) the process to deliver input to after a capture.
+    fn set_target_pid(&self, pid: Option<i32>) {
+        *self.target_pid.lock().expect("target_pid mutex") = pid;
+    }
+
+    /// The process the accessibility-action tools operate on: the last
+    /// window-captured app if known, otherwise the frontmost app.
+    fn current_ax_pid(&self) -> Option<i32> {
+        self.target_pid
+            .lock()
+            .expect("target_pid mutex")
+            .or_else(crate::tools::window::frontmost_app_pid)
+    }
+
+    /// Replace the Set-of-Mark cache with the elements of the latest `marks`
+    /// capture (clearing the old numbers, which are now stale).
+    fn set_marks(&self, targets: Vec<crate::tools::elements::CachedElement>) {
+        let mut cache = self.marks.lock().expect("marks mutex");
+        cache.clear();
+        for t in targets {
+            cache.insert(t.number, t);
+        }
+    }
+
+    /// Look up a marked element by its number (cloned out so the AX call runs
+    /// off the lock).
+    fn get_mark(&self, number: u32) -> Option<crate::tools::elements::CachedElement> {
+        self.marks.lock().expect("marks mutex").get(&number).cloned()
+    }
+
+    /// Run the requested capture on a blocking thread with a hard timeout.
+    ///
+    /// ScreenCaptureKit / CoreGraphics calls are blocking and can stall (or hang)
+    /// when the host's window-server session is busy, so a wedged capture must
+    /// fail fast instead of starving the async runtime — which would make the MCP
+    /// client drop the connection.
+    async fn acquire_capture(
+        &self,
+        plan: &CapturePlan,
+    ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
+        let (region, window, grid, marks) =
+            (plan.region, plan.window.clone(), plan.grid, plan.marks);
+        let capture = tokio::task::spawn_blocking(move || match (region, &window) {
+            (Some(rect), _) => crate::tools::screenshot::take_region_screenshot(rect, grid, marks),
+            (None, Some(query)) => {
+                crate::tools::screenshot::take_window_screenshot(query, grid, marks)
+            }
+            (None, None) => crate::tools::screenshot::take_screenshot(grid, marks),
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => Err(format!("screenshot task failed: {join_err}")),
+            Err(_) => Err("screenshot timed out after 20s (the display capture or accessibility \
+                           walk did not complete; try again, or without marks)"
+                .to_string()),
+        }
+    }
+
+    /// Turn a fresh capture into an MCP result: record its coordinate frame and
+    /// marks, update input routing, keep the captured app's AX tree warm, and
+    /// build the text note + image content.
+    fn render_capture(
+        &self,
+        mut img: crate::tools::screenshot::ScreenshotImage,
+        plan: &CapturePlan,
+    ) -> rmcp::model::CallToolResult {
+        // Record this image's coordinate frame so later clicks map back to the
+        // right physical spot (essential for window/region captures).
+        self.set_view(img.view);
+        // Cache the marked elements (by number) so `click_mark` can drive them
+        // directly. A `marks=true` shot replaces the set; the numbers go stale on
+        // UI changes, so the model re-shoots before clicking.
+        if plan.marks {
+            self.set_marks(std::mem::take(&mut img.mark_targets));
+        }
+        // Update the input delivery target. A `window=` capture targets that
+        // window's process (background input); a full-display capture clears it
+        // (global input); a `region=` zoom keeps whatever the prior capture set
+        // (it zooms into the same surface).
+        if plan.region.is_some() {
+            // preserve existing target
+        } else if plan.window.is_some() {
+            self.set_target_pid(img.target_pid);
+        } else {
+            self.set_target_pid(None);
+        }
+        // Keep the captured app's Chromium/Electron accessibility tree warm so the
+        // NEXT marks capture is fast — the full semantic tree stays built instead
+        // of paying the ~2-3s cold materialization again. Harmless for native apps
+        // (the enable is rejected).
+        if let Some(pid) = img.target_pid {
+            crate::tools::elements::warmer().warm(pid);
+        }
+        let note = screenshot_note(&img, plan);
+        rmcp::model::CallToolResult::success(vec![
+            rmcp::model::Content::text(note),
+            rmcp::model::Content::image(img.base64_data, img.mime_type),
+        ])
+    }
+}
+
+/// Click a cached marked element. Strongly prefers the Accessibility action
+/// (true background: no cursor movement, no window raise, always lands on the
+/// target). Only if the whole subtree/ancestry exposes no AX action does it fall
+/// back to a synthesized coordinate click — and even then it first raises the
+/// owning app (so the click hits the target instead of merely focusing the
+/// window, the classic "first click only focuses" miss) and restores the cursor
+/// afterward so the user's pointer is left where it was. Runs on a blocking
+/// thread (AX + input calls block).
+fn click_cached_mark(
+    el: crate::tools::elements::CachedElement,
+    target: crate::tools::input::InputTarget,
+) -> Result<String, String> {
+    use crate::tools::input::{cursor_position, left_click_at, mouse_move};
+
+    // A page refresh / navigation destroys and rebuilds the app's AX tree, so a
+    // handle cached from an earlier marks shot can dangle. Detect that up front
+    // and tell the model to re-shoot, rather than press a destroyed node or (via
+    // a reused frame) the wrong element.
+    if !el.handle.is_alive() {
+        return Err(format!(
+            "mark [{}] is stale — the page changed or refreshed since the marks screenshot, so its \
+             numbering no longer applies. Take a fresh screenshot(marks=true) and click the new number.",
+            el.number
+        ));
+    }
+
+    let ax_err = match el.handle.click() {
+        Ok(action) => {
+            return Ok(format!(
+                "performed {action} on mark [{}] {} {:?} (via Accessibility — no cursor movement)",
+                el.number, el.role, el.label
+            ));
+        }
+        Err(e) => e,
+    };
+
+    // Coordinate fallback. Remember the cursor so we can put it back, and raise
+    // the target app so the click registers on its content rather than just
+    // activating the window.
+    let saved = cursor_position().ok();
+    crate::tools::elements::raise_app(el.pid);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    let (cx, cy) = el.center;
+    let click = left_click_at(cx, cy, target);
+    if let Some((sx, sy)) = saved {
+        let _ = mouse_move(sx, sy); // restore the user's pointer
+    }
+    click.map_err(|e| {
+        format!("mark [{}]: AX action failed ({ax_err}) and coordinate click failed: {e}", el.number)
+    })?;
+    Ok(format!(
+        "mark [{}] {} {:?}: no AX action ({ax_err}); raised its app and coordinate-clicked the \
+         center ({cx:.0}, {cy:.0}), cursor restored",
+        el.number, el.role, el.label
+    ))
 }
 
 /// Render the Set-of-Mark list appended to the screenshot's text note.
@@ -65,7 +250,8 @@ fn format_marks(marks: &[crate::capture::screenshot::Mark]) -> String {
             .to_string();
     }
     let mut s = format!(
-        "\n{} actionable elements (click a mark's center):",
+        "\n{} actionable elements — call click_mark(number=N) to activate one by its [N] \
+         (drives the control directly in the background; falls back to clicking its center):",
         marks.len()
     );
     for m in marks {
@@ -82,39 +268,212 @@ fn format_marks(marks: &[crate::capture::screenshot::Mark]) -> String {
     s
 }
 
+/// Build the text note that accompanies a capture: the subject + coordinate
+/// frame (so the model never has to guess the pixel range), plus the grid legend
+/// and the Set-of-Mark list when those overlays are present.
+fn screenshot_note(img: &crate::tools::screenshot::ScreenshotImage, plan: &CapturePlan) -> String {
+    let subject = if plan.region.is_some() {
+        "a zoomed region".to_string()
+    } else {
+        match &plan.window {
+            Some(q) => format!("window matching {q:?}"),
+            None => "the main display".to_string(),
+        }
+    };
+    let (w, h) = (img.width, img.height);
+    let mut note = format!(
+        "Screenshot of {subject}, {w}x{h} px. Click/move/scroll coordinates use this \
+         image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left. If a \
+         target is too small to locate precisely, retry with marks=true to click \
+         elements by number (click_mark) or zoom_region(x,y,w,h) to magnify part of it.",
+    );
+    if plan.grid {
+        // Tell the model the grid is there and how to read it — the overlaid
+        // magenta rules are easy to overlook, and the text makes the spacing
+        // explicit so it reads coordinates off the nearest labeled lines instead
+        // of estimating.
+        let step = crate::capture::overlay::grid_step(w, h);
+        note.push_str(&format!(
+            "\nA magenta coordinate grid is overlaid: vertical rules every {step}px \
+             labeled with their x value along the TOP and BOTTOM edges, horizontal \
+             rules every {step}px labeled with their y value along the LEFT and RIGHT \
+             edges. Read a target's (x, y) from the nearest labeled rules (interpolate \
+             within the {step}px cell) instead of estimating from scratch."
+        ));
+    }
+    if plan.marks {
+        note.push_str(&format_marks(&img.marks));
+    }
+    note
+}
+
 // ── Tool implementations ────────────────────────────────────────────
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::tool;
-use rmcp::tool_router;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
 
+/// Server-level usage guidance surfaced to the model via the MCP `initialize`
+/// `instructions` field. A client that injects server instructions into the
+/// system prompt (bamboo does, only while nova is connected) gives the model the
+/// coordinate-grounding workflow up front — which is the single biggest fix for
+/// "the agent can't find the right pixel to click".
+///
+/// The failure this prevents (observed in real sessions): the model drives off
+/// full-display screenshots, which are downscaled to ~1280px wide. On a busy or
+/// Retina desktop the target app is a fraction of that frame, so list rows /
+/// sidebar entries / buttons end up ~10px tall — too small to READ (it misreads
+/// labels) and too small to CLICK precisely (it guesses y-coordinates and keeps
+/// missing). The cure is to capture the specific window or zoom a region before
+/// reading or clicking.
+pub const NOVA_INSTRUCTIONS: &str = "\
+Nova controls the macOS desktop: screenshots + mouse/keyboard. All click/move/\
+scroll coordinates are in the pixel space of the MOST RECENT screenshot.
+
+Targeting — how to click the right thing, in PRIORITY ORDER (do not jump to raw \
+coordinates first):
+1. BEST — click by mark number. A window/display `screenshot` numbers every \
+actionable element BY DEFAULT (marks is on; needs Accessibility); each is listed \
+as `[N] role \"label\"`. Then call `click_mark(number=N)` to activate [N]. This drives the \
+control straight through the Accessibility tree (background, no cursor) and only \
+falls back to a coordinate click if the control has no AX action. It does NOT \
+guess pixels and does NOT match a label string, so it is the most reliable path — \
+use it whenever the element you want appears in the marks list. The numbers reset \
+on every marks capture and go stale when the UI changes, so take a fresh \
+`screenshot(marks=true)` right before each `click_mark`.
+2. Let the app find it for you. Prefer the app's OWN search (click the search box, \
+type the name, press Enter) over visually scanning a long list — far more reliable \
+than estimating a row's position.
+3. FALLBACK — read coordinates, only when the target is NOT in the marks list. \
+Web pages are covered by marks too: real links/buttons on semantic pages, and on \
+div-rendered pages (e.g. webmail) the list ROWS are numbered as well (clicking \
+such a row lands via a coordinate at its center, so it still needs a fresh \
+`marks=true` shot right before, since these go stale on scroll). So coordinate \
+mode is mainly for canvas / game / custom-rendered surfaces that expose no marks \
+at all. Then:
+  - Do NOT guess off a full-display `screenshot`: it is downscaled (max ~1280px \
+wide), so on a busy/Retina screen small UI is only a few pixels tall — too small \
+to read or click. Capture the specific window: `screenshot(window=\"<name>\")` \
+(larger, sharper, clicks map into the window automatically), and if the target is \
+still small, zoom: `zoom_region(x, y, w, h)` re-captures that rectangle (in the \
+last shot's pixel space) at native resolution. Click only once the target is \
+clearly legible.
+  - In this coordinate mode a labeled magenta grid is overlaid automatically \
+(rules with their pixel x/y values along the edges): read a target's (x, y) off \
+the nearest labeled rules and interpolate within the cell instead of guessing. \
+(The grid is shown whenever marks is off; with marks on it is hidden since you \
+click by number — pass grid=true if you want both.)
+
+Confirm every action — do NOT operate blind:
+- After EACH input action (click, scroll, type, key press) take a screenshot to \
+see the result BEFORE deciding the next action. Never fire several scrolls or \
+clicks in a row without a screenshot in between — you cannot read what you \
+scrolled past, and an unconfirmed click may have missed.
+- When reading a long view by scrolling, scroll ONE step, screenshot, read, then \
+scroll again — capturing each screen so nothing is skipped.
+
+Keep captures focused — once you know WHICH part of the screen matters, capture \
+just that part instead of the whole display:
+- `screenshot(window=\"<name>\")` or `zoom_region(x, y, w, h)` returns a smaller, \
+sharper image. Smaller means fewer pixels for the model to read, so each turn \
+carries less context and comes back faster — and a `zoom_region` capture grabs \
+only that rectangle, so it is also quicker to take than a full-display shot. \
+Reserve the full-display capture for when you genuinely need the whole screen \
+(orienting, finding which window to target); for repeated work inside one app or \
+one panel, stay scoped to it.
+
+Typing:
+- `type_text` accepts ANY text, including non-ASCII (e.g. 中文) and emoji. To \
+enter something by name, click the field and type it directly.
+
+Foreground vs background input:
+- By DEFAULT clicks/scroll/typing go to the foreground (the real cursor moves; \
+the target window is activated). This works for EVERY app, including browsers \
+and Electron apps (Arc, Chrome, VS Code, Slack, WeChat). Use this unless you \
+have a specific reason not to.
+- For a NATIVE macOS app you do not want to disturb, pass background=true on a \
+click/scroll/type to deliver it straight to the captured window's process \
+without moving your cursor or raising the window. It only works after a \
+`window=` capture, and browsers / Electron / custom-rendered apps IGNORE it — \
+so if a background action has no visible effect, retry WITHOUT background.
+- The Accessibility tree also drives controls directly, in the background, with no \
+coordinates: `click_mark(number=N)` (preferred — pick the element from a \
+`marks=true` shot), or by label match `ax_click`/`ax_set_value`/`ax_focus` (a \
+substring of the element's role/label). The label-match tools need a semantic \
+control, so they return \"no element\" on div-rendered pages (use click_mark on a \
+row mark there instead) and on canvas/game surfaces with no tree.
+
+Workflow for \"find X inside app Y\": screenshot(window=\"Y\", marks=true) → if X is \
+listed, click_mark(number=N) → screenshot to confirm. If X is not in the marks, \
+use Y's search box or zoom_region until X is legible, then click its coordinates \
+→ screenshot to confirm.";
+
 // Tool parameter types — all stub, to be fleshed out in implementation.
+
+/// A resolved capture request — what to capture and how to annotate it. Both
+/// the `screenshot` and `zoom_region` tools build one of these, then share the
+/// capture step ([`NovaServer::acquire_capture`]) and the render step
+/// ([`NovaServer::render_capture`]).
+struct CapturePlan {
+    /// Global-logical rect `(x, y, w, h)` for a `zoom_region` zoom; `None` for a
+    /// window or full-display `screenshot`.
+    region: Option<(f64, f64, f64, f64)>,
+    /// Window-title/app substring for a `window=` capture; `None` otherwise.
+    window: Option<String>,
+    /// Overlay the coordinate grid.
+    grid: bool,
+    /// Draw + cache Set-of-Mark element boxes.
+    marks: bool,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScreenshotParams {
-    /// Overlay a labeled coordinate grid (rules + pixel labels every 100px) to
-    /// help read off precise click coordinates. Defaults to false.
+    /// Overlay a labeled coordinate grid (magenta rules + pixel labels) for
+    /// reading off click coordinates. Omitted by default it follows the AX-first
+    /// rule: OFF when `marks` is on (you click by number, not coordinates), ON
+    /// when `marks` is off (coordinate mode). Pass grid=true to force it on
+    /// alongside marks, or grid=false to suppress it.
     #[serde(default)]
-    pub grid: bool,
+    pub grid: Option<bool>,
     /// Capture only a single on-screen window instead of the whole display —
     /// a case-insensitive substring of the window title or app name (e.g.
     /// "Safari", "Settings"). Smaller, sharper image = less context and better
     /// click precision. Subsequent clicks map to this window automatically.
     #[serde(default)]
     pub window: Option<String>,
-    /// Set-of-Mark: draw numbered boxes over actionable UI elements (buttons,
-    /// links, fields) and return a list with each element's exact center. Click
-    /// a mark's listed center instead of estimating coordinates — the most
-    /// reliable targeting. Needs Accessibility permission. Defaults to false.
+    /// Set-of-Mark: number every actionable UI element (buttons, links, fields)
+    /// and list each as `[N] role "label"`, so you can activate it with
+    /// click_mark(number=N) — the most reliable targeting, no coordinate
+    /// guessing. Defaults ON (AX-first). Needs Accessibility permission. Covers
+    /// native controls AND web content — real links/buttons on semantic pages,
+    /// and on div-rendered pages (e.g. webmail) the list rows are numbered too
+    /// (their click lands via a coordinate at the row center). Only canvas/game-
+    /// style surfaces with no AX come back empty. Pass marks=false for pure
+    /// coordinate mode.
     #[serde(default)]
-    pub marks: bool,
-    /// Zoom into a rectangle `[x, y, width, height]` of the CURRENT image (the
-    /// last screenshot's pixel space) and re-capture it at native resolution.
-    /// The crop is sharp and legible — use it to read exact positions in apps
-    /// with no Accessibility tree (WeChat, Electron, games) before clicking.
-    /// Clicks afterward map into the zoomed region automatically.
+    pub marks: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ZoomRegionParams {
+    /// Left edge of the rectangle, in the CURRENT image's pixel space (the last
+    /// screenshot's coordinates).
+    pub x: f64,
+    /// Top edge of the rectangle, in the current image's pixel space.
+    pub y: f64,
+    /// Width of the rectangle in current-image pixels. Must be > 0.
+    pub width: f64,
+    /// Height of the rectangle in current-image pixels. Must be > 0.
+    pub height: f64,
+    /// Overlay a labeled coordinate grid. Defaults ON for a zoom (coordinate
+    /// mode); pass grid=false to suppress it.
     #[serde(default)]
-    pub region: Option<Vec<f64>>,
+    pub grid: Option<bool>,
+    /// Set-of-Mark numbering. Defaults OFF for a zoom — the zoom is the tool for
+    /// surfaces that expose no marks, so you read coordinates off the grid. Pass
+    /// marks=true to also number any actionable elements inside the region.
+    #[serde(default)]
+    pub marks: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -127,6 +486,10 @@ pub struct MouseMoveParams {
 pub struct ClickParams {
     pub x: f64,
     pub y: f64,
+    /// Deliver in the background to the captured window's process (native apps
+    /// only; browsers/Electron ignore it). Default false = foreground.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -134,16 +497,28 @@ pub struct ScrollParams {
     pub x: f64,
     pub y: f64,
     pub lines: i32,
+    /// Deliver in the background to the captured window's process (native apps
+    /// only). Default false = foreground.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KeyParams {
     pub key: String,
+    /// Deliver in the background to the captured window's process (native apps
+    /// only). Default false = foreground.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TypeParams {
     pub text: String,
+    /// Deliver in the background to the captured window's process (native apps
+    /// only). Default false = foreground.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -167,100 +542,122 @@ pub struct BatchParams {
     pub actions: Vec<crate::tools::batch::BatchAction>,
 }
 
-#[tool_router(server_handler)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AxQueryParams {
+    /// Case-insensitive substring matching the target element's accessibility
+    /// role or label/title (e.g. "Send", "Search", "AXButton").
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AxSetValueParams {
+    /// Case-insensitive substring matching the target element's role or label.
+    pub query: String,
+    /// The value to set (e.g. the text to place into a field).
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClickMarkParams {
+    /// The mark number [N] of the element to activate, as listed by the most
+    /// recent `screenshot(marks=true)`.
+    pub number: u32,
+    /// Deliver the coordinate-click fallback in the background to the captured
+    /// window's process (native apps only). The AX action is always background;
+    /// this only affects the fallback. Default false = foreground.
+    #[serde(default)]
+    pub background: bool,
+}
+
+#[tool_router]
 impl NovaServer {
     #[tool(
         name = "screenshot",
-        description = "Take a screenshot and return a base64 JPEG plus a text note with its pixel \
+        description = "Capture the screen — the whole main display, or a single window with \
+                       window=\"<name>\" — and return a base64 JPEG plus a text note with its pixel \
                        dimensions. ALL coordinate-taking tools (mouse_move, *_click, scroll) expect \
                        coordinates in THIS image's pixel space — origin (0,0) top-left, x right, y \
                        down — so read target positions directly off the returned image; subsequent \
-                       clicks are mapped through it automatically. Pass window=\"<name>\" to capture \
-                       just one window (substring of its title or app name) — smaller, sharper, less \
-                       context, better precision. Pass grid=true for a labeled coordinate grid, \
-                       marks=true to box+number actionable elements (needs Accessibility), or \
-                       region=[x,y,w,h] to zoom into part of the current image at native resolution \
-                       — the way to read small targets in apps with no accessibility (WeChat, \
-                       Electron, games)."
+                       clicks are mapped through it automatically.\n\
+                       PREFER window=\"<name>\" (substring of its title or app name) over the whole \
+                       display whenever you are working inside one app: a full-display shot is \
+                       downscaled to ~1280px wide, so small UI (list rows, sidebar items, buttons) \
+                       becomes only a few pixels — too small to read or click accurately. A window \
+                       capture is larger and sharper, returns a smaller image (fewer pixels → less \
+                       context, faster turn), and clicks map into the window automatically. \
+                       marks is ON by default: it boxes+numbers actionable elements (needs \
+                       Accessibility) and lists each as [N] — activate one with click_mark(number=N), \
+                       the most reliable way to click with no coordinate guessing. A magenta \
+                       coordinate grid (for reading x/y) is shown automatically when marks is off and \
+                       hidden when it is on; pass grid=true to force both, or marks=false for pure \
+                       coordinate mode. If a target is still too small to click, use zoom_region to \
+                       magnify part of this image."
     )]
-    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = %p.grid, marks = %p.marks, region = ?p.region), level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, grid = ?p.grid, marks = ?p.marks), level = "info")]
     async fn screenshot(
         &self,
         Parameters(p): Parameters<ScreenshotParams>,
     ) -> rmcp::model::CallToolResult {
-        // `region` zooms into the CURRENT image's pixel space, so resolve it
-        // against the active view frame into a global-logical rectangle.
-        let region_logical = match &p.region {
-            Some(r) if r.len() == 4 && r[2] > 0.0 && r[3] > 0.0 => {
-                let view = self.current_view();
-                let (tlx, tly) = view.to_logical(r[0], r[1]);
-                let (brx, bry) = view.to_logical(r[0] + r[2], r[1] + r[3]);
-                Some((tlx, tly, brx - tlx, bry - tly))
-            }
-            Some(_) => {
-                return err_result("region must be [x, y, width, height] with width,height > 0")
-            }
-            None => None,
+        // AX-first default: marks ON for a window/display capture (click by
+        // number). The grid follows — hidden when marks is on, shown otherwise.
+        let marks = p.marks.unwrap_or(true);
+        let grid = p.grid.unwrap_or(!marks);
+        let plan = CapturePlan {
+            region: None,
+            window: p.window,
+            grid,
+            marks,
         };
 
-        // ScreenCaptureKit / CoreGraphics calls are blocking and can stall (or
-        // hang) when the host process's window-server session is busy. Run them
-        // on a blocking thread with a hard timeout so a stuck capture returns an
-        // error fast instead of starving the async runtime — which would make
-        // the MCP client drop the connection.
-        let (grid, marks, window) = (p.grid, p.marks, p.window.clone());
-        let capture = tokio::task::spawn_blocking(move || match (region_logical, &window) {
-            (Some(rect), _) => crate::tools::screenshot::take_region_screenshot(rect, grid, marks),
-            (None, Some(query)) => {
-                crate::tools::screenshot::take_window_screenshot(query, grid, marks)
-            }
-            (None, None) => crate::tools::screenshot::take_screenshot(grid, marks),
-        });
-        let captured = match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(join_err)) => {
-                return err_result(&format!("screenshot task failed: {join_err}"))
-            }
-            Err(_) => {
-                return err_result(
-                    "screenshot timed out after 20s (the display capture or accessibility walk \
-                     did not complete; try again, or without marks)",
-                )
-            }
+        // Acquire the capture (blocking + timeout), then render it into a result.
+        match self.acquire_capture(&plan).await {
+            Ok(img) => self.render_capture(img, &plan),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "zoom_region",
+        description = "Zoom into a rectangle of the CURRENT image (the last screenshot's pixel \
+                       space) and re-capture it at native resolution — a sharp, legible magnified \
+                       view. Only that rectangle is captured (not the whole display), so it is also \
+                       smaller and quicker to take than a full-display shot. Use it to read exact \
+                       positions on surfaces that expose no marks (canvas/games, custom-rendered \
+                       views) before clicking, or to stay scoped while working inside one area. \
+                       Pass x, y, width, height in the current image's pixels (width,height > 0). \
+                       The returned image becomes the new coordinate space, and clicks afterward map \
+                       into the zoomed region automatically. marks defaults OFF (read coordinates off \
+                       the overlaid grid); grid defaults ON. Take a screenshot first so there is an \
+                       image to zoom into."
+    )]
+    #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y, w = %p.width, h = %p.height, grid = ?p.grid, marks = ?p.marks), level = "info")]
+    async fn zoom_region(
+        &self,
+        Parameters(p): Parameters<ZoomRegionParams>,
+    ) -> rmcp::model::CallToolResult {
+        if p.width <= 0.0 || p.height <= 0.0 {
+            return err_result("width and height must be > 0");
+        }
+        // The rectangle is in the CURRENT image's pixel space; resolve it against
+        // the active view frame into a global-logical rectangle.
+        let view = self.current_view();
+        let (tlx, tly) = view.to_logical(p.x, p.y);
+        let (brx, bry) = view.to_logical(p.x + p.width, p.y + p.height);
+        let region = (tlx, tly, brx - tlx, bry - tly);
+
+        // A zoom is the coordinate-reading tool for surfaces with no AX tree, so
+        // marks defaults OFF and the grid defaults ON.
+        let marks = p.marks.unwrap_or(false);
+        let grid = p.grid.unwrap_or(!marks);
+        let plan = CapturePlan {
+            region: Some(region),
+            window: None,
+            grid,
+            marks,
         };
-        match captured {
-            Ok(img) => {
-                // Record this image's coordinate frame so later clicks map back
-                // to the right physical spot (essential for window/region captures).
-                self.set_view(img.view);
-                // Give the model an explicit coordinate frame of reference: without
-                // the image dimensions it has to guess the pixel range, which is a
-                // major source of mis-clicks.
-                let subject = if region_logical.is_some() {
-                    "a zoomed region".to_string()
-                } else {
-                    match &p.window {
-                        Some(q) => format!("window matching {q:?}"),
-                        None => "the main display".to_string(),
-                    }
-                };
-                let mut note = format!(
-                    "Screenshot of {subject}, {w}x{h} px. Click/move/scroll coordinates use this \
-                     image's pixel space: x in [0, {w}], y in [0, {h}], origin top-left. If a \
-                     target is too small to locate precisely, retry with region=[x,y,w,h] to zoom \
-                     in, grid=true for a coordinate ruler, or marks=true for clickable elements.",
-                    w = img.width,
-                    h = img.height,
-                );
-                if p.marks {
-                    note.push_str(&format_marks(&img.marks));
-                }
-                rmcp::model::CallToolResult::success(vec![
-                    rmcp::model::Content::text(note),
-                    rmcp::model::Content::image(img.base64_data, img.mime_type),
-                ])
-            }
+
+        match self.acquire_capture(&plan).await {
+            Ok(img) => self.render_capture(img, &plan),
             Err(e) => err_result(&e),
         }
     }
@@ -281,6 +678,9 @@ impl NovaServer {
         }
     }
 
+    // NOTE: mouse_move always moves the real global cursor (there is no
+    // background equivalent); clicks/scroll/typing below honor current_target().
+
     #[tool(
         name = "left_click",
         description = "Left-click at the given (x, y) coordinates (in screenshot space)."
@@ -291,7 +691,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::left_click_at(lx, ly) {
+        match crate::tools::input::left_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -307,7 +707,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::right_click_at(lx, ly) {
+        match crate::tools::input::right_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -323,10 +723,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::mouse_move(lx, ly).and_then(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::tools::input::double_click()
-        }) {
+        match crate::tools::input::double_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -338,14 +735,10 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y, lines = %p.lines), level = "info")]
     async fn scroll(&self, Parameters(p): Parameters<ScrollParams>) -> rmcp::model::CallToolResult {
-        // Move to the requested position first so the scroll lands on the
-        // intended region, not wherever the cursor happened to be.
+        // scroll_at positions the scroll at (lx, ly): it moves the cursor there
+        // for global delivery, or sets the event location for a process target.
         let (lx, ly) = self.to_logical(p.x, p.y);
-        let result = crate::tools::input::mouse_move(lx, ly).and_then(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::tools::input::scroll(p.lines)
-        });
-        match result {
+        match crate::tools::input::scroll_at(lx, ly, p.lines, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("scrolled {} lines at ({}, {})", p.lines, p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -357,7 +750,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(key = %p.key), level = "info")]
     async fn key_combo(&self, Parameters(p): Parameters<KeyParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::key_combo(&p.key) {
+        match crate::tools::input::key_combo(&p.key, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("pressed {}", p.key)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -372,7 +765,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::input::type_text(&p.text) {
+        match crate::tools::input::type_text(&p.text, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -478,10 +871,133 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::batch::execute_batch(p.actions, self.current_view()).await {
+        match crate::tools::batch::execute_batch(p.actions, self.current_view(), self.current_target(false))
+            .await
+        {
             Ok(results) => ok_text(results.join("\n")),
             Err(e) => err_result(&e.to_string()),
         }
+    }
+
+    #[tool(
+        name = "ax_click",
+        description = "Press a UI control directly through the macOS Accessibility tree — no \
+                       coordinates, no cursor movement, works in the background (the app need not \
+                       be frontmost). `query` is a case-insensitive substring of the element's \
+                       accessibility role or label/title (e.g. \"Send\", \"Search\"). Targets the \
+                       last window-captured app (or the frontmost app). Only works for apps that \
+                       expose an accessibility tree; if it returns \"no element matching\", fall \
+                       back to screenshot + left_click."
+    )]
+    #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
+    async fn ax_click(&self, Parameters(p): Parameters<AxQueryParams>) -> rmcp::model::CallToolResult {
+        let Some(pid) = self.current_ax_pid() else {
+            return err_result("no target app (take a window screenshot first)");
+        };
+        match crate::tools::elements::ax_click(pid, &p.query) {
+            Ok(msg) => ok_text(msg),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "ax_set_value",
+        description = "Set a control's value directly through the Accessibility tree — e.g. fill a \
+                       text field without focusing or typing. Background, no cursor. `query` \
+                       matches the element's role/label; `value` is the text to set. Targets the \
+                       last window-captured app (or frontmost). Native-app accessibility only."
+    )]
+    #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
+    async fn ax_set_value(
+        &self,
+        Parameters(p): Parameters<AxSetValueParams>,
+    ) -> rmcp::model::CallToolResult {
+        let Some(pid) = self.current_ax_pid() else {
+            return err_result("no target app (take a window screenshot first)");
+        };
+        match crate::tools::elements::ax_set_value(pid, &p.query, &p.value) {
+            Ok(msg) => ok_text(msg),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "ax_focus",
+        description = "Move keyboard focus to a control through the Accessibility tree (background, \
+                       no cursor). `query` matches the element's role/label. Targets the last \
+                       window-captured app (or frontmost). Native-app accessibility only."
+    )]
+    #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
+    async fn ax_focus(&self, Parameters(p): Parameters<AxQueryParams>) -> rmcp::model::CallToolResult {
+        let Some(pid) = self.current_ax_pid() else {
+            return err_result("no target app (take a window screenshot first)");
+        };
+        match crate::tools::elements::ax_focus(pid, &p.query) {
+            Ok(msg) => ok_text(msg),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "click_mark",
+        description = "Activate an actionable element by the mark NUMBER shown in the most recent \
+                       screenshot(marks=true) — the reliable way to click without guessing \
+                       coordinates. Drives the control directly through the Accessibility tree (no \
+                       cursor movement, works in the background); if the control exposes no AX \
+                       action, falls back to a click at the element's center. Numbers go stale when \
+                       the UI changes, so take a fresh screenshot(marks=true) right before calling \
+                       this. If the number is unknown, re-shoot with marks=true."
+    )]
+    #[tracing::instrument(skip_all, fields(number = %p.number, background = %p.background), level = "info")]
+    async fn click_mark(
+        &self,
+        Parameters(p): Parameters<ClickMarkParams>,
+    ) -> rmcp::model::CallToolResult {
+        let Some(el) = self.get_mark(p.number) else {
+            return err_result(&format!(
+                "unknown mark [{}] — take a screenshot with marks=true first (numbers reset each \
+                 marks capture)",
+                p.number
+            ));
+        };
+        let target = self.current_target(p.background);
+        // AX + input calls block; run them off the async runtime.
+        match tokio::task::spawn_blocking(move || click_cached_mark(el, target)).await {
+            Ok(Ok(msg)) => ok_text(msg),
+            Ok(Err(e)) => err_result(&e),
+            Err(join_err) => err_result(&format!("click_mark task failed: {join_err}")),
+        }
+    }
+
+    #[tool(
+        name = "dump_ax",
+        description = "DEBUG: dump the target app's Accessibility tree (roles, subroles, labels, \
+                       actions, frames) as indented text — to diagnose why some elements are not \
+                       marked. Targets the last window-captured app (or frontmost)."
+    )]
+    #[tracing::instrument(skip_all, level = "info")]
+    async fn dump_ax(&self) -> rmcp::model::CallToolResult {
+        let Some(pid) = self.current_ax_pid() else {
+            return err_result("no target app (take a window screenshot first)");
+        };
+        match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500)).await
+        {
+            Ok(text) => ok_text(text),
+            Err(join_err) => err_result(&format!("dump_ax task failed: {join_err}")),
+        }
+    }
+}
+
+// `#[tool_handler]` wires up call_tool/list_tools from the `tool_router()` above.
+// We provide `get_info` ourselves so it is NOT auto-generated — letting us attach
+// `instructions` (the coordinate-grounding guidance) to the `initialize` result.
+#[tool_handler]
+impl ServerHandler for NovaServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_instructions(NOVA_INSTRUCTIONS)
     }
 }
 
@@ -550,6 +1066,7 @@ mod tests {
         let router = NovaServer::tool_router();
         let expected = [
             "screenshot",
+            "zoom_region",
             "mouse_move",
             "left_click",
             "right_click",
@@ -565,6 +1082,11 @@ mod tests {
             "write_clipboard",
             "wait",
             "batch_actions",
+            "ax_click",
+            "ax_set_value",
+            "ax_focus",
+            "click_mark",
+            "dump_ax",
         ];
         for name in expected {
             assert!(router.has_route(name), "tool not registered: {name}");
@@ -600,5 +1122,152 @@ mod tests {
             result.content[0].as_image().is_some(),
             "expected image content"
         );
+    }
+
+    /// Build a minimal `ScreenshotImage` for note-formatting tests (no display).
+    fn fake_image(
+        width: u32,
+        height: u32,
+        marks: Vec<crate::capture::screenshot::Mark>,
+    ) -> crate::tools::screenshot::ScreenshotImage {
+        crate::tools::screenshot::ScreenshotImage {
+            base64_data: "Zm9v".to_string(),
+            width,
+            height,
+            mime_type: "image/jpeg",
+            view: crate::display::view::ViewFrame {
+                origin: (0.0, 0.0),
+                region: (width as f64, height as f64),
+                screenshot: (width as f64, height as f64),
+            },
+            marks,
+            mark_targets: Vec::new(),
+            target_pid: None,
+        }
+    }
+
+    fn mark(number: u32, role: &str, label: &str, x: f64, y: f64) -> crate::capture::screenshot::Mark {
+        crate::capture::screenshot::Mark {
+            number,
+            role: role.to_string(),
+            label: label.to_string(),
+            x,
+            y,
+        }
+    }
+
+    #[test]
+    fn note_names_the_main_display_and_states_the_pixel_frame() {
+        let img = fake_image(1280, 536, Vec::new());
+        let plan = CapturePlan {
+            region: None,
+            window: None,
+            grid: false,
+            marks: false,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains("the main display"), "{note}");
+        assert!(note.contains("1280x536 px"), "{note}");
+        assert!(note.contains("x in [0, 1280]") && note.contains("y in [0, 536]"), "{note}");
+        // No overlays requested → no grid legend, no marks list.
+        assert!(!note.contains("magenta coordinate grid"), "{note}");
+        assert!(!note.contains("actionable elements"), "{note}");
+    }
+
+    #[test]
+    fn note_names_the_window_subject() {
+        let img = fake_image(800, 600, Vec::new());
+        let plan = CapturePlan {
+            region: None,
+            window: Some("Safari".to_string()),
+            grid: false,
+            marks: false,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains(r#"window matching "Safari""#), "{note}");
+    }
+
+    #[test]
+    fn note_names_a_zoomed_region() {
+        let img = fake_image(400, 300, Vec::new());
+        let plan = CapturePlan {
+            region: Some((100.0, 100.0, 400.0, 300.0)),
+            window: None,
+            grid: false,
+            marks: false,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains("a zoomed region"), "{note}");
+    }
+
+    #[test]
+    fn note_includes_grid_legend_when_grid_on() {
+        let img = fake_image(1280, 536, Vec::new());
+        let plan = CapturePlan {
+            region: None,
+            window: None,
+            grid: true,
+            marks: false,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains("magenta coordinate grid"), "{note}");
+    }
+
+    #[test]
+    fn note_lists_marks_when_marks_on() {
+        let img = fake_image(1280, 536, vec![mark(1, "AXButton", "Send", 10.0, 20.0)]);
+        let plan = CapturePlan {
+            region: None,
+            window: None,
+            grid: false,
+            marks: true,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains("[1] AXButton \"Send\""), "{note}");
+        assert!(note.contains("click_mark"), "{note}");
+    }
+
+    #[test]
+    fn note_reports_empty_marks_explicitly() {
+        let img = fake_image(1280, 536, Vec::new());
+        let plan = CapturePlan {
+            region: None,
+            window: None,
+            grid: false,
+            marks: true,
+        };
+        let note = screenshot_note(&img, &plan);
+        assert!(note.contains("No actionable elements detected"), "{note}");
+    }
+
+    /// A zero/negative-size zoom must be rejected up front, before any capture
+    /// runs — so this path is hermetic (no display / Screen Recording needed).
+    #[tokio::test]
+    async fn zoom_region_rejects_nonpositive_size() {
+        let server = NovaServer::new();
+
+        let zero = server
+            .zoom_region(Parameters(ZoomRegionParams {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                grid: None,
+                marks: None,
+            }))
+            .await;
+        assert_eq!(zero.is_error, Some(true));
+
+        let negative = server
+            .zoom_region(Parameters(ZoomRegionParams {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: -5.0,
+                grid: None,
+                marks: None,
+            }))
+            .await;
+        assert_eq!(negative.is_error, Some(true));
     }
 }

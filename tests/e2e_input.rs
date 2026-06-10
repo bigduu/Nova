@@ -12,7 +12,8 @@
 //! a smoke test that proves the posting path returns `Ok` and restores state.
 
 use nova::tools::input::{
-    cursor_position, double_click, left_click_at, mouse_move, right_click_at, scroll, type_text,
+    cursor_position, double_click_at, key_combo, left_click_at, mouse_move, right_click_at,
+    scroll_at, type_text, InputTarget,
 };
 use std::thread::sleep;
 use std::time::Duration;
@@ -50,14 +51,14 @@ fn click_events_post_without_error() {
     let original = cursor_position().unwrap_or((0.0, 0.0));
     let (x, y) = (display.width as f64 - 2.0, display.height as f64 - 2.0);
 
-    left_click_at(x, y).expect("left_click_at should post");
+    left_click_at(x, y, InputTarget::Global).expect("left_click_at should post");
     sleep(Duration::from_millis(50));
-    double_click().expect("double_click should post");
+    double_click_at(x, y, InputTarget::Global).expect("double_click_at should post");
     sleep(Duration::from_millis(50));
-    right_click_at(x, y).expect("right_click_at should post");
+    right_click_at(x, y, InputTarget::Global).expect("right_click_at should post");
     sleep(Duration::from_millis(50));
     // Dismiss any context menu the right-click opened.
-    let _ = nova::tools::input::key_combo("escape");
+    let _ = key_combo("escape", InputTarget::Global);
 
     let _ = mouse_move(original.0, original.1);
 }
@@ -67,9 +68,10 @@ fn click_events_post_without_error() {
 #[test]
 #[ignore = "posts real scroll events"]
 fn scroll_events_post_without_error() {
-    scroll(3).expect("scroll up should post");
+    let (x, y) = cursor_position().unwrap_or((400.0, 400.0));
+    scroll_at(x, y, 3, InputTarget::Global).expect("scroll up should post");
     sleep(Duration::from_millis(20));
-    scroll(-3).expect("scroll down should post");
+    scroll_at(x, y, -3, InputTarget::Global).expect("scroll down should post");
 }
 
 /// Smoke test for keyboard text entry. Types into the focused window, so it is
@@ -78,8 +80,9 @@ fn scroll_events_post_without_error() {
 #[test]
 #[ignore = "types into the focused window"]
 fn type_text_posts_without_error() {
-    // Exercises lowercase, uppercase (shift), digit, and a shifted symbol.
-    type_text("Nova7@").expect("type_text should post");
+    // Exercises ASCII (lower/upper/digit/symbol) AND non-ASCII (CJK) — the
+    // Unicode path must handle characters with no key on a US layout.
+    type_text("Nova7@ 中文", InputTarget::Global).expect("type_text should post");
 }
 
 // ── application ─────────────────────────────────────────────────────

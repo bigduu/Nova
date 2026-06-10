@@ -9,10 +9,25 @@
 
 use image::{Rgb, RgbImage};
 
-/// Grid spacing in screenshot pixels.
-const GRID_STEP: u32 = 100;
 /// Label scale (each font pixel becomes SCALE x SCALE).
 const LABEL_SCALE: u32 = 2;
+
+/// Grid spacing (px) chosen from the image resolution. Finer than the old fixed
+/// 100px (so a target sits in a smaller cell) but floored so the labels never
+/// collide and the rules don't bury the content:
+/// - up to ~1500px (a normal window / `region=` zoom): 50px
+/// - ~1500–3000px (a Retina full display): 100px
+/// - larger: 200px
+///
+/// For a `region=` zoom the extra precision comes from the zoom itself (the crop
+/// maps back to global points exactly), so a readable 50px grid is plenty there.
+pub fn grid_step(w: u32, h: u32) -> u32 {
+    match w.max(h) {
+        0..=1500 => 50,
+        1501..=3000 => 100,
+        _ => 200,
+    }
+}
 
 const GRID_COLOR: Rgb<u8> = Rgb([255, 0, 255]); // magenta rules
 const LABEL_FG: Rgb<u8> = Rgb([255, 255, 0]); // yellow digits
@@ -127,27 +142,37 @@ pub fn draw_mark(img: &mut RgbImage, x: f64, y: f64, w: f64, h: f64, number: u32
 }
 
 /// Overlay a labeled coordinate grid on the image, in place.
+///
+/// Rules are drawn every `step` pixels (finer on small images), and each rule is
+/// labeled at BOTH opposite edges — x along the top and bottom, y along the left
+/// and right — so a target anywhere in the frame has a labeled reference nearby
+/// without tracing a line across the whole image.
 pub fn draw_grid(img: &mut RgbImage) {
     let (w, h) = (img.width(), img.height());
+    let step = grid_step(w, h);
+    let label_h = DIGIT_H * LABEL_SCALE;
 
-    // Vertical rules + x labels along the top.
-    let mut gx = GRID_STEP;
+    // Vertical rules + x labels along the top and bottom.
+    let mut gx = step;
     while gx < w {
         for y in 0..h {
             blend_half(img, gx, y, GRID_COLOR);
         }
         draw_number(img, gx + 2, 2, gx, LABEL_SCALE);
-        gx += GRID_STEP;
+        draw_number(img, gx + 2, h.saturating_sub(label_h + 2), gx, LABEL_SCALE);
+        gx += step;
     }
 
-    // Horizontal rules + y labels along the left.
-    let mut gy = GRID_STEP;
+    // Horizontal rules + y labels along the left and right.
+    let mut gy = step;
     while gy < h {
         for x in 0..w {
             blend_half(img, x, gy, GRID_COLOR);
         }
         draw_number(img, 2, gy + 2, gy, LABEL_SCALE);
-        gy += GRID_STEP;
+        let right_x = w.saturating_sub(number_width(gy, LABEL_SCALE) + 2);
+        draw_number(img, right_x, gy + 2, gy, LABEL_SCALE);
+        gy += step;
     }
 }
 
