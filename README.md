@@ -45,6 +45,45 @@ cargo run -- --http --addr 0.0.0.0:8080
 > baked in by `build.rs`, so no `DYLD_*` environment variable is needed for
 > `cargo run`/`cargo test` or the standalone binary.
 
+## Use it from an MCP client
+
+Build the binary once, then point your MCP client at it.
+
+```sh
+cargo build --release      # produces target/release/nova
+```
+
+**Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
+config. For Claude Desktop that's
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "nova": {
+      "command": "/absolute/path/to/nova/target/release/nova"
+    }
+  }
+}
+```
+
+Restart the client, then grant the **Screen Recording** and **Accessibility**
+permissions when macOS prompts (or pre-grant them to the client app under
+*System Settings → Privacy & Security*). The Nova tools then appear to the agent.
+
+**HTTP clients** — run Nova as a server and connect over Streamable HTTP:
+
+```sh
+nova --http                       # 127.0.0.1:3100/mcp
+nova --http --addr 0.0.0.0:8080   # reachable on the LAN
+```
+
+**First calls.** Take a `screenshot` to see the desktop and get the numbered
+elements, then `click_mark(number=N)` to activate one — no coordinates needed.
+Drop to `zoom_region` only when a target sits on a surface with no Accessibility
+tree (canvas, games). All pointer tools use the pixel space of the most recent
+screenshot, so screenshot → act → screenshot to confirm.
+
 ## Coordinate grounding
 
 A general LLM judging pixel coordinates off a downscaled screenshot is the main
