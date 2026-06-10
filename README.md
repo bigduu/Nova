@@ -1,10 +1,29 @@
 # Nova
 
-Computer Use MCP server for macOS — gives an LLM agent control of the desktop:
-screenshots, mouse, keyboard, scrolling, window/app introspection, and the
-clipboard, over the [Model Context Protocol](https://modelcontextprotocol.io).
+**A Computer Use implementation in Rust.** Nova is a [Model Context
+Protocol](https://modelcontextprotocol.io) server that gives an LLM agent
+control of the macOS desktop: screenshots, mouse, keyboard, scrolling,
+window/app introspection, and the clipboard — the "computer use" capability,
+built natively in Rust rather than wrapping a Python/JS automation stack.
 
-Built on ScreenCaptureKit, CoreGraphics (CGEvent), and the Accessibility APIs.
+Built directly on Apple's ScreenCaptureKit, CoreGraphics (CGEvent), and the
+Accessibility APIs — a single self-contained binary, no runtime to install.
+Connect it to any MCP client (Claude Desktop, an agent runtime, your own) over
+stdio or Streamable HTTP.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `screenshot` | Capture the whole display or a single `window=` — returns a JPEG + the pixel-coordinate contract. Numbers actionable elements (Set-of-Mark) by default. |
+| `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
+| `click_mark` | Activate a numbered element straight through the Accessibility tree (no cursor, no pixel guessing). |
+| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input, in the pixel space of the last screenshot. |
+| `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
+| `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
+| `read_clipboard` / `write_clipboard` | Clipboard access. |
+| `ax_click` / `ax_set_value` / `ax_focus` / `dump_ax` | Drive controls by Accessibility role/label. |
+| `batch_actions` | Run a sequence of input actions in one call. |
 
 ## Requirements
 
@@ -35,15 +54,20 @@ targeting precise. **All click/move/scroll tools work in the pixel space of the
 last screenshot** — the server remembers that frame and maps clicks back to the
 real screen, so the model just "clicks what it sees".
 
-- `window: "<name>"` — capture a single window (substring of its title or app
-  name) instead of the whole display. Smaller, sharper image → less context and
-  far less downscaling → better precision. Later clicks map into that window.
-- `grid: true` — overlay a labeled coordinate grid (rules + pixel labels every
-  100px) so the model can read positions straight off the axes.
-- `marks: true` — **Set-of-Mark**: draw numbered boxes over actionable UI
-  elements (via the Accessibility tree) and return a list with each element's
-  exact center. The model clicks a mark's listed center — the most reliable
-  targeting. Needs Accessibility permission; degrades to no marks without it.
+- **Set-of-Mark (default)** — `screenshot` draws numbered boxes over actionable
+  UI elements (via the Accessibility tree) and lists each one; the agent then
+  calls `click_mark(number=N)` to drive it straight through Accessibility — no
+  pixel guessing at all. The most reliable targeting. Needs Accessibility
+  permission; degrades to plain coordinates without it.
+- `screenshot(window: "<name>")` — capture a single window (substring of its
+  title or app name) instead of the whole display. Smaller, sharper image → less
+  context and far less downscaling → better precision. Later clicks map into
+  that window.
+- `zoom_region(x, y, w, h)` — magnify a rectangle of the last screenshot at
+  native resolution (capturing only that rectangle). For reading small targets
+  on surfaces that expose no Accessibility tree (canvas, games, custom views),
+  where coordinates are the only option. A labeled coordinate grid is overlaid
+  so the model reads positions straight off the axes.
 
 ## Testing
 
@@ -105,3 +129,7 @@ only reads Spotlight and is tolerant of a Spotlight-less CI host.
 cargo fmt --all -- --check
 cargo clippy --all-targets
 ```
+
+## License
+
+[MIT](LICENSE) © bigduu
