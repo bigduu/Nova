@@ -4,7 +4,6 @@
 use crate::capture::screenshot::{
     capture_display_with, capture_region_with, capture_window_with, Capture, CaptureOptions, Mark,
 };
-use crate::display::geometry::screen_recording_available;
 use crate::display::view::ViewFrame;
 
 /// Result of a screenshot tool call, ready for MCP.
@@ -64,17 +63,4 @@ pub fn take_region_screenshot(
     marks: bool,
 ) -> Result<ScreenshotImage, String> {
     Ok(capture_region_with(rect, CaptureOptions { grid, marks })?.into())
-}
-
-/// Check if screen recording permission is available.
-/// Call this early to give the user a clear error message.
-pub fn check_permission() -> Result<(), String> {
-    if screen_recording_available() {
-        Ok(())
-    } else {
-        Err("Screen Recording permission not granted. \
-             Open System Settings → Privacy & Security → Screen Recording \
-             and enable the terminal/application running Nova."
-            .to_string())
-    }
 }

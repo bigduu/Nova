@@ -180,6 +180,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Request Screen Recording access from THIS (server) process before serving —
+    // it surfaces the first-run system prompt and is a no-op once granted. Done
+    // here, not in the headless capture worker (which can't show a prompt).
+    let screen_ok = nova::display::geometry::request_screen_recording_access();
+    tracing::info!(
+        "Screen Recording access: {}",
+        if screen_ok {
+            "granted"
+        } else {
+            "not granted — accept the prompt, or add the nova binary in System \
+             Settings → Privacy & Security → Screen Recording"
+        }
+    );
+
     if cli.http {
         nova::server::run_http(&cli.addr).await
     } else {

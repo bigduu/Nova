@@ -77,6 +77,27 @@ pub fn screen_recording_available() -> bool {
     }
 }
 
+/// Request Screen Recording (screen-capture) access, prompting the user on the
+/// first undecided run and returning whether it is currently granted.
+///
+/// This is the macOS-recommended way to ask (`CGRequestScreenCaptureAccess`): it
+/// surfaces the system prompt when there is no prior decision and is a no-op (no
+/// prompt, returns `true`) once granted. Call it at startup in the MAIN process —
+/// which the OS can attribute to the launching app — and NOT in the headless
+/// capture-worker subprocess, which cannot present a prompt. Relying on the
+/// `SCShareableContent::get` side-effect from the worker is why the first-run
+/// prompt stopped appearing.
+pub fn request_screen_recording_access() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+    // SAFETY: a CoreGraphics C function taking no args and returning a bool; it
+    // triggers the TCC request and reports the current grant. Safe to call once
+    // at startup from the main thread.
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
 /// List all available displays (via ScreenCaptureKit; requires permission).
 pub fn list_displays() -> Vec<DisplayInfo> {
     let Ok(content) = SCShareableContent::get() else {
