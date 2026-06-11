@@ -410,11 +410,8 @@ clearly legible.
 the nearest labeled rules and interpolate within the cell instead of guessing. \
 (The grid is shown whenever marks is off; with marks on it is hidden since you \
 click by number — pass grid=true if you want both.)
-  - To read or click TEXT on such a marks-less surface, `ocr` is often faster \
-than eyeballing the grid: it returns every recognized line WITH a clickable \
-center in the same pixel space, so you can left_click(x, y) a line directly — and \
-it returns text only (no image), so it is cheap for pulling a lot of text at \
-once. Use `window=\"<name>\"` for sharper recognition of small text.
+  - To READ or click text on such a marks-less surface, prefer `ocr` over \
+eyeballing the grid — see \"Reading TEXT\" below.
 
 Confirm every action — do NOT operate blind:
 - After EACH input action (click, scroll, type, key press) take a screenshot to \
@@ -433,6 +430,27 @@ only that rectangle, so it is also quicker to take than a full-display shot. \
 Reserve the full-display capture for when you genuinely need the whole screen \
 (orienting, finding which window to target); for repeated work inside one app or \
 one panel, stay scoped to it.
+
+Reading TEXT — when to use `ocr`, and how to combine it with the rest:
+- USE `ocr` to (a) READ a lot of text at once (a chat thread, an article, a log, \
+a list/table) — it returns the lines as TEXT, far cheaper than parsing a \
+screenshot image; or (b) read or click text on a surface where `marks` comes \
+back EMPTY or sparse (canvas, games, image-/custom-rendered views, chat bubbles). \
+Each line carries a clickable center, so left_click(x, y) a line to click text \
+that is not an Accessibility element.
+- Do NOT reach for `ocr` when the target IS an actionable native/web control \
+(button, link, field, list row): `screenshot(marks=true)` + `click_mark` is more \
+precise — it drives the control directly with no pixel guessing. And `ocr` \
+returns no image, so when you need to SEE layout / icons / state, take a \
+`screenshot`.
+- COMBINE by role within one window: the native CHROME (sidebar, toolbar, \
+buttons) is usually marked → use marks + click_mark there; the CONTENT (message \
+bubbles, a rendered document) is often AX-less → use `ocr` to read or click it. \
+A WeChat chat is the canonical case: marks finds only the few titlebar buttons, \
+while `ocr` reads the whole conversation. Typical flow: \
+`screenshot(window=\"X\", marks=true)` to act on controls, then `ocr(window=\"X\")` \
+to read the content — and pass `window=\"<name>\"` (or `zoom_region` first) for \
+sharper recognition of small text.
 
 Typing:
 - `type_text` accepts ANY text, including non-ASCII (e.g. 中文) and emoji. To \
