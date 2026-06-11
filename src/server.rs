@@ -129,12 +129,13 @@ impl NovaServer {
     /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
     ///
     /// Phase 1 — the raw pixel capture runs in the killable capture-worker
-    /// subprocess. If it hangs, the 20s timeout fires and we KILL the worker
-    /// (freeing its stuck stream so replayd recovers); the next call respawns a
-    /// fresh one. This is what stops a single stuck capture from wedging every
-    /// later capture. Phase 2 — overlays + the Set-of-Mark Accessibility walk run
-    /// in THIS process (the cached AX handles can't cross the worker boundary),
-    /// also on a blocking thread with its own timeout.
+    /// subprocess. If it hangs (20s) the capture has wedged ScreenCaptureKit /
+    /// replayd. Killing the worker frees the worker PROCESS but NOT replayd's
+    /// stuck stream, so we also bounce `replayd` (it relaunches on demand) and
+    /// retry once — that is what actually recovers a wedge. Phase 2 — overlays +
+    /// the Set-of-Mark Accessibility walk run in THIS process (the cached AX
+    /// handles can't cross the worker boundary), on a blocking thread with its
+    /// own timeout.
     async fn acquire_capture(
         &self,
         plan: &CapturePlan,
@@ -152,21 +153,34 @@ impl NovaServer {
             marks: plan.marks,
         };
 
-        // Phase 1: raw capture in the killable worker.
+        // Phase 1: raw capture in the killable worker, with replayd-wedge recovery.
         let worker = self.capture_worker.clone();
-        let w = worker.clone();
-        let raw_task = tokio::task::spawn_blocking(move || w.capture(&request));
-        let raw = match tokio::time::timeout(std::time::Duration::from_secs(20), raw_task).await {
-            Ok(Ok(Ok(raw))) => raw,
-            Ok(Ok(Err(e))) => return Err(format!("screenshot capture failed: {e}")),
-            Ok(Err(join_err)) => return Err(format!("screenshot task failed: {join_err}")),
-            Err(_) => {
-                // The capture hung; kill the worker so its stuck stream is freed
-                // (and replayd recovers) before it can wedge the next capture.
+        let raw = match capture_once(&worker, &request, 20).await {
+            CaptureAttempt::Ok(raw) => raw,
+            CaptureAttempt::Failed(e) => return Err(format!("screenshot capture failed: {e}")),
+            CaptureAttempt::TimedOut => {
+                // A 20s raw-capture hang means ScreenCaptureKit / replayd is
+                // wedged. Kill the stuck worker AND bounce replayd (killing the
+                // worker alone does not release replayd's half of the wedge),
+                // then transparently retry once on a fresh worker + replayd.
                 worker.kill();
-                return Err("screenshot timed out after 20s — the capture worker was \
-                            restarted; retry the screenshot"
-                    .to_string());
+                bounce_replayd().await;
+                match capture_once(&worker, &request, 15).await {
+                    CaptureAttempt::Ok(raw) => raw,
+                    CaptureAttempt::Failed(e) => {
+                        return Err(format!(
+                            "screenshot capture failed after replayd restart: {e}"
+                        ))
+                    }
+                    CaptureAttempt::TimedOut => {
+                        worker.kill();
+                        return Err("screenshot timed out twice even after restarting replayd \
+                                    — the capture pipeline is wedged. Verify Screen Recording \
+                                    permission for the nova binary (README: Permissions & code \
+                                    signing)."
+                            .to_string());
+                    }
+                }
             }
         };
 
@@ -227,6 +241,47 @@ impl NovaServer {
             rmcp::model::Content::image(img.base64_data, img.mime_type),
         ])
     }
+}
+
+/// Outcome of one worker capture attempt — distinguishes a HANG (`TimedOut`,
+/// the wedge signature) from a returned error (`Failed`, e.g. a TCC denial,
+/// which comes back fast) so the caller can recover from a wedge specifically.
+enum CaptureAttempt {
+    Ok(crate::capture::screenshot::RawCapture),
+    Failed(String),
+    TimedOut,
+}
+
+/// Run one capture through the worker, bounded by `secs`.
+async fn capture_once(
+    worker: &std::sync::Arc<crate::capture::worker::CaptureWorker>,
+    request: &crate::capture::worker::CaptureRequest,
+    secs: u64,
+) -> CaptureAttempt {
+    let w = worker.clone();
+    let req = request.clone();
+    let task = tokio::task::spawn_blocking(move || w.capture(&req));
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), task).await {
+        Ok(Ok(Ok(raw))) => CaptureAttempt::Ok(raw),
+        Ok(Ok(Err(e))) => CaptureAttempt::Failed(e),
+        Ok(Err(join)) => CaptureAttempt::Failed(format!("capture task failed: {join}")),
+        Err(_) => CaptureAttempt::TimedOut,
+    }
+}
+
+/// Restart `replayd` (the ScreenCaptureKit daemon) to clear a capture wedge, then
+/// pause briefly. A capture that hangs leaves replayd holding a half-open stream;
+/// killing the stuck worker frees the worker process but not replayd's side —
+/// bouncing replayd (it relaunches on demand) is what actually recovers it.
+async fn bounce_replayd() {
+    let _ = tokio::task::spawn_blocking(|| {
+        // Absolute path: the spawning env's PATH may not include /usr/bin.
+        let _ = std::process::Command::new("/usr/bin/killall")
+            .arg("replayd")
+            .status();
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 }
 
 /// Click a cached marked element. Strongly prefers the Accessibility action

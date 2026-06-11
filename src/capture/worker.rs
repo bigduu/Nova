@@ -135,8 +135,10 @@ struct WorkerIo {
 }
 
 /// A persistent, killable capture worker. The raw SCK capture runs in the child;
-/// on a hang the server [`kill`](CaptureWorker::kill)s the child (freeing the
-/// stuck stream) and the next [`capture`](CaptureWorker::capture) respawns one.
+/// on a hang the server [`kill`](CaptureWorker::kill)s the child and the next
+/// [`capture`](CaptureWorker::capture) respawns one. (Killing the worker frees
+/// the worker process but not replayd's half of a wedged stream — the server
+/// bounces replayd separately to fully recover.)
 ///
 /// The IO handles and the kill handle live behind SEPARATE locks on purpose:
 /// `capture` holds the IO lock while blocked on the child's response, and
