@@ -29,10 +29,12 @@ stdio or Streamable HTTP.
 ## Requirements
 
 - **macOS 15+** (a transitive dependency, `apple-metal`, needs the macOS 15 SDK / Xcode 16+).
-- **Screen Recording** permission — for screenshots and `list_windows`. Grant it
-  to the terminal/app running Nova in *System Settings → Privacy & Security →
-  Screen Recording*.
-- **Accessibility** permission — for posting mouse/keyboard events.
+- **Screen Recording** permission — for `screenshot` / `ocr` / `list_windows`.
+- **Accessibility** permission — for posting mouse/keyboard events and Set-of-Mark.
+
+> Both are granted to the **nova binary itself**, not the app that launches it —
+> see [Permissions & code signing](#permissions--code-signing-macos). On a dev
+> build you must also sign nova, or the grant breaks on every rebuild.
 
 ## Run
 
@@ -68,9 +70,9 @@ config. For Claude Desktop that's
 }
 ```
 
-Restart the client, then grant the **Screen Recording** and **Accessibility**
-permissions when macOS prompts (or pre-grant them to the client app under
-*System Settings → Privacy & Security*). The Nova tools then appear to the agent.
+Restart the client; the Nova tools then appear to the agent. Grant **Screen
+Recording** and **Accessibility** to the nova binary (not the client app) — see
+[Permissions & code signing](#permissions--code-signing-macos).
 
 **HTTP clients** — run Nova as a server and connect over Streamable HTTP:
 
@@ -84,6 +86,43 @@ elements, then `click_mark(number=N)` to activate one — no coordinates needed.
 Drop to `zoom_region` only when a target sits on a surface with no Accessibility
 tree (canvas, games). All pointer tools use the pixel space of the most recent
 screenshot, so screenshot → act → screenshot to confirm.
+
+## Permissions & code signing (macOS)
+
+Two non-obvious things about how macOS grants Nova its **Screen Recording** and
+**Accessibility** permissions:
+
+**Nova is its own permission subject — grant the *nova binary*, not the launcher.**
+As a standalone CLI (not inside an `.app` bundle), Nova does **not** inherit the
+Screen Recording grant of its parent process (your terminal, Claude Desktop, or a
+host app). Add the binary itself: *System Settings → Privacy & Security → Screen
+Recording* (and *Accessibility*) → `+` → ⌘⇧G → enter the path to
+`target/release/nova`, then enable it. A headless subprocess can't trigger the
+permission prompt, so adding it by path is the reliable way.
+
+**Sign it, or the grant breaks on every rebuild.** `cargo build` produces an
+ad-hoc, *linker-signed* binary whose code-signing identity is a content hash
+(`nova-<hash>`) — it changes every build, so macOS treats each rebuild as a brand-
+new app and the grant stops applying. Sign with a stable self-signed identity so
+the grant persists:
+
+```sh
+cargo build --release
+./scripts/dev-codesign.sh --release   # re-sign after EVERY build
+```
+
+The first run creates a `Zenith Nova Code Signing` identity in your login keychain
+(click **Always Allow** once if codesign prompts) and signs the binary with a
+fixed identifier (`com.zenith.nova`). Grant the two permissions once (above);
+later rebuilds, re-signed with the same cert, keep the grant.
+
+> **Troubleshooting — `screenshot` hangs ~20s then "capture worker was restarted".**
+> Permission and window enumeration succeed but the capture itself hangs: that's a
+> wedged `replayd` (the ScreenCaptureKit daemon), usually caused by a Nova process
+> killed mid-capture leaking a stuck stream. Nova runs each capture in a killable
+> worker subprocess and restarts it on a hang, but a wedge caused by *other* stuck
+> clients needs `killall replayd` (it relaunches on demand). Don't `kill -9` a
+> capturing Nova — let it exit cleanly so it can't leak the stream.
 
 ## Coordinate grounding
 
@@ -155,10 +194,16 @@ cargo test --test e2e_input mouse_move_roundtrips_through_cursor_position -- --i
 | `list_windows_returns…` (`e2e_input`) | Enumerates on-screen windows | Screen Recording |
 | `e2e_capture_display_returns_valid_jpeg` (`e2e_screenshot`) | Captures the display, checks the JPEG | Screen Recording |
 | `e2e_capture_dims_match_target_dims_contract` (`e2e_screenshot`) | Asserts capture dims match the click-coordinate mapping | Screen Recording |
+| `ocr_recognizes_text_on_the_display` (`e2e_ocr`) | Runs Apple Vision OCR on a live capture; asserts text + in-bounds line centers | Screen Recording |
+| `worker_*` (`e2e_capture_worker`) | Capture-worker subprocess: capture, kill→respawn recovery, repeated reuse | Screen Recording |
 
 > `mouse_move_roundtrips…` is the strongest input check: it proves events
 > actually reach the window server *and* that the screenshot→logical coordinate
 > conversion is correct, all click paths share the same posting mechanism.
+>
+> Run `e2e_capture_worker` **single-threaded** (`-- --ignored --test-threads=1`):
+> each test drives its own worker, and concurrent captures from multiple
+> processes contend on the window server.
 
 `list_applications_returns_app_bundles` (in `e2e_input`) is **not** ignored — it
 only reads Spotlight and is tolerant of a Spotlight-less CI host.
