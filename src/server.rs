@@ -46,6 +46,10 @@ pub struct NovaServer {
     marks: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<u32, crate::tools::elements::CachedElement>>,
     >,
+    /// The killable subprocess that runs the raw ScreenCaptureKit capture. A
+    /// capture that hangs is recovered by killing+respawning this worker, so a
+    /// stuck capture can't wedge the whole pipeline (see [`crate::capture::worker`]).
+    capture_worker: std::sync::Arc<crate::capture::worker::CaptureWorker>,
 }
 
 impl NovaServer {
@@ -122,31 +126,61 @@ impl NovaServer {
             .cloned()
     }
 
-    /// Run the requested capture on a blocking thread with a hard timeout.
+    /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
     ///
-    /// ScreenCaptureKit / CoreGraphics calls are blocking and can stall (or hang)
-    /// when the host's window-server session is busy, so a wedged capture must
-    /// fail fast instead of starving the async runtime — which would make the MCP
-    /// client drop the connection.
+    /// Phase 1 — the raw pixel capture runs in the killable capture-worker
+    /// subprocess. If it hangs, the 20s timeout fires and we KILL the worker
+    /// (freeing its stuck stream so replayd recovers); the next call respawns a
+    /// fresh one. This is what stops a single stuck capture from wedging every
+    /// later capture. Phase 2 — overlays + the Set-of-Mark Accessibility walk run
+    /// in THIS process (the cached AX handles can't cross the worker boundary),
+    /// also on a blocking thread with its own timeout.
     async fn acquire_capture(
         &self,
         plan: &CapturePlan,
     ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
-        let (region, window, grid, marks) =
-            (plan.region, plan.window.clone(), plan.grid, plan.marks);
-        let capture = tokio::task::spawn_blocking(move || match (region, &window) {
-            (Some(rect), _) => crate::tools::screenshot::take_region_screenshot(rect, grid, marks),
-            (None, Some(query)) => {
-                crate::tools::screenshot::take_window_screenshot(query, grid, marks)
+        use crate::capture::worker::CaptureRequest;
+        let request = match (plan.region, &plan.window) {
+            (Some(rect), _) => CaptureRequest::Region { rect },
+            (None, Some(query)) => CaptureRequest::Window {
+                query: query.clone(),
+            },
+            (None, None) => CaptureRequest::Display,
+        };
+        let opts = crate::capture::screenshot::CaptureOptions {
+            grid: plan.grid,
+            marks: plan.marks,
+        };
+
+        // Phase 1: raw capture in the killable worker.
+        let worker = self.capture_worker.clone();
+        let w = worker.clone();
+        let raw_task = tokio::task::spawn_blocking(move || w.capture(&request));
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(20), raw_task).await {
+            Ok(Ok(Ok(raw))) => raw,
+            Ok(Ok(Err(e))) => return Err(format!("screenshot capture failed: {e}")),
+            Ok(Err(join_err)) => return Err(format!("screenshot task failed: {join_err}")),
+            Err(_) => {
+                // The capture hung; kill the worker so its stuck stream is freed
+                // (and replayd recovers) before it can wedge the next capture.
+                worker.kill();
+                return Err("screenshot timed out after 20s — the capture worker was \
+                            restarted; retry the screenshot"
+                    .to_string());
             }
-            (None, None) => crate::tools::screenshot::take_screenshot(grid, marks),
+        };
+
+        // Phase 2: overlays + marks (Accessibility) + encode, in-process.
+        let finish = tokio::task::spawn_blocking(move || {
+            crate::capture::screenshot::finish_capture(raw, opts)
+                .map(crate::tools::screenshot::ScreenshotImage::from)
         });
-        match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(20), finish).await {
             Ok(Ok(result)) => result,
-            Ok(Err(join_err)) => Err(format!("screenshot task failed: {join_err}")),
+            Ok(Err(join_err)) => Err(format!("screenshot finish task failed: {join_err}")),
             Err(_) => Err(
-                "screenshot timed out after 20s (the display capture or accessibility \
-                           walk did not complete; try again, or without marks)"
+                "screenshot overlays/marks timed out after 20s (the accessibility walk \
+                 did not complete; try again without marks)"
                     .to_string(),
             ),
         }

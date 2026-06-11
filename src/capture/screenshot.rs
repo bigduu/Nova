@@ -60,6 +60,21 @@ pub struct Capture {
     pub target_pid: Option<i32>,
 }
 
+/// A raw capture before any overlays/marks: just the pixels, the coordinate
+/// frame, and (for a window capture) the owning process. This is what crosses
+/// the capture-worker process boundary — it holds no Accessibility handles, so
+/// it is `Send` and serializable. The marks/AX walk runs later, in-process, via
+/// [`finish_capture`].
+pub struct RawCapture {
+    /// The captured pixels, no overlays.
+    pub image: image::RgbImage,
+    /// Maps this image's pixels back to global logical points.
+    pub view: ViewFrame,
+    /// Owning process id, set ONLY for a single-window capture (it is both the
+    /// input-routing target and the app whose AX tree marks are walked on).
+    pub window_pid: Option<i32>,
+}
+
 /// Capture the main display as a JPEG screenshot (no overlays).
 ///
 /// Returns base64-encoded JPEG data ready for MCP ImageContent.
@@ -68,8 +83,9 @@ pub fn capture_display() -> Result<ScreenshotResult, String> {
     Ok(capture_display_with(CaptureOptions::default())?.result)
 }
 
-/// Capture the main display, applying any requested overlays before encoding.
-pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
+/// Raw main-display capture (ScreenCaptureKit only — the part that can hang, run
+/// inside the capture worker). No overlays, no marks.
+pub fn capture_display_raw() -> Result<RawCapture, String> {
     let (filter, target) = main_display_filter()?;
     let img = capture_rgb_via(filter, target, None)?;
 
@@ -79,13 +95,16 @@ pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
         region: (display.width as f64, display.height as f64),
         screenshot: (img.width() as f64, img.height() as f64),
     };
-    // Set-of-Mark on a full-display shot marks the frontmost app's elements.
-    let pid = if opts.marks {
-        crate::tools::window::frontmost_app_pid()
-    } else {
-        None
-    };
-    finish(img, opts, view, pid)
+    Ok(RawCapture {
+        image: img,
+        view,
+        window_pid: None,
+    })
+}
+
+/// Capture the main display, applying any requested overlays before encoding.
+pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
+    finish_capture(capture_display_raw()?, opts)
 }
 
 /// Capture a single on-screen window matching `query` — a case-insensitive
@@ -96,6 +115,13 @@ pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
 /// Capturing just the relevant window cuts the image (and thus LLM context) down
 /// to what matters and reduces downscaling, which improves coordinate precision.
 pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture, String> {
+    finish_capture(capture_window_raw(query)?, opts)
+}
+
+/// Raw single-window capture (ScreenCaptureKit only — run inside the capture
+/// worker). Returns the owning pid as `window_pid` (both the input-routing
+/// target and the app whose marks are walked later).
+pub fn capture_window_raw(query: &str) -> Result<RawCapture, String> {
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(true)
         .with_exclude_desktop_windows(true)
@@ -134,11 +160,11 @@ pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture,
         region: (frame.size.width, frame.size.height),
         screenshot: (img.width() as f64, img.height() as f64),
     };
-    let mut capture = finish(img, opts, view, pid)?;
-    // This is a single-window capture: remember the owning process so the server
-    // can deliver clicks/scroll/typing straight to it (background input).
-    capture.target_pid = pid;
-    Ok(capture)
+    Ok(RawCapture {
+        image: img,
+        view,
+        window_pid: pid,
+    })
 }
 
 /// Zoom: capture the global-logical rectangle `(x, y, w, h)` at the display's
@@ -155,6 +181,12 @@ pub fn capture_region_with(
     rect: (f64, f64, f64, f64),
     opts: CaptureOptions,
 ) -> Result<Capture, String> {
+    finish_capture(capture_region_raw(rect)?, opts)
+}
+
+/// Raw region/zoom capture (ScreenCaptureKit only — run inside the capture
+/// worker). No overlays, no marks.
+pub fn capture_region_raw(rect: (f64, f64, f64, f64)) -> Result<RawCapture, String> {
     let (x, y, w, h) = rect;
     if w <= 0.0 || h <= 0.0 {
         return Err("region has zero size".to_string());
@@ -192,12 +224,32 @@ pub fn capture_region_with(
         region: (w, h),
         screenshot: (out.width() as f64, out.height() as f64),
     };
-    let pid = if opts.marks {
-        crate::tools::window::frontmost_app_pid()
+    Ok(RawCapture {
+        image: out,
+        view,
+        window_pid: None,
+    })
+}
+
+/// Turn a [`RawCapture`] into a finished [`Capture`]: apply overlays, walk the
+/// Set-of-Mark Accessibility tree (in THIS process — the cached handles can't
+/// cross a process boundary), and encode. The marks are walked on the captured
+/// window's app, or — for a display/region capture — on the frontmost app.
+pub fn finish_capture(raw: RawCapture, opts: CaptureOptions) -> Result<Capture, String> {
+    let RawCapture {
+        image,
+        view,
+        window_pid,
+    } = raw;
+    let marks_pid = if opts.marks {
+        window_pid.or_else(crate::tools::window::frontmost_app_pid)
     } else {
         None
     };
-    finish(out, opts, view, pid)
+    let mut capture = finish(image, opts, view, marks_pid)?;
+    // A single-window capture routes later input to its owning process.
+    capture.target_pid = window_pid;
+    Ok(capture)
 }
 
 /// Apply overlays (grid, Set-of-Mark) and encode the final capture.

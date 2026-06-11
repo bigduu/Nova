@@ -21,6 +21,12 @@ struct Cli {
     #[arg(long)]
     selftest: bool,
 
+    /// INTERNAL: run as the capture worker subprocess. Reads JSON capture
+    /// requests on stdin and writes raw images on stdout; spawned by the server
+    /// to isolate the hang-prone ScreenCaptureKit call. Not for direct use.
+    #[arg(long, hide = true)]
+    capture_worker: bool,
+
     /// DEBUG: dump the Accessibility tree of the app whose window/name matches
     /// this substring (e.g. "Arc"), then exit. No MCP needed. Stdout = the tree.
     #[arg(long, value_name = "APP")]
@@ -63,6 +69,12 @@ async fn main() -> Result<()> {
     // `nova::capture::init_core_graphics`.
     nova::capture::init_core_graphics();
 
+    // Capture worker subprocess: just loop on stdin/stdout doing raw captures.
+    // (Bootstrap above already ran, which is exactly what this child needs.)
+    if cli.capture_worker {
+        nova::capture::worker::run();
+    }
+
     tracing::info!(
         "Nova Computer Use MCP Server v{}",
         env!("CARGO_PKG_VERSION")
@@ -88,7 +100,7 @@ async fn main() -> Result<()> {
 
         // SAME binary, no MCP server: capture directly on a blocking thread.
         let t = std::time::Instant::now();
-        let h = tokio::task::spawn_blocking(|| nova::capture::screenshot::capture_display());
+        let h = tokio::task::spawn_blocking(nova::capture::screenshot::capture_display);
         match tokio::time::timeout(std::time::Duration::from_secs(20), h).await {
             Ok(Ok(Ok(img))) => {
                 eprintln!(
