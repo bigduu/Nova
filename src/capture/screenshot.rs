@@ -129,9 +129,9 @@ pub fn capture_window_raw(query: &str) -> Result<RawCapture, String> {
         .map_err(|e| format!("SCShareableContent::get: {e}"))?;
 
     let q = query.to_lowercase();
-    let window = content
-        .windows()
-        .into_iter()
+    let windows = content.windows();
+    let window = windows
+        .iter()
         .find(|w| {
             let title = w.title().unwrap_or_default();
             if title.is_empty() {
@@ -143,7 +143,45 @@ pub fn capture_window_raw(query: &str) -> Result<RawCapture, String> {
                 .unwrap_or_default();
             title.to_lowercase().contains(&q) || app.to_lowercase().contains(&q)
         })
-        .ok_or_else(|| format!("no on-screen window matching {query:?}"))?;
+        // On a miss, list the available windows so the caller can retry with a
+        // name that actually exists — the match is a case-insensitive substring
+        // of the app name OR the window title, and non-English apps report a
+        // localized name (e.g. WeChat is "微信", QQ is "QQ"), which is the usual
+        // reason a plausible English query finds nothing.
+        .ok_or_else(|| {
+            let mut avail: Vec<String> = windows
+                .iter()
+                .filter_map(|w| {
+                    let title = w.title().unwrap_or_default();
+                    if title.is_empty() {
+                        return None;
+                    }
+                    let app = w
+                        .owning_application()
+                        .map(|a| a.application_name())
+                        .unwrap_or_default();
+                    Some(if app.is_empty() {
+                        title
+                    } else {
+                        format!("{app} — {title}")
+                    })
+                })
+                .collect();
+            avail.sort();
+            avail.dedup();
+            let shown = avail.iter().take(25).cloned().collect::<Vec<_>>().join("; ");
+            let more = avail.len().saturating_sub(25);
+            let suffix = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            format!(
+                "no on-screen window matching {query:?}. Match is a case-insensitive \
+                 substring of the app name OR window title; non-English apps use a \
+                 localized name (WeChat → \"微信\"). Available windows: {shown}{suffix}"
+            )
+        })?;
 
     let frame = window.frame();
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
@@ -152,7 +190,7 @@ pub fn capture_window_raw(query: &str) -> Result<RawCapture, String> {
     let pid = window.owning_application().map(|a| a.process_id());
 
     let target = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
-    let filter = SCContentFilter::create().with_window(&window).build();
+    let filter = SCContentFilter::create().with_window(window).build();
     let img = capture_rgb_via(filter, target, None)?;
 
     let view = ViewFrame {
