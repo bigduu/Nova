@@ -98,6 +98,56 @@ pub fn request_screen_recording_access() -> bool {
     unsafe { CGRequestScreenCaptureAccess() }
 }
 
+/// One-line snapshot of who-am-I + screen-capture authorization, for tracing
+/// *why* capture is allowed or denied.
+///
+/// The critical fact this surfaces: when nova runs as a **child** of another app
+/// (e.g. Bodhi), macOS attributes the Screen Recording (TCC) grant to the
+/// **responsible process** — the parent app bundle — NOT to nova's own signed
+/// identity. So if the parent (`parent=`) is an ad-hoc/linker-signed app whose
+/// code identity rotates per build, the user's grant evaporates on every rebuild
+/// and `preflight=false` even though nova itself is properly signed.
+///
+/// Uses only `CGPreflightScreenCaptureAccess` (a cheap TCC-db lookup). It does
+/// NOT call `SCShareableContent::get` on purpose — that one can hang on a wedged
+/// replayd, and a diagnostic must never hang the path it's instrumenting.
+pub fn permission_diagnostics() -> String {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    extern "C" {
+        fn getppid() -> i32;
+    }
+    // SAFETY: argless TCC/posix calls returning a bool / pid.
+    let preflight = unsafe { CGPreflightScreenCaptureAccess() };
+    let pid = std::process::id();
+    let ppid = unsafe { getppid() };
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let parent = proc_path(ppid).unwrap_or_else(|| "?".into());
+    format!(
+        "pid={pid} ppid={ppid} preflight(ScreenCapture)={preflight} exe={exe} responsible/parent={parent}"
+    )
+}
+
+/// Absolute executable path for `pid` via libproc's `proc_pidpath` (part of
+/// libSystem; no extra link needed). `None` if the lookup fails.
+fn proc_path(pid: i32) -> Option<String> {
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut std::os::raw::c_void, buffersize: u32) -> i32;
+    }
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: writes at most `buf.len()` bytes into our buffer; returns the byte count.
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut _, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
 /// List all available displays (via ScreenCaptureKit; requires permission).
 pub fn list_displays() -> Vec<DisplayInfo> {
     let Ok(content) = SCShareableContent::get() else {

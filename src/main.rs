@@ -193,6 +193,11 @@ async fn main() -> Result<()> {
              Settings → Privacy & Security → Screen Recording"
         }
     );
+    // Log the TCC attribution picture once at startup. When nova is a child of
+    // another app, `responsible/parent=` shows whose Screen Recording grant the OS
+    // actually checks — if that parent is ad-hoc-signed, its grant won't persist
+    // across rebuilds and `preflight=false` here even though nova is signed.
+    tracing::info!("permission diagnostics: {}", nova::display::geometry::permission_diagnostics());
 
     if cli.http {
         nova::server::run_http(&cli.addr).await

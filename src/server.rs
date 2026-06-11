@@ -154,10 +154,20 @@ impl NovaServer {
         };
 
         // Phase 1: raw capture in the killable worker, with replayd-wedge recovery.
+        // Snapshot the authorization picture first — cheap and hang-free — and both
+        // log it and fold it into every failure message. It distinguishes a real
+        // TCC denial (preflight=false → fix the *responsible process*'s grant; when
+        // nova runs under another app that responsible process is `parent=`, not
+        // nova) from a wedge (preflight=true but the capture below times out →
+        // bounce replayd).
+        let diag = crate::display::geometry::permission_diagnostics();
+        tracing::info!(target: "nova::capture", "capture {:?} — {}", request, diag);
         let worker = self.capture_worker.clone();
         let raw = match capture_once(&worker, &request, 20).await {
             CaptureAttempt::Ok(raw) => raw,
-            CaptureAttempt::Failed(e) => return Err(format!("screenshot capture failed: {e}")),
+            CaptureAttempt::Failed(e) => {
+                return Err(format!("screenshot capture failed: {e} [{diag}]"))
+            }
             CaptureAttempt::TimedOut => {
                 // A 20s raw-capture hang means ScreenCaptureKit / replayd is
                 // wedged. Kill the stuck worker AND bounce replayd (killing the
@@ -169,16 +179,18 @@ impl NovaServer {
                     CaptureAttempt::Ok(raw) => raw,
                     CaptureAttempt::Failed(e) => {
                         return Err(format!(
-                            "screenshot capture failed after replayd restart: {e}"
+                            "screenshot capture failed after replayd restart: {e} [{diag}]"
                         ))
                     }
                     CaptureAttempt::TimedOut => {
                         worker.kill();
-                        return Err("screenshot timed out twice even after restarting replayd \
-                                    — the capture pipeline is wedged. Verify Screen Recording \
-                                    permission for the nova binary (README: Permissions & code \
-                                    signing)."
-                            .to_string());
+                        return Err(format!(
+                            "screenshot timed out twice even after restarting replayd — the \
+                             capture pipeline is wedged. If preflight=false below, Screen \
+                             Recording is NOT granted to the responsible process (when nova runs \
+                             under another app that is `parent=`, not nova — sign that app stably \
+                             and grant it). If preflight=true, it is a replayd wedge. [{diag}]"
+                        ));
                     }
                 }
             }
@@ -272,16 +284,26 @@ async fn capture_once(
 /// Restart `replayd` (the ScreenCaptureKit daemon) to clear a capture wedge, then
 /// pause briefly. A capture that hangs leaves replayd holding a half-open stream;
 /// killing the stuck worker frees the worker process but not replayd's side —
-/// bouncing replayd (it relaunches on demand) is what actually recovers it.
+/// bouncing replayd (launchd relaunches it on demand) is what actually recovers it.
+///
+/// MUST use SIGKILL (`-9`): replayd **ignores SIGTERM**, so a plain `killall
+/// replayd` returns success but leaves the same wedged process running (verified:
+/// exit 0, unchanged PID, multi-hour uptime). That made this recovery a silent
+/// no-op — captures kept timing out "even after restarting replayd" because replayd
+/// was never actually restarted. SIGKILL can't be caught, so launchd respawns a
+/// fresh replayd with a new PID, which is what clears the wedge.
 async fn bounce_replayd() {
     let _ = tokio::task::spawn_blocking(|| {
         // Absolute path: the spawning env's PATH may not include /usr/bin.
+        // `-9` (SIGKILL) is required — replayd ignores the default SIGTERM.
         let _ = std::process::Command::new("/usr/bin/killall")
+            .arg("-9")
             .arg("replayd")
             .status();
     })
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // Give launchd a moment to respawn replayd before the retry capture.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 }
 
 /// Click a cached marked element. Strongly prefers the Accessibility action
