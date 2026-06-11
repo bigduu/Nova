@@ -57,3 +57,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Error helpers
 anyhow = "1"
+# Apple Vision OCR (VNRecognizeTextRequest) — native, on-device, no model files.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSData", "NSDictionary", "NSError"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "VNError", "objc2-core-foundation"] }

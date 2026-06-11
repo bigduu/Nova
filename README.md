@@ -17,6 +17,7 @@ stdio or Streamable HTTP.
 | --- | --- |
 | `screenshot` | Capture the whole display or a single `window=` — returns a JPEG + the pixel-coordinate contract. Numbers actionable elements (Set-of-Mark) by default. |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
+| `ocr` | Recognize on-screen text via Apple Vision (on-device, no model files). Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. CJK + Latin. |
 | `click_mark` | Activate a numbered element straight through the Accessibility tree (no cursor, no pixel guessing). |
 | `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input, in the pixel space of the last screenshot. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |

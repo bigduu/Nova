@@ -1,5 +1,6 @@
 /// MCP server lifecycle — tool registration, transport dispatch, and handler routing.
 use anyhow::{Context, Result};
+use base64::Engine;
 use rmcp::ServiceExt;
 
 // ── MCP tool result helpers ─────────────────────────────────────────
@@ -78,7 +79,10 @@ impl NovaServer {
     /// been captured, deliver straight to that window's process instead (no
     /// cursor movement, app need not be frontmost) — reliable for native apps.
     fn current_target(&self, background: bool) -> crate::tools::input::InputTarget {
-        match (background, *self.target_pid.lock().expect("target_pid mutex")) {
+        match (
+            background,
+            *self.target_pid.lock().expect("target_pid mutex"),
+        ) {
             (true, Some(pid)) => crate::tools::input::InputTarget::Pid(pid),
             _ => crate::tools::input::InputTarget::Global,
         }
@@ -111,7 +115,11 @@ impl NovaServer {
     /// Look up a marked element by its number (cloned out so the AX call runs
     /// off the lock).
     fn get_mark(&self, number: u32) -> Option<crate::tools::elements::CachedElement> {
-        self.marks.lock().expect("marks mutex").get(&number).cloned()
+        self.marks
+            .lock()
+            .expect("marks mutex")
+            .get(&number)
+            .cloned()
     }
 
     /// Run the requested capture on a blocking thread with a hard timeout.
@@ -136,9 +144,11 @@ impl NovaServer {
         match tokio::time::timeout(std::time::Duration::from_secs(20), capture).await {
             Ok(Ok(result)) => result,
             Ok(Err(join_err)) => Err(format!("screenshot task failed: {join_err}")),
-            Err(_) => Err("screenshot timed out after 20s (the display capture or accessibility \
+            Err(_) => Err(
+                "screenshot timed out after 20s (the display capture or accessibility \
                            walk did not complete; try again, or without marks)"
-                .to_string()),
+                    .to_string(),
+            ),
         }
     }
 
@@ -234,7 +244,10 @@ fn click_cached_mark(
         let _ = mouse_move(sx, sy); // restore the user's pointer
     }
     click.map_err(|e| {
-        format!("mark [{}]: AX action failed ({ax_err}) and coordinate click failed: {e}", el.number)
+        format!(
+            "mark [{}]: AX action failed ({ax_err}) and coordinate click failed: {e}",
+            el.number
+        )
     })?;
     Ok(format!(
         "mark [{}] {} {:?}: no AX action ({ax_err}); raised its app and coordinate-clicked the \
@@ -363,6 +376,11 @@ clearly legible.
 the nearest labeled rules and interpolate within the cell instead of guessing. \
 (The grid is shown whenever marks is off; with marks on it is hidden since you \
 click by number — pass grid=true if you want both.)
+  - To read or click TEXT on such a marks-less surface, `ocr` is often faster \
+than eyeballing the grid: it returns every recognized line WITH a clickable \
+center in the same pixel space, so you can left_click(x, y) a line directly — and \
+it returns text only (no image), so it is cheap for pulling a lot of text at \
+once. Use `window=\"<name>\"` for sharper recognition of small text.
 
 Confirm every action — do NOT operate blind:
 - After EACH input action (click, scroll, type, key press) take a screenshot to \
@@ -569,6 +587,19 @@ pub struct ClickMarkParams {
     pub background: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OcrParams {
+    /// Capture only a single on-screen window (case-insensitive substring of its
+    /// title or app name) instead of the whole display. Smaller, sharper image
+    /// → better recognition of small text.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// BCP-47 language hints in priority order (e.g. ["zh-Hans", "en-US"]).
+    /// Omitted, defaults to Simplified Chinese + English.
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+}
+
 #[tool_router]
 impl NovaServer {
     #[tool(
@@ -660,6 +691,95 @@ impl NovaServer {
             Ok(img) => self.render_capture(img, &plan),
             Err(e) => err_result(&e),
         }
+    }
+
+    #[tool(
+        name = "ocr",
+        description = "Read on-screen TEXT via the OS text recognizer (Apple Vision). Captures the \
+                       display (or window=\"<name>\") and returns the recognized text lines, each \
+                       with a clickable center in the same pixel space as a screenshot — so you can \
+                       both READ the text and click a line with left_click(x, y). Returns text only \
+                       (no image), so it is a cheap, fast way to pull text off the screen. Best when \
+                       you need to read or click TEXT on a surface where marks come back empty — \
+                       canvas, games, image-rendered or custom-drawn views — or to grab a lot of \
+                       text at once without parsing a screenshot. For native/web UI with an \
+                       Accessibility tree, screenshot(marks=true) + click_mark is still more precise. \
+                       Languages default to Simplified Chinese + English; pass languages=[...] (BCP-47) \
+                       to override."
+    )]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, languages = ?p.languages), level = "info")]
+    async fn ocr(&self, Parameters(p): Parameters<OcrParams>) -> rmcp::model::CallToolResult {
+        // Capture a clean image (no overlays), record its frame so the recognized
+        // centers are clickable, and route input like a window/display capture.
+        let plan = CapturePlan {
+            region: None,
+            window: p.window.clone(),
+            grid: false,
+            marks: false,
+        };
+        let img = match self.acquire_capture(&plan).await {
+            Ok(img) => img,
+            Err(e) => return err_result(&e),
+        };
+        self.set_view(img.view);
+        if p.window.is_some() {
+            self.set_target_pid(img.target_pid);
+        } else {
+            self.set_target_pid(None);
+        }
+
+        let jpeg = match base64::engine::general_purpose::STANDARD.decode(&img.base64_data) {
+            Ok(bytes) => bytes,
+            Err(e) => return err_result(&format!("failed to decode captured image: {e}")),
+        };
+        let (w, h) = (img.width, img.height);
+        let languages = p
+            .languages
+            .clone()
+            .unwrap_or_else(|| vec!["zh-Hans".to_string(), "en-US".to_string()]);
+
+        // Vision recognition is blocking; run it off the async runtime with a
+        // hard timeout so a stuck recognizer can't starve the server.
+        let task = tokio::task::spawn_blocking(move || {
+            let lang_refs: Vec<&str> = languages.iter().map(String::as_str).collect();
+            crate::ocr::recognize(&jpeg, w, h, &lang_refs)
+        });
+        let lines = match tokio::time::timeout(std::time::Duration::from_secs(20), task).await {
+            Ok(Ok(Ok(lines))) => lines,
+            Ok(Ok(Err(e))) => return err_result(&format!("OCR failed: {e}")),
+            Ok(Err(join_err)) => return err_result(&format!("OCR task failed: {join_err}")),
+            Err(_) => return err_result("OCR timed out after 20s"),
+        };
+
+        let subject = match &p.window {
+            Some(q) => format!("window matching {q:?}"),
+            None => "the main display".to_string(),
+        };
+        if lines.is_empty() {
+            return ok_text(format!(
+                "OCR of {subject} ({w}x{h} px): no text recognized."
+            ));
+        }
+        let mut note = format!(
+            "OCR of {subject} ({w}x{h} px), {n} text lines. Coordinates are in this image's pixel \
+             space (same as a screenshot) — click a line by its center with left_click(x, y).\n",
+            n = lines.len(),
+        );
+        for (i, line) in lines.iter().enumerate() {
+            note.push_str(&format!(
+                "  [{}] {:?} — ({:.0}, {:.0})\n",
+                i + 1,
+                line.text,
+                line.center.0,
+                line.center.1,
+            ));
+        }
+        note.push_str("\nFull text:\n");
+        for line in &lines {
+            note.push_str(&line.text);
+            note.push('\n');
+        }
+        ok_text(note)
     }
 
     #[tool(
@@ -871,8 +991,12 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::batch::execute_batch(p.actions, self.current_view(), self.current_target(false))
-            .await
+        match crate::tools::batch::execute_batch(
+            p.actions,
+            self.current_view(),
+            self.current_target(false),
+        )
+        .await
         {
             Ok(results) => ok_text(results.join("\n")),
             Err(e) => err_result(&e.to_string()),
@@ -890,7 +1014,10 @@ impl NovaServer {
                        back to screenshot + left_click."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
-    async fn ax_click(&self, Parameters(p): Parameters<AxQueryParams>) -> rmcp::model::CallToolResult {
+    async fn ax_click(
+        &self,
+        Parameters(p): Parameters<AxQueryParams>,
+    ) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid() else {
             return err_result("no target app (take a window screenshot first)");
         };
@@ -928,7 +1055,10 @@ impl NovaServer {
                        window-captured app (or frontmost). Native-app accessibility only."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
-    async fn ax_focus(&self, Parameters(p): Parameters<AxQueryParams>) -> rmcp::model::CallToolResult {
+    async fn ax_focus(
+        &self,
+        Parameters(p): Parameters<AxQueryParams>,
+    ) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid() else {
             return err_result("no target app (take a window screenshot first)");
         };
@@ -980,7 +1110,8 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid() else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500)).await
+        match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500))
+            .await
         {
             Ok(text) => ok_text(text),
             Err(join_err) => err_result(&format!("dump_ax task failed: {join_err}")),
@@ -995,7 +1126,9 @@ impl NovaServer {
 impl ServerHandler for NovaServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
-            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
         )
         .with_instructions(NOVA_INSTRUCTIONS)
     }
@@ -1067,6 +1200,7 @@ mod tests {
         let expected = [
             "screenshot",
             "zoom_region",
+            "ocr",
             "mouse_move",
             "left_click",
             "right_click",
@@ -1146,7 +1280,13 @@ mod tests {
         }
     }
 
-    fn mark(number: u32, role: &str, label: &str, x: f64, y: f64) -> crate::capture::screenshot::Mark {
+    fn mark(
+        number: u32,
+        role: &str,
+        label: &str,
+        x: f64,
+        y: f64,
+    ) -> crate::capture::screenshot::Mark {
         crate::capture::screenshot::Mark {
             number,
             role: role.to_string(),
@@ -1168,7 +1308,10 @@ mod tests {
         let note = screenshot_note(&img, &plan);
         assert!(note.contains("the main display"), "{note}");
         assert!(note.contains("1280x536 px"), "{note}");
-        assert!(note.contains("x in [0, 1280]") && note.contains("y in [0, 536]"), "{note}");
+        assert!(
+            note.contains("x in [0, 1280]") && note.contains("y in [0, 536]"),
+            "{note}"
+        );
         // No overlays requested → no grid legend, no marks list.
         assert!(!note.contains("magenta coordinate grid"), "{note}");
         assert!(!note.contains("actionable elements"), "{note}");
