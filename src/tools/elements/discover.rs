@@ -69,8 +69,10 @@ pub fn collect_actionable(pid: i32, max: usize, clip: Option<Rect>) -> Vec<(UiEl
     let mut walked = walk.out;
     let mut seen = std::collections::HashSet::new();
     walked.retain(|(e, _)| seen.insert((e.x as i64, e.y as i64, e.width as i64, e.height as i64)));
-    let mut result: Vec<(UiElement, AxHandle)> =
-        walked.into_iter().map(|(el, h)| (el, AxHandle(h))).collect();
+    let mut result: Vec<(UiElement, AxHandle)> = walked
+        .into_iter()
+        .map(|(el, h)| (el, AxHandle(h)))
+        .collect();
 
     // Hit-test pass: sample the visible window and pick up actionable elements
     // the tree walk couldn't reach (e.g. web rows Chromium buries under a

@@ -36,7 +36,12 @@ fn bench_region(rounds: usize) {
     for i in 0..rounds {
         let t = Instant::now();
         match capture_region_with(rect, CaptureOptions::default()) {
-            Ok(c) => eprintln!("  round {i}: {:>8.1} ms  ({}x{} px out)", ms(t), c.result.width, c.result.height),
+            Ok(c) => eprintln!(
+                "  round {i}: {:>8.1} ms  ({}x{} px out)",
+                ms(t),
+                c.result.width,
+                c.result.height
+            ),
             Err(e) => eprintln!("  round {i}: ERROR {e}"),
         }
     }
@@ -63,12 +68,20 @@ async fn bench_concurrent(n: usize) {
             Err(e) => eprintln!("  task join error: {e}"),
         }
     }
-    eprintln!("  --- total wall-clock for {n} concurrent: {:>8.1} ms ---", ms(t));
+    eprintln!(
+        "  --- total wall-clock for {n} concurrent: {:>8.1} ms ---",
+        ms(t)
+    );
 }
 
 fn main() {
     eprintln!("nova capture benchmark — measuring where the time goes");
-    eprintln!("rt worker threads = {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+    eprintln!(
+        "rt worker threads = {}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
 
     eprintln!("\n== cold start (first capture pays framework init) ==");
     let t = Instant::now();

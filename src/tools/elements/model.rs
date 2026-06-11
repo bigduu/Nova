@@ -174,8 +174,9 @@ impl AxHandle {
         if let Some((el, action)) = first_descendant_action(&self.0, DESCENDANT_CLICK_DEPTH)
             .or_else(|| first_ancestor_action(&self.0, ANCESTOR_CLICK_DEPTH))
         {
-            el.perform_action(&CFString::new(action))
-                .map_err(|e| format!("{action} on relative failed: {}", super::attrs::ax_err(&e)))?;
+            el.perform_action(&CFString::new(action)).map_err(|e| {
+                format!("{action} on relative failed: {}", super::attrs::ax_err(&e))
+            })?;
             return Ok(action);
         }
         Err("element (and its descendants/ancestors) expose no click action".to_string())

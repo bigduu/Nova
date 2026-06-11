@@ -102,9 +102,7 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
             x: sx + (x - sx) * t,
             y: sy + (y - sy) * t,
         };
-        if let Ok(ev) =
-            make_mouse_event(CGEventType::MouseMoved, CGMouseButton::Left, pt, None)
-        {
+        if let Ok(ev) = make_mouse_event(CGEventType::MouseMoved, CGMouseButton::Left, pt, None) {
             ev.post(CGEventTapLocation::HID);
         }
         thread::sleep(MOVE_STEP_DELAY);

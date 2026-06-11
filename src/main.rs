@@ -88,9 +88,7 @@ async fn main() -> Result<()> {
 
         // SAME binary, no MCP server: capture directly on a blocking thread.
         let t = std::time::Instant::now();
-        let h = tokio::task::spawn_blocking(|| {
-            nova::capture::screenshot::capture_display()
-        });
+        let h = tokio::task::spawn_blocking(|| nova::capture::screenshot::capture_display());
         match tokio::time::timeout(std::time::Duration::from_secs(20), h).await {
             Ok(Ok(Ok(img))) => {
                 eprintln!(

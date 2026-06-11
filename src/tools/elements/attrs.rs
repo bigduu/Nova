@@ -152,8 +152,14 @@ mod tests {
 
     #[test]
     fn rect_intersection() {
-        assert!(rects_intersect((0.0, 0.0, 10.0, 10.0), (5.0, 5.0, 10.0, 10.0)));
-        assert!(!rects_intersect((0.0, 0.0, 10.0, 10.0), (20.0, 20.0, 5.0, 5.0)));
+        assert!(rects_intersect(
+            (0.0, 0.0, 10.0, 10.0),
+            (5.0, 5.0, 10.0, 10.0)
+        ));
+        assert!(!rects_intersect(
+            (0.0, 0.0, 10.0, 10.0),
+            (20.0, 20.0, 5.0, 5.0)
+        ));
     }
 
     #[test]

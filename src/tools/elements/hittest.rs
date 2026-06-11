@@ -132,7 +132,8 @@ pub(crate) fn hit_test_elements(
     });
 
     // Merge bands, deduping by frame across band boundaries.
-    let mut seen: std::collections::HashSet<(i64, i64, i64, i64)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(i64, i64, i64, i64)> =
+        std::collections::HashSet::new();
     let mut out = Vec::new();
     for band in bands {
         for (info, handle) in band {

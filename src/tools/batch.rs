@@ -49,7 +49,11 @@ pub async fn execute_batch(
     Ok(results)
 }
 
-async fn execute_action(action: BatchAction, view: ViewFrame, target: InputTarget) -> Result<String> {
+async fn execute_action(
+    action: BatchAction,
+    view: ViewFrame,
+    target: InputTarget,
+) -> Result<String> {
     use crate::tools::input;
 
     match action {

@@ -82,7 +82,12 @@ fn synthesize_label(row: &AXUIElement) -> String {
             break;
         }
     }
-    kept.join(" ").chars().take(LABEL_MAX_CHARS).collect::<String>().trim().to_string()
+    kept.join(" ")
+        .chars()
+        .take(LABEL_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn collect_text(el: &AXUIElement, depth: usize, parts: &mut Vec<String>) {
@@ -115,7 +120,11 @@ fn collect_text(el: &AXUIElement, depth: usize, parts: &mut Vec<String>) {
 /// inside `covered` (what the tree walk already marked — the native sidebar) and
 /// capping at `max`. Returns `(UiElement, AxHandle)` whose click falls through to
 /// a coordinate click at the row center (the divs expose no AX action).
-pub(crate) fn geometry_rows(clip: Rect, covered: &[Rect], max: usize) -> Vec<(UiElement, AxHandle)> {
+pub(crate) fn geometry_rows(
+    clip: Rect,
+    covered: &[Rect],
+    max: usize,
+) -> Vec<(UiElement, AxHandle)> {
     let (cx, cy, cw, ch) = clip;
     let min_width = cw * ROW_MIN_WIDTH_FRAC;
     let system_wide = AXUIElement::system_wide();
@@ -165,7 +174,7 @@ mod tests {
     #[test]
     fn row_shape_accepts_wide_short_rejects_else() {
         let min_w = 860.0; // 50% of a 1720-wide window
-        // A real QQ-mail email row: 1218x26.
+                           // A real QQ-mail email row: 1218x26.
         assert!(is_row_shaped((2195.0, 183.0, 1218.0, 26.0), min_w));
         // The whole list container: too tall.
         assert!(!is_row_shaped((2192.0, 137.0, 1224.0, 1292.0), min_w));

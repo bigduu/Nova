@@ -178,10 +178,12 @@ pub fn ax_warm_probe(pid: i32, clip: Rect, rounds: usize) -> String {
             .filter(|(_, h)| click_action_for(h.element()).is_some())
             .count();
         let roles: std::collections::BTreeMap<String, usize> =
-            found.iter().fold(std::collections::BTreeMap::new(), |mut m, (e, _)| {
-                *m.entry(e.role.clone()).or_default() += 1;
-                m
-            });
+            found
+                .iter()
+                .fold(std::collections::BTreeMap::new(), |mut m, (e, _)| {
+                    *m.entry(e.role.clone()).or_default() += 1;
+                    m
+                });
         out.push_str(&format!(
             "round {round}: {total} actionable ({with_action} with AXPress-like)  roles={roles:?}\n"
         ));
