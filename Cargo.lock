@@ -1333,6 +1333,7 @@ dependencies = [
  "core-foundation",
  "core-graphics 0.25.0",
  "image",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-vision",

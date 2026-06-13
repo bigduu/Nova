@@ -18,6 +18,8 @@ use nova::tools::input::{
 use std::thread::sleep;
 use std::time::Duration;
 
+mod common;
+
 /// The strongest input e2e: post real cursor-move events and read the position
 /// back from the window server. This proves the move path reaches the OS *and*
 /// that the logical coordinate space round-trips. Restores the original cursor.
@@ -136,6 +138,7 @@ fn open_application_launches_system_app() {
 #[test]
 #[ignore = "requires Screen Recording permission in System Settings"]
 fn list_windows_returns_titled_windows() {
+    common::use_isolated_capture_daemon();
     let windows = nova::tools::window::list_windows().expect("list_windows should Ok");
 
     for w in &windows {

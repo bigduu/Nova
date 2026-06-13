@@ -1,6 +1,7 @@
+pub mod broker;
 pub mod overlay;
 pub mod screenshot;
-pub mod worker;
+pub mod stream;
 
 /// Force CoreGraphics / the window-server connection to initialize once, before
 /// any ScreenCaptureKit call.

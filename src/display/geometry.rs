@@ -112,15 +112,11 @@ pub fn request_screen_recording_access() -> bool {
 /// NOT call `SCShareableContent::get` on purpose — that one can hang on a wedged
 /// replayd, and a diagnostic must never hang the path it's instrumenting.
 pub fn permission_diagnostics() -> String {
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGPreflightScreenCaptureAccess() -> bool;
-    }
     extern "C" {
         fn getppid() -> i32;
     }
-    // SAFETY: argless TCC/posix calls returning a bool / pid.
-    let preflight = unsafe { CGPreflightScreenCaptureAccess() };
+    // SAFETY: argless posix call returning a pid.
+    let preflight = preflight_screen_capture();
     let pid = std::process::id();
     let ppid = unsafe { getppid() };
     let exe = std::env::current_exe()
@@ -130,6 +126,18 @@ pub fn permission_diagnostics() -> String {
     format!(
         "pid={pid} ppid={ppid} preflight(ScreenCapture)={preflight} exe={exe} responsible/parent={parent}"
     )
+}
+
+/// Whether this process's responsibility chain holds the Screen Recording TCC
+/// grant. A cheap CoreGraphics TCC-db lookup — never touches replayd, so it is
+/// safe from any process (unlike `SCShareableContent::get`).
+pub fn preflight_screen_capture() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    // SAFETY: argless TCC lookup returning a bool.
+    unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 /// Absolute executable path for `pid` via libproc's `proc_pidpath` (part of

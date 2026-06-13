@@ -5,12 +5,32 @@
 //! or `cargo test --test e2e_screenshot -- --include-ignored`
 
 use base64::Engine;
-use nova::capture::screenshot::capture_display;
+use nova::capture::screenshot::{finish_capture, CaptureOptions};
+use nova::capture::stream::StreamCapturer;
+use nova::tools::screenshot::ScreenshotImage;
+
+mod common;
+use common::with_timeout;
+
+/// Capture the display via the live stream path (the real one nova uses) and
+/// finish it into a `ScreenshotImage`, mirroring what the server produces. Each
+/// blocking step is time-bounded so a wedge fails the test instead of hanging.
+fn capture_display_shot() -> ScreenshotImage {
+    let raw = with_timeout(12, "stream capture_display", || {
+        StreamCapturer::new().capture_display()
+    })
+    .expect("stream capture_display should succeed with permissions");
+    with_timeout(15, "finish_capture", move || {
+        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+    })
+    .expect("finish_capture")
+    .into()
+}
 
 #[test]
 #[ignore = "requires Screen Recording permission in System Settings"]
 fn e2e_capture_display_returns_valid_jpeg() {
-    let result = capture_display().expect("capture_display should succeed with permissions");
+    let result = capture_display_shot();
 
     // Verify dimensions
     assert!(result.width > 0, "image width must be positive");
@@ -24,13 +44,13 @@ fn e2e_capture_display_returns_valid_jpeg() {
 
     // Verify base64 is non-empty
     assert!(
-        !result.base64_image.is_empty(),
+        !result.base64_data.is_empty(),
         "base64 image must not be empty"
     );
 
     // Decode and verify it's a valid JPEG
     let jpeg_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&result.base64_image)
+        .decode(&result.base64_data)
         .expect("base64 should decode to valid bytes");
     assert!(!jpeg_bytes.is_empty(), "decoded JPEG must not be empty");
 
@@ -71,7 +91,7 @@ fn e2e_capture_dims_match_target_dims_contract() {
     let display = primary_display();
     let expected = compute_target_dims(display.width, display.height);
 
-    let result = capture_display().expect("capture_display should succeed with permissions");
+    let result = capture_display_shot();
 
     assert_eq!(
         (result.width, result.height),
@@ -93,9 +113,9 @@ fn e2e_capture_dims_match_target_dims_contract() {
 #[test]
 #[ignore = "requires Screen Recording permission in System Settings"]
 fn e2e_window_screenshot_produces_view_frame() {
-    use nova::tools::screenshot::take_window_screenshot;
     use nova::tools::window::list_windows;
 
+    common::use_isolated_capture_daemon();
     let windows = list_windows().expect("list_windows");
     let Some(w) = windows
         .iter()
@@ -105,7 +125,16 @@ fn e2e_window_screenshot_produces_view_frame() {
         return;
     };
 
-    let shot = take_window_screenshot(&w.app_name, false, false).expect("window screenshot");
+    let app = w.app_name.clone();
+    let raw = with_timeout(12, "stream capture_window", move || {
+        StreamCapturer::new().capture_window(&app)
+    })
+    .expect("window screenshot");
+    let shot: ScreenshotImage = with_timeout(15, "finish_capture", move || {
+        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+    })
+    .expect("finish_capture")
+    .into();
     assert!(shot.width > 0 && shot.height > 0, "empty window capture");
     assert!(
         shot.view.region.0 > 0.0 && shot.view.region.1 > 0.0,

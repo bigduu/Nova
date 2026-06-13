@@ -4,19 +4,36 @@
 //!   cargo test --test e2e_ocr -- --ignored --nocapture
 
 use base64::Engine;
-use nova::tools::screenshot::take_screenshot;
+use nova::capture::screenshot::{finish_capture, CaptureOptions};
+use nova::capture::stream::StreamCapturer;
+use nova::tools::screenshot::ScreenshotImage;
+
+mod common;
+use common::with_timeout;
 
 #[test]
 #[ignore = "captures the display; needs Screen Recording permission"]
 fn ocr_recognizes_text_on_the_display() {
-    // Capture the whole display without overlays.
-    let shot = take_screenshot(false, false).expect("capture display");
+    // Capture the whole display (via the live stream) without overlays. Each
+    // blocking step is time-bounded so a wedge fails the test instead of hanging.
+    let raw = with_timeout(12, "stream capture_display", || {
+        StreamCapturer::new().capture_display()
+    })
+    .expect("capture display");
+    let shot: ScreenshotImage = with_timeout(15, "finish_capture", move || {
+        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+    })
+    .expect("finish_capture")
+    .into();
     let jpeg = base64::engine::general_purpose::STANDARD
         .decode(&shot.base64_data)
         .expect("decode jpeg");
 
-    let lines = nova::ocr::recognize(&jpeg, shot.width, shot.height, &["zh-Hans", "en-US"])
-        .expect("OCR should not error");
+    let (w, h) = (shot.width, shot.height);
+    let lines = with_timeout(20, "Vision OCR", move || {
+        nova::ocr::recognize(&jpeg, w, h, &["zh-Hans", "en-US"])
+    })
+    .expect("OCR should not error");
 
     eprintln!(
         "OCR found {} lines on a {}x{} capture",

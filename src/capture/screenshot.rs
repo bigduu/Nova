@@ -1,15 +1,44 @@
 /// Screenshot capture — captures the primary display using ScreenCaptureKit.
 ///
 /// Returns raw RGBA pixel data along with the capture dimensions.
-use crate::display::scaling::{compute_target_dims, TargetDims};
 use crate::display::view::ViewFrame;
 use base64::Engine;
-use screencapturekit::{
-    cg::CGRect,
-    screenshot_manager::{CGImageExt, SCScreenshotManager},
-    shareable_content::SCShareableContent,
-    stream::{configuration::SCStreamConfiguration, content_filter::SCContentFilter},
-};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When enabled (in the capture daemon), each capture sub-step is appended with
+/// a timestamp to a log file, so a hang can be pinpointed to the exact step
+/// (window enumeration vs stream start vs encode) by reading the last line
+/// written. Reliable regardless of the host's log level — unlike
+/// stderr/tracing, which the MCP host may drop.
+static STEP_TRACE: AtomicBool = AtomicBool::new(false);
+
+/// Path of the capture-worker step-trace log.
+pub const STEP_TRACE_PATH: &str = "/tmp/nova-capture-worker.log";
+
+/// Enable step tracing for this process (called by the capture worker at startup).
+pub fn enable_step_trace() {
+    STEP_TRACE.store(true, Ordering::Relaxed);
+}
+
+/// Append one timestamped step line to [`STEP_TRACE_PATH`] when tracing is on.
+pub fn step(s: &str) {
+    if !STEP_TRACE.load(Ordering::Relaxed) {
+        return;
+    }
+    use std::io::Write;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(STEP_TRACE_PATH)
+    {
+        let _ = writeln!(f, "{ms} pid={} {s}", std::process::id());
+    }
+}
 
 /// Result of capturing a screenshot.
 pub struct ScreenshotResult {
@@ -73,200 +102,6 @@ pub struct RawCapture {
     /// Owning process id, set ONLY for a single-window capture (it is both the
     /// input-routing target and the app whose AX tree marks are walked on).
     pub window_pid: Option<i32>,
-}
-
-/// Capture the main display as a JPEG screenshot (no overlays).
-///
-/// Returns base64-encoded JPEG data ready for MCP ImageContent.
-/// The image is resized to fit within 1280px max dimension.
-pub fn capture_display() -> Result<ScreenshotResult, String> {
-    Ok(capture_display_with(CaptureOptions::default())?.result)
-}
-
-/// Raw main-display capture (ScreenCaptureKit only — the part that can hang, run
-/// inside the capture worker). No overlays, no marks.
-pub fn capture_display_raw() -> Result<RawCapture, String> {
-    let (filter, target) = main_display_filter()?;
-    let img = capture_rgb_via(filter, target, None)?;
-
-    let display = crate::display::geometry::primary_display();
-    let view = ViewFrame {
-        origin: (0.0, 0.0),
-        region: (display.width as f64, display.height as f64),
-        screenshot: (img.width() as f64, img.height() as f64),
-    };
-    Ok(RawCapture {
-        image: img,
-        view,
-        window_pid: None,
-    })
-}
-
-/// Capture the main display, applying any requested overlays before encoding.
-pub fn capture_display_with(opts: CaptureOptions) -> Result<Capture, String> {
-    finish_capture(capture_display_raw()?, opts)
-}
-
-/// Capture a single on-screen window matching `query` — a case-insensitive
-/// substring of the window title or its owning application name. Returns the
-/// screenshot plus the [`ViewFrame`] that maps the image's pixels back to global
-/// logical points, so clicks against this image land on the real window.
-///
-/// Capturing just the relevant window cuts the image (and thus LLM context) down
-/// to what matters and reduces downscaling, which improves coordinate precision.
-pub fn capture_window_with(query: &str, opts: CaptureOptions) -> Result<Capture, String> {
-    finish_capture(capture_window_raw(query)?, opts)
-}
-
-/// Raw single-window capture (ScreenCaptureKit only — run inside the capture
-/// worker). Returns the owning pid as `window_pid` (both the input-routing
-/// target and the app whose marks are walked later).
-pub fn capture_window_raw(query: &str) -> Result<RawCapture, String> {
-    let content = SCShareableContent::create()
-        .with_on_screen_windows_only(true)
-        .with_exclude_desktop_windows(true)
-        .get()
-        .map_err(|e| format!("SCShareableContent::get: {e}"))?;
-
-    let q = query.to_lowercase();
-    let windows = content.windows();
-    let window = windows
-        .iter()
-        .find(|w| {
-            let title = w.title().unwrap_or_default();
-            if title.is_empty() {
-                return false;
-            }
-            let app = w
-                .owning_application()
-                .map(|a| a.application_name())
-                .unwrap_or_default();
-            title.to_lowercase().contains(&q) || app.to_lowercase().contains(&q)
-        })
-        // On a miss, list the available windows so the caller can retry with a
-        // name that actually exists — the match is a case-insensitive substring
-        // of the app name OR the window title, and non-English apps report a
-        // localized name (e.g. WeChat is "微信", QQ is "QQ"), which is the usual
-        // reason a plausible English query finds nothing.
-        .ok_or_else(|| {
-            let mut avail: Vec<String> = windows
-                .iter()
-                .filter_map(|w| {
-                    let title = w.title().unwrap_or_default();
-                    if title.is_empty() {
-                        return None;
-                    }
-                    let app = w
-                        .owning_application()
-                        .map(|a| a.application_name())
-                        .unwrap_or_default();
-                    Some(if app.is_empty() {
-                        title
-                    } else {
-                        format!("{app} — {title}")
-                    })
-                })
-                .collect();
-            avail.sort();
-            avail.dedup();
-            let shown = avail.iter().take(25).cloned().collect::<Vec<_>>().join("; ");
-            let more = avail.len().saturating_sub(25);
-            let suffix = if more > 0 {
-                format!(" (+{more} more)")
-            } else {
-                String::new()
-            };
-            format!(
-                "no on-screen window matching {query:?}. Match is a case-insensitive \
-                 substring of the app name OR window title; non-English apps use a \
-                 localized name (WeChat → \"微信\"). Available windows: {shown}{suffix}"
-            )
-        })?;
-
-    let frame = window.frame();
-    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-        return Err(format!("window {query:?} has zero size"));
-    }
-    let pid = window.owning_application().map(|a| a.process_id());
-
-    let target = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
-    let filter = SCContentFilter::create().with_window(window).build();
-    let img = capture_rgb_via(filter, target, None)?;
-
-    let view = ViewFrame {
-        origin: (frame.origin.x, frame.origin.y),
-        region: (frame.size.width, frame.size.height),
-        screenshot: (img.width() as f64, img.height() as f64),
-    };
-    Ok(RawCapture {
-        image: img,
-        view,
-        window_pid: pid,
-    })
-}
-
-/// Zoom: capture the global-logical rectangle `(x, y, w, h)` at the display's
-/// *native* resolution, so a small region fills the model's resolution budget
-/// and becomes legible. This is the grounding tool for apps that expose no
-/// Accessibility tree (WeChat, Electron, games): the model takes an overview,
-/// then zooms a region to read exact positions. Clicks against the zoomed image
-/// map back through its [`ViewFrame`].
-///
-/// Only the region itself is captured (ScreenCaptureKit `sourceRect`), not the
-/// whole display followed by a crop — fewer pixels to composite and encode, so a
-/// focused capture is cheaper than a full-display shot.
-pub fn capture_region_with(
-    rect: (f64, f64, f64, f64),
-    opts: CaptureOptions,
-) -> Result<Capture, String> {
-    finish_capture(capture_region_raw(rect)?, opts)
-}
-
-/// Raw region/zoom capture (ScreenCaptureKit only — run inside the capture
-/// worker). No overlays, no marks.
-pub fn capture_region_raw(rect: (f64, f64, f64, f64)) -> Result<RawCapture, String> {
-    let (x, y, w, h) = rect;
-    if w <= 0.0 || h <= 0.0 {
-        return Err("region has zero size".to_string());
-    }
-
-    let main = core_graphics::display::CGDisplay::main();
-    let logical = main.bounds().size;
-    if logical.width <= 0.0 || logical.height <= 0.0 {
-        return Err("main display has no geometry".to_string());
-    }
-
-    // Clamp the rect to the display so the sourceRect stays in-bounds.
-    let x = x.clamp(0.0, logical.width);
-    let y = y.clamp(0.0, logical.height);
-    let w = (w).min(logical.width - x);
-    let h = (h).min(logical.height - y);
-    if w <= 0.0 || h <= 0.0 {
-        return Err("region lies outside the display".to_string());
-    }
-
-    // Native pixels-per-point of the main display. The output buffer is sized to
-    // the region's native pixels (capped at the model budget), and SCK scales the
-    // captured sourceRect into it — preserving aspect ratio, so no letterboxing.
-    let scale = main.pixels_wide() as f64 / logical.width;
-    let region_native_w = (w * scale).round().max(1.0) as u32;
-    let region_native_h = (h * scale).round().max(1.0) as u32;
-    let target = compute_target_dims(region_native_w, region_native_h);
-
-    // Capture ONLY the region via sourceRect (display points, top-left origin).
-    let (filter, _) = main_display_filter()?;
-    let out = capture_rgb_via(filter, target, Some(CGRect::new(x, y, w, h)))?;
-
-    let view = ViewFrame {
-        origin: (x, y),
-        region: (w, h),
-        screenshot: (out.width() as f64, out.height() as f64),
-    };
-    Ok(RawCapture {
-        image: out,
-        view,
-        window_pid: None,
-    })
 }
 
 /// Turn a [`RawCapture`] into a finished [`Capture`]: apply overlays, walk the
@@ -373,57 +208,6 @@ fn build_marks(
         }
     }
     (marks, targets)
-}
-
-/// Build a content filter + target dims for the *main* display — the same one
-/// `display::geometry::primary_display` (CGDisplay::main) maps click coordinates
-/// against. SCK's `displays()` order is not guaranteed to put the main display
-/// first, so on a multi-monitor setup `.first()` could capture a different
-/// screen than clicks target; match by display id.
-fn main_display_filter() -> Result<(SCContentFilter, TargetDims), String> {
-    let content = SCShareableContent::get().map_err(|e| format!("SCShareableContent::get: {e}"))?;
-    let displays = content.displays();
-    let main_id = core_graphics::display::CGDisplay::main().id;
-    let display = displays
-        .iter()
-        .find(|d| d.display_id() == main_id)
-        .or_else(|| displays.first())
-        .ok_or_else(|| "no displays found".to_string())?;
-
-    let target = compute_target_dims(display.width(), display.height());
-    let filter = SCContentFilter::create()
-        .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
-    Ok((filter, target))
-}
-
-/// Capture `filter` at `target` dims into an in-memory RGB image (no overlays).
-///
-/// `source_rect` (in display points, top-left origin) restricts ScreenCaptureKit
-/// to compositing+encoding only that rectangle, so a region capture is cheaper
-/// than grabbing the whole display. `None` captures the full filter content.
-fn capture_rgb_via(
-    filter: SCContentFilter,
-    target: TargetDims,
-    source_rect: Option<CGRect>,
-) -> Result<image::RgbImage, String> {
-    let mut config = SCStreamConfiguration::new()
-        .with_width(target.width)
-        .with_height(target.height);
-    if let Some(rect) = source_rect {
-        config = config.with_source_rect(rect);
-    }
-
-    let image = SCScreenshotManager::capture_image(&filter, &config)
-        .map_err(|e| format!("capture_image: {e}"))?;
-
-    let img_w = image.width() as u32;
-    let img_h = image.height() as u32;
-    let rgba = image.rgba_data().map_err(|e| format!("rgba_data: {e}"))?;
-    let rgb = rgba_to_rgb(&rgba, img_w as usize, img_h as usize);
-    image::RgbImage::from_raw(img_w, img_h, rgb)
-        .ok_or_else(|| "captured buffer size did not match dimensions".to_string())
 }
 
 /// Encode an RGB image as base64 JPEG (quality 80).

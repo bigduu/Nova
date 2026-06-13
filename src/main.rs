@@ -21,9 +21,25 @@ struct Cli {
     #[arg(long)]
     selftest: bool,
 
-    /// INTERNAL: run as the capture worker subprocess. Reads JSON capture
-    /// requests on stdin and writes raw images on stdout; spawned by the server
-    /// to isolate the hang-prone ScreenCaptureKit call. Not for direct use.
+    /// INTERNAL: the SCK-touching half of --selftest, run in a SACRIFICIAL
+    /// subprocess. Any process that touches ScreenCaptureKit becomes a replayd
+    /// client that collides with the daemon (same-binary identity), so the
+    /// direct-stream probe must die before the daemon probe runs.
+    #[arg(long, hide = true)]
+    selftest_direct: bool,
+
+    /// INTERNAL: run as the shared per-user capture daemon. Owns the ONE
+    /// ScreenCaptureKit client all nova processes route captures through (two
+    /// same-binary processes holding replayd streams evict each other's XPC
+    /// identity and wedge — see capture::broker). Spawned on demand; elected
+    /// via a flock. Not for direct use.
+    #[arg(long, hide = true)]
+    capture_daemon: bool,
+
+    /// INTERNAL (legacy): old pipe-protocol capture worker, kept as a thin
+    /// proxy that forwards to the capture daemon — still-running nova servers
+    /// from pre-daemon builds spawn this from the binary on disk. Not for
+    /// direct use.
     #[arg(long, hide = true)]
     capture_worker: bool,
 
@@ -69,10 +85,14 @@ async fn main() -> Result<()> {
     // `nova::capture::init_core_graphics`.
     nova::capture::init_core_graphics();
 
-    // Capture worker subprocess: just loop on stdin/stdout doing raw captures.
-    // (Bootstrap above already ran, which is exactly what this child needs.)
+    // Shared capture daemon: serve capture requests over the per-user socket.
+    // (Bootstrap above already ran, which is exactly what this process needs.)
+    if cli.capture_daemon {
+        nova::capture::broker::run_daemon();
+    }
+    // Legacy worker entry point: proxy the old pipe protocol into the daemon.
     if cli.capture_worker {
-        nova::capture::worker::run();
+        nova::capture::broker::run_worker_proxy();
     }
 
     tracing::info!(
@@ -84,37 +104,125 @@ async fn main() -> Result<()> {
         if cli.http { "Streamable HTTP" } else { "stdio" }
     );
 
-    if cli.selftest {
-        // Probe the actual *capture* authorization (distinct from the content
-        // enumeration that SCShareableContent::get checks).
-        #[link(name = "CoreGraphics", kind = "framework")]
-        extern "C" {
-            fn CGPreflightScreenCaptureAccess() -> bool;
+    if cli.selftest_direct {
+        // SCK-touching probes, isolated in this short-lived process. Our exit
+        // closes the replayd XPC connection these open — leaving it open in the
+        // main selftest process would wedge the daemon probe that follows.
+        let probe = tokio::task::spawn_blocking(nova::display::geometry::screen_recording_available);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
+            Ok(Ok(ok)) => eprintln!(
+                "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {ok}"
+            ),
+            _ => eprintln!(
+                "[SELFTEST] screen_recording_available() TIMED OUT after 5s — \
+                 SCShareableContent itself is wedged"
+            ),
         }
-        let preflight = unsafe { CGPreflightScreenCaptureAccess() };
-        eprintln!("[SELFTEST] CGPreflightScreenCaptureAccess() = {preflight}");
-        eprintln!(
-            "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {}",
-            nova::display::geometry::screen_recording_available()
-        );
-
-        // SAME binary, no MCP server: capture directly on a blocking thread.
         let t = std::time::Instant::now();
-        let h = tokio::task::spawn_blocking(nova::capture::screenshot::capture_display);
-        match tokio::time::timeout(std::time::Duration::from_secs(20), h).await {
-            Ok(Ok(Ok(img))) => {
+        let h = tokio::task::spawn_blocking(|| {
+            nova::capture::stream::StreamCapturer::new().capture_display()
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(10), h).await {
+            Ok(Ok(Ok(raw))) => {
                 eprintln!(
-                    "[SELFTEST] OK {}x{} in {:.0} ms",
-                    img.width,
-                    img.height,
+                    "[SELFTEST] direct stream: OK {}x{} in {:.0} ms",
+                    raw.image.width(),
+                    raw.image.height(),
                     t.elapsed().as_secs_f64() * 1000.0
                 );
             }
-            Ok(Ok(Err(e))) => eprintln!("[SELFTEST] capture error: {e}"),
-            Ok(Err(e)) => eprintln!("[SELFTEST] join error: {e}"),
+            Ok(Ok(Err(e))) => eprintln!("[SELFTEST] direct stream: capture error: {e}"),
+            Ok(Err(e)) => eprintln!("[SELFTEST] direct stream: join error: {e}"),
             Err(_) => eprintln!(
-                "[SELFTEST] TIMED OUT after 20s ({:.0} ms)",
+                "[SELFTEST] direct stream: TIMED OUT after 10s — another process is \
+                 holding a ScreenCaptureKit stream (a live capture daemon is normal \
+                 here; a wedge is not)"
+            ),
+        }
+        // NOTE: process::exit, not return — Runtime::drop would WAIT for a
+        // wedged spawn_blocking thread (uncancellable SCK condvar) and this
+        // child would never exit; and only process death closes the replayd
+        // connection the probes opened.
+        std::process::exit(0);
+    }
+
+    if cli.selftest {
+        // Probe the actual *capture* authorization (CoreGraphics TCC lookup —
+        // does NOT touch replayd, so it can't contaminate the daemon probe).
+        let preflight = nova::display::geometry::preflight_screen_capture();
+        eprintln!("[SELFTEST] CGPreflightScreenCaptureAccess() = {preflight}");
+
+        // Direct-path probes (SCShareableContent + a private StreamCapturer) in
+        // a sacrificial subprocess: a process that has touched ScreenCaptureKit
+        // keeps a replayd client connection that collides with the daemon's.
+        // Only meaningful on a quiet system — with a live capture daemon the
+        // probe is GUARANTEED to collide with the daemon's stream, so skip it.
+        if let Some(pid) = nova::capture::broker::any_capture_daemon_pid() {
+            eprintln!(
+                "[SELFTEST] direct stream: skipped (capture daemon pid={pid} is live; \
+                 its warm stream would collide with a second same-binary stream)"
+            );
+        } else {
+            // Bounded wait + SIGKILL: even though the child exits via
+            // process::exit after its own timeouts, the parent must never
+            // hang on it (--selftest is the tool that diagnoses hangs).
+            let exe = std::env::current_exe()?;
+            match std::process::Command::new(&exe)
+                .arg("--selftest-direct")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(s)) if !s.success() => {
+                                eprintln!("[SELFTEST] direct probe exited: {s}");
+                                break;
+                            }
+                            Ok(Some(_)) => break,
+                            Ok(None) if std::time::Instant::now() >= deadline => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                eprintln!(
+                                    "[SELFTEST] direct probe KILLED after 25s — it hung \
+                                     past its own internal timeouts"
+                                );
+                                break;
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await
+                            }
+                            Err(e) => {
+                                eprintln!("[SELFTEST] direct probe wait failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[SELFTEST] direct probe failed to run: {e}"),
+            }
+        }
+
+        // Daemon path: the one production actually uses (connect-or-spawn the
+        // shared daemon, capture through it, full recovery ladder).
+        let t = std::time::Instant::now();
+        let h = tokio::task::spawn_blocking(|| {
+            nova::capture::broker::shared_client()
+                .capture(&nova::capture::broker::CaptureRequest::Display)
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(60), h).await {
+            Ok(Ok(Ok(raw))) => eprintln!(
+                "[SELFTEST] capture daemon: OK {}x{} in {:.0} ms",
+                raw.image.width(),
+                raw.image.height(),
                 t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Ok(Ok(Err(e))) => eprintln!("[SELFTEST] capture daemon: error: {e}"),
+            Ok(Err(e)) => eprintln!("[SELFTEST] capture daemon: join error: {e}"),
+            Err(_) => eprintln!(
+                "[SELFTEST] capture daemon: TIMED OUT after 60s — even the recovery \
+                 ladder is stuck"
             ),
         }
         return Ok(());

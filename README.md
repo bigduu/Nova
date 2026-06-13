@@ -116,13 +116,22 @@ The first run creates a `Zenith Nova Code Signing` identity in your login keycha
 fixed identifier (`com.zenith.nova`). Grant the two permissions once (above);
 later rebuilds, re-signed with the same cert, keep the grant.
 
-> **Troubleshooting — `screenshot` hangs ~20s then "capture worker was restarted".**
-> Permission and window enumeration succeed but the capture itself hangs: that's a
-> wedged `replayd` (the ScreenCaptureKit daemon), usually caused by a Nova process
-> killed mid-capture leaking a stuck stream. Nova runs each capture in a killable
-> worker subprocess and restarts it on a hang, but a wedge caused by *other* stuck
-> clients needs `killall replayd` (it relaunches on demand). Don't `kill -9` a
-> capturing Nova — let it exit cleanly so it can't leak the stream.
+> **Troubleshooting — `screenshot` fails with a "wedged" / "busy" capture error.**
+> All captures (and window enumeration) run in ONE shared per-user daemon
+> (`nova --capture-daemon`, flock-elected, socket `/tmp/nova-capture-<uid>-<hash>.sock`),
+> because `replayd` keys clients by **executable path** — two same-binary
+> ScreenCaptureKit clients evict each other's XPC identity and wedge every new
+> stream start. The daemon kills itself if a capture exceeds its 8s watchdog,
+> and the client auto-recovers: kill+respawn the daemon, then (second failure)
+> SIGKILL all nova capture processes and `killall -9 replayd` — wedges self-heal
+> without manual action. If they don't: `nova --selftest` (probes ScreenCaptureKit
+> in a sacrificial subprocess, then the daemon path) and read
+> `/tmp/nova-capture-worker.log` (step trace) + `/tmp/nova-capture-daemon.log`
+> (daemon stderr). Manual remedy = kill the processes holding streams
+> (`pkill -f -- --capture-daemon`), NOT replayd: plain `killall replayd` is a
+> no-op (replayd ignores SIGTERM), and even `killall -9 replayd` doesn't cure a
+> wedge while a stream-holding client survives — it just reconnects and re-wedges
+> the fresh replayd.
 
 ## Coordinate grounding
 
@@ -195,15 +204,15 @@ cargo test --test e2e_input mouse_move_roundtrips_through_cursor_position -- --i
 | `e2e_capture_display_returns_valid_jpeg` (`e2e_screenshot`) | Captures the display, checks the JPEG | Screen Recording |
 | `e2e_capture_dims_match_target_dims_contract` (`e2e_screenshot`) | Asserts capture dims match the click-coordinate mapping | Screen Recording |
 | `ocr_recognizes_text_on_the_display` (`e2e_ocr`) | Runs Apple Vision OCR on a live capture; asserts text + in-bounds line centers | Screen Recording |
-| `worker_*` (`e2e_capture_worker`) | Capture-worker subprocess: capture, kill→respawn recovery, repeated reuse | Screen Recording |
+| `daemon_*` / `client_*` / `concurrent_*` (`e2e_capture_worker`) | Shared capture daemon: capture, kill→respawn recovery, concurrent clients, clean-error survival | Screen Recording |
+| `legacy_pipe_protocol_still_served` (`e2e_worker`) | Old `--capture-worker` pipe protocol, proxied into the daemon | Screen Recording |
 
 > `mouse_move_roundtrips…` is the strongest input check: it proves events
 > actually reach the window server *and* that the screenshot→logical coordinate
 > conversion is correct, all click paths share the same posting mechanism.
 >
 > Run `e2e_capture_worker` **single-threaded** (`-- --ignored --test-threads=1`):
-> each test drives its own worker, and concurrent captures from multiple
-> processes contend on the window server.
+> the tests share one daemon/socket.
 
 `list_applications_returns_app_bundles` (in `e2e_input`) is **not** ignored — it
 only reads Spotlight and is tolerant of a Spotlight-less CI host.

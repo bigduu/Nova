@@ -1,9 +1,7 @@
 /// Screenshot tool — MCP-facing wrapper around the capture module.
 ///
 /// Coordinates capture, image processing, and base64 encoding for MCP responses.
-use crate::capture::screenshot::{
-    capture_display_with, capture_region_with, capture_window_with, Capture, CaptureOptions, Mark,
-};
+use crate::capture::screenshot::{Capture, Mark};
 use crate::display::view::ViewFrame;
 
 /// Result of a screenshot tool call, ready for MCP.
@@ -37,30 +35,4 @@ impl From<Capture> for ScreenshotImage {
             target_pid: c.target_pid,
         }
     }
-}
-
-/// Take a screenshot of the main display. Resizes to max 1280px, JPEG q80.
-/// `grid` overlays a coordinate grid; `marks` draws Set-of-Mark element boxes.
-pub fn take_screenshot(grid: bool, marks: bool) -> Result<ScreenshotImage, String> {
-    Ok(capture_display_with(CaptureOptions { grid, marks })?.into())
-}
-
-/// Take a screenshot of a single on-screen window matching `query` (a
-/// case-insensitive substring of the window title or owning app name).
-pub fn take_window_screenshot(
-    query: &str,
-    grid: bool,
-    marks: bool,
-) -> Result<ScreenshotImage, String> {
-    Ok(capture_window_with(query, CaptureOptions { grid, marks })?.into())
-}
-
-/// Zoom into `rect` (x, y, w, h in global logical points), captured at native
-/// resolution for a sharp, legible crop.
-pub fn take_region_screenshot(
-    rect: (f64, f64, f64, f64),
-    grid: bool,
-    marks: bool,
-) -> Result<ScreenshotImage, String> {
-    Ok(capture_region_with(rect, CaptureOptions { grid, marks })?.into())
 }

@@ -46,11 +46,18 @@ pub struct NovaServer {
     marks: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<u32, crate::tools::elements::CachedElement>>,
     >,
-    /// The killable subprocess that runs the raw ScreenCaptureKit capture. A
-    /// capture that hangs is recovered by killing+respawning this worker, so a
-    /// stuck capture can't wedge the whole pipeline (see [`crate::capture::worker`]).
-    capture_worker: std::sync::Arc<crate::capture::worker::CaptureWorker>,
 }
+
+use crate::capture::broker::shared_client as capture_client;
+
+/// Outer backstop on any daemon round-trip. The client's recovery ladder is
+/// self-limiting (every honest daemon reply lands within QUEUE_BUDGET +
+/// DAEMON_WATCHDOG, and dead daemons fail fast), but a ladder worst case —
+/// three read-timeout attempts plus kills and settles — can run ~2 minutes.
+/// This must sit ABOVE that so it never truncates a recovery mid-flight
+/// (a truncated ladder leaves the in-flight blocking task holding the client
+/// lock, making the disconnect() below a guaranteed no-op).
+const CAPTURE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(150);
 
 impl NovaServer {
     pub fn new() -> Self {
@@ -99,11 +106,21 @@ impl NovaServer {
 
     /// The process the accessibility-action tools operate on: the last
     /// window-captured app if known, otherwise the frontmost app.
-    fn current_ax_pid(&self) -> Option<i32> {
-        self.target_pid
-            .lock()
-            .expect("target_pid mutex")
-            .or_else(crate::tools::window::frontmost_app_pid)
+    ///
+    /// Async on purpose: the frontmost-app fallback is a daemon round-trip
+    /// (blocking socket I/O, worst case the full recovery ladder) — it must
+    /// run on the blocking pool, and NEVER while holding the `target_pid`
+    /// mutex (every input tool locks that mutex; holding it across the ladder
+    /// would freeze all input tools for its duration).
+    async fn current_ax_pid(&self) -> Option<i32> {
+        let cached = *self.target_pid.lock().expect("target_pid mutex");
+        if cached.is_some() {
+            return cached;
+        }
+        tokio::task::spawn_blocking(crate::tools::window::frontmost_app_pid)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Replace the Set-of-Mark cache with the elements of the latest `marks`
@@ -128,19 +145,20 @@ impl NovaServer {
 
     /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
     ///
-    /// Phase 1 — the raw pixel capture runs in the killable capture-worker
-    /// subprocess. If it hangs (20s) the capture has wedged ScreenCaptureKit /
-    /// replayd. Killing the worker frees the worker PROCESS but NOT replayd's
-    /// stuck stream, so we also bounce `replayd` (it relaunches on demand) and
-    /// retry once — that is what actually recovers a wedge. Phase 2 — overlays +
-    /// the Set-of-Mark Accessibility walk run in THIS process (the cached AX
-    /// handles can't cross the worker boundary), on a blocking thread with its
-    /// own timeout.
+    /// Phase 1 — the raw pixel capture runs in the SHARED capture daemon (one
+    /// per user, all nova processes; see [`crate::capture::broker`] for why two
+    /// same-binary ScreenCaptureKit clients wedge each other). The client call
+    /// below already contains the whole recovery ladder — daemon watchdog,
+    /// kill+respawn, stray-process sweep, `killall -9 replayd` — so by the time
+    /// it returns an error, recovery has genuinely been attempted; the outer
+    /// timeout here is only a backstop. Phase 2 — overlays + the Set-of-Mark
+    /// Accessibility walk run in THIS process (the cached AX handles can't
+    /// cross a process boundary), on a blocking thread with its own timeout.
     async fn acquire_capture(
         &self,
         plan: &CapturePlan,
     ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
-        use crate::capture::worker::CaptureRequest;
+        use crate::capture::broker::CaptureRequest;
         let request = match (plan.region, &plan.window) {
             (Some(rect), _) => CaptureRequest::Region { rect },
             (None, Some(query)) => CaptureRequest::Window {
@@ -153,46 +171,29 @@ impl NovaServer {
             marks: plan.marks,
         };
 
-        // Phase 1: raw capture in the killable worker, with replayd-wedge recovery.
-        // Snapshot the authorization picture first — cheap and hang-free — and both
-        // log it and fold it into every failure message. It distinguishes a real
-        // TCC denial (preflight=false → fix the *responsible process*'s grant; when
-        // nova runs under another app that responsible process is `parent=`, not
-        // nova) from a wedge (preflight=true but the capture below times out →
-        // bounce replayd).
+        // Phase 1: capture via the shared daemon. `preflight` in the error
+        // distinguishes a real Screen-Recording denial (fix the responsible
+        // `parent=` process) from a capture-stack failure.
         let diag = crate::display::geometry::permission_diagnostics();
         tracing::info!(target: "nova::capture", "capture {:?} — {}", request, diag);
-        let worker = self.capture_worker.clone();
-        let raw = match capture_once(&worker, &request, 20).await {
-            CaptureAttempt::Ok(raw) => raw,
-            CaptureAttempt::Failed(e) => {
-                return Err(format!("screenshot capture failed: {e} [{diag}]"))
+        let req = request.clone();
+        let task = tokio::task::spawn_blocking(move || capture_client().capture(&req));
+        let raw = match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
+            Ok(Ok(Ok(raw))) => raw,
+            Ok(Ok(Err(e))) => {
+                return Err(format!("screenshot capture failed: {e} [{diag}]"));
             }
-            CaptureAttempt::TimedOut => {
-                // A 20s raw-capture hang means ScreenCaptureKit / replayd is
-                // wedged. Kill the stuck worker AND bounce replayd (killing the
-                // worker alone does not release replayd's half of the wedge),
-                // then transparently retry once on a fresh worker + replayd.
-                worker.kill();
-                bounce_replayd().await;
-                match capture_once(&worker, &request, 15).await {
-                    CaptureAttempt::Ok(raw) => raw,
-                    CaptureAttempt::Failed(e) => {
-                        return Err(format!(
-                            "screenshot capture failed after replayd restart: {e} [{diag}]"
-                        ))
-                    }
-                    CaptureAttempt::TimedOut => {
-                        worker.kill();
-                        return Err(format!(
-                            "screenshot timed out twice even after restarting replayd — the \
-                             capture pipeline is wedged. If preflight=false below, Screen \
-                             Recording is NOT granted to the responsible process (when nova runs \
-                             under another app that is `parent=`, not nova — sign that app stably \
-                             and grant it). If preflight=true, it is a replayd wedge. [{diag}]"
-                        ));
-                    }
-                }
+            Ok(Err(join_err)) => {
+                return Err(format!("capture task failed: {join_err} [{diag}]"));
+            }
+            Err(_) => {
+                capture_client().disconnect();
+                return Err(format!(
+                    "capture of {request:?} did not return within {CAPTURE_BACKSTOP:?} — \
+                     the recovery ladder itself is stuck (preflight below: \
+                     preflight=false ⇒ Screen Recording not granted to the responsible \
+                     `parent=` process). [{diag}]"
+                ));
             }
         };
 
@@ -240,70 +241,19 @@ impl NovaServer {
         } else {
             self.set_target_pid(None);
         }
-        // Keep the captured app's Chromium/Electron accessibility tree warm so the
-        // NEXT marks capture is fast — the full semantic tree stays built instead
-        // of paying the ~2-3s cold materialization again. Harmless for native apps
-        // (the enable is rejected).
-        if let Some(pid) = img.target_pid {
-            crate::tools::elements::warmer().warm(pid);
-        }
+        // (Removed) AX keep-warm heartbeat. It re-asserted AXEnhancedUserInterface
+        // on the last-captured app every tick to keep a Chromium/Electron tree
+        // materialized for faster subsequent marks. Dropped to remove a background
+        // thread that continuously pokes app accessibility (fewer moving parts /
+        // less interference). Trade-off: the FIRST marks capture of a
+        // Chromium/Electron app now pays the cold AX materialization (~2-3s) again;
+        // native apps (e.g. WeChat) are unaffected since they expose no web tree.
         let note = screenshot_note(&img, plan);
         rmcp::model::CallToolResult::success(vec![
             rmcp::model::Content::text(note),
             rmcp::model::Content::image(img.base64_data, img.mime_type),
         ])
     }
-}
-
-/// Outcome of one worker capture attempt — distinguishes a HANG (`TimedOut`,
-/// the wedge signature) from a returned error (`Failed`, e.g. a TCC denial,
-/// which comes back fast) so the caller can recover from a wedge specifically.
-enum CaptureAttempt {
-    Ok(crate::capture::screenshot::RawCapture),
-    Failed(String),
-    TimedOut,
-}
-
-/// Run one capture through the worker, bounded by `secs`.
-async fn capture_once(
-    worker: &std::sync::Arc<crate::capture::worker::CaptureWorker>,
-    request: &crate::capture::worker::CaptureRequest,
-    secs: u64,
-) -> CaptureAttempt {
-    let w = worker.clone();
-    let req = request.clone();
-    let task = tokio::task::spawn_blocking(move || w.capture(&req));
-    match tokio::time::timeout(std::time::Duration::from_secs(secs), task).await {
-        Ok(Ok(Ok(raw))) => CaptureAttempt::Ok(raw),
-        Ok(Ok(Err(e))) => CaptureAttempt::Failed(e),
-        Ok(Err(join)) => CaptureAttempt::Failed(format!("capture task failed: {join}")),
-        Err(_) => CaptureAttempt::TimedOut,
-    }
-}
-
-/// Restart `replayd` (the ScreenCaptureKit daemon) to clear a capture wedge, then
-/// pause briefly. A capture that hangs leaves replayd holding a half-open stream;
-/// killing the stuck worker frees the worker process but not replayd's side —
-/// bouncing replayd (launchd relaunches it on demand) is what actually recovers it.
-///
-/// MUST use SIGKILL (`-9`): replayd **ignores SIGTERM**, so a plain `killall
-/// replayd` returns success but leaves the same wedged process running (verified:
-/// exit 0, unchanged PID, multi-hour uptime). That made this recovery a silent
-/// no-op — captures kept timing out "even after restarting replayd" because replayd
-/// was never actually restarted. SIGKILL can't be caught, so launchd respawns a
-/// fresh replayd with a new PID, which is what clears the wedge.
-async fn bounce_replayd() {
-    let _ = tokio::task::spawn_blocking(|| {
-        // Absolute path: the spawning env's PATH may not include /usr/bin.
-        // `-9` (SIGKILL) is required — replayd ignores the default SIGTERM.
-        let _ = std::process::Command::new("/usr/bin/killall")
-            .arg("-9")
-            .arg("replayd")
-            .status();
-    })
-    .await;
-    // Give launchd a moment to respawn replayd before the retry capture.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 }
 
 /// Click a cached marked element. Strongly prefers the Accessibility action
@@ -507,6 +457,16 @@ only that rectangle, so it is also quicker to take than a full-display shot. \
 Reserve the full-display capture for when you genuinely need the whole screen \
 (orienting, finding which window to target); for repeated work inside one app or \
 one panel, stay scoped to it.
+
+Targeting a window by name (`window=\"<name>\"`):
+- The name is a case-insensitive SUBSTRING of an ON-SCREEN window's title or its \
+app's name, exactly as it appears on screen — match the literal on-screen text, \
+do not translate or transliterate it. \
+- If your guess is wrong the tool does NOT guess for you: it returns \"no \
+on-screen window matching …\" and LISTS the windows that are actually on screen. \
+Read that list and retry with the correct name — do not repeat the same guess. \
+- When you do not already know the exact on-screen name, take a full-display \
+`screenshot` first (omit window=) to read the real window/app names, then target one.
 
 Reading TEXT — when to use `ocr`, and how to combine it with the rest:
 - USE `ocr` to (a) READ a lot of text at once (a chat thread, an article, a log, \
@@ -1038,9 +998,21 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn list_windows(&self) -> rmcp::model::CallToolResult {
-        match crate::tools::window::list_windows() {
-            Ok(windows) => ok_text(serde_json::to_string_pretty(&windows).unwrap_or_default()),
-            Err(e) => err_result(&e),
+        // Daemon round-trip (worst case the full recovery ladder) — keep it
+        // off the async runtime, with the same backstop as captures.
+        let task = tokio::task::spawn_blocking(crate::tools::window::list_windows);
+        match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
+            Ok(Ok(Ok(windows))) => {
+                ok_text(serde_json::to_string_pretty(&windows).unwrap_or_default())
+            }
+            Ok(Ok(Err(e))) => err_result(&e),
+            Ok(Err(join_err)) => err_result(&format!("list_windows task failed: {join_err}")),
+            Err(_) => {
+                capture_client().disconnect();
+                err_result(&format!(
+                    "window listing did not return within {CAPTURE_BACKSTOP:?}"
+                ))
+            }
         }
     }
 
@@ -1147,7 +1119,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<AxQueryParams>,
     ) -> rmcp::model::CallToolResult {
-        let Some(pid) = self.current_ax_pid() else {
+        let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
         match crate::tools::elements::ax_click(pid, &p.query) {
@@ -1168,7 +1140,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<AxSetValueParams>,
     ) -> rmcp::model::CallToolResult {
-        let Some(pid) = self.current_ax_pid() else {
+        let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
         match crate::tools::elements::ax_set_value(pid, &p.query, &p.value) {
@@ -1188,7 +1160,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<AxQueryParams>,
     ) -> rmcp::model::CallToolResult {
-        let Some(pid) = self.current_ax_pid() else {
+        let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
         match crate::tools::elements::ax_focus(pid, &p.query) {
@@ -1236,7 +1208,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn dump_ax(&self) -> rmcp::model::CallToolResult {
-        let Some(pid) = self.current_ax_pid() else {
+        let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
         match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500))
