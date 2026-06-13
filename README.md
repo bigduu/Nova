@@ -48,13 +48,32 @@ cargo run -- --http --addr 0.0.0.0:8080
 > baked in by `build.rs`, so no `DYLD_*` environment variable is needed for
 > `cargo run`/`cargo test` or the standalone binary.
 
-## Use it from an MCP client
+## Install
 
-Build the binary once, then point your MCP client at it.
+macOS 14+ (Apple Silicon or Intel — the release is a universal binary). Pick one:
 
 ```sh
+# Homebrew (recommended) — puts `nova` on your PATH
+brew install bigduu/tap/nova
+
+# npx — no install; great for MCP configs
+npx -y @bigduu/nova --version
+
+# Prebuilt tarball — download, unquarantine, drop on PATH
+curl -fsSLO https://github.com/bigduu/Nova/releases/latest/download/nova-vX.Y.Z-universal-apple-darwin.tar.gz
+tar xzf nova-*.tar.gz
+xattr -dr com.apple.quarantine ./nova   # only needed for the raw download
+sudo mv nova /usr/local/bin/
+
+# From source
 cargo build --release      # produces target/release/nova
 ```
+
+> The release binary is **ad-hoc signed**, not notarized. Homebrew and npm
+> install it without a Gatekeeper prompt; only the raw tarball download needs
+> the one-time `xattr -dr com.apple.quarantine` above.
+
+## Use it from an MCP client
 
 **Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
 config. For Claude Desktop that's
@@ -63,16 +82,19 @@ config. For Claude Desktop that's
 ```json
 {
   "mcpServers": {
-    "nova": {
-      "command": "/absolute/path/to/nova/target/release/nova"
-    }
+    "nova": { "command": "npx", "args": ["-y", "@bigduu/nova"] }
   }
 }
 ```
 
+With `brew install` (or a binary on PATH) the command is simply `"nova"`; from
+source, use the absolute path to `target/release/nova`.
+
 Restart the client; the Nova tools then appear to the agent. Grant **Screen
-Recording** and **Accessibility** to the nova binary (not the client app) — see
-[Permissions & code signing](#permissions--code-signing-macos).
+Recording** and **Accessibility** — see
+[Permissions & code signing](#permissions--code-signing-macos) (as a subprocess,
+the responsible process is usually the **host app or your terminal**, so grant
+that, not only the binary).
 
 **HTTP clients** — run Nova as a server and connect over Streamable HTTP:
 
@@ -223,6 +245,29 @@ only reads Spotlight and is tolerant of a Spotlight-less CI host.
 cargo fmt --all -- --check
 cargo clippy --all-targets
 ```
+
+## Releasing (maintainers)
+
+A version tag drives everything via `.github/workflows/release.yml`: it builds
+the universal binary (arm64 + x86_64, ad-hoc signed), smoke-tests it, and
+attaches it to a GitHub Release. When their secrets are present it also updates
+the Homebrew tap and publishes the npm wrapper; without them those steps skip,
+so the GitHub Release still ships.
+
+```sh
+# bump the version, then tag it (the tag must match Cargo.toml)
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+One-time setup for the optional channels:
+
+- **Homebrew** — `gh repo create bigduu/homebrew-tap --public`, then add a
+  fine-grained PAT with **Contents: write** on that repo as the nova-repo secret
+  `HOMEBREW_TAP_TOKEN`. (`packaging/homebrew/nova.rb` is the formula template.)
+- **npm** — publish under the `@bigduu` scope; add an npm automation token as the
+  secret `NPM_TOKEN`. The package (`npm/`) downloads the matching release binary
+  on install.
 
 ## License
 

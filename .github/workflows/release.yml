@@ -1,0 +1,201 @@
+name: Release
+
+# Publish a Nova release on a version tag. Produces a single UNIVERSAL macOS
+# binary (arm64 + x86_64), ad-hoc signed, attached to a GitHub Release; then
+# (optionally, when the corresponding secrets exist) updates the Homebrew tap
+# and publishes the npm wrapper so people can install Nova as an MCP server
+# without building from source.
+#
+# Trigger:  git tag v0.1.0 && git push origin v0.1.0
+# Manual:   Actions → Release → Run workflow (provide the tag)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build the universal binary + GitHub Release ──────────────────────
+  build:
+    runs-on: macos-15 # macOS 15 SDK required (apple-metal Swift bridge); matches CI
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.pkg.outputs.sha256 }}
+      asset: ${{ steps.pkg.outputs.asset }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: meta
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+          # Guard: the tag must match Cargo.toml so npm/brew never ship a
+          # version that doesn't exist as a release asset.
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $REF (=$VERSION) != Cargo.toml version $CARGO_VERSION — bump Cargo.toml or fix the tag"
+            exit 1
+          fi
+
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust toolchain (both Apple targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build arm64 + x86_64
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Make universal binary
+        run: |
+          lipo -create -output nova \
+            target/aarch64-apple-darwin/release/nova \
+            target/x86_64-apple-darwin/release/nova
+          # lipo strips the per-slice signatures; an arm64 binary MUST be at
+          # least ad-hoc signed to execute, so RE-sign the fat binary. Stable
+          # identifier so the binary has a consistent designated requirement.
+          codesign --force --identifier com.zenith.nova --sign - nova
+          lipo -info nova
+          codesign -dv nova 2>&1 | head -3
+
+      - name: Smoke test (catches dyld / Swift-rpath regressions on a clean host)
+        run: |
+          chmod +x nova
+          ./nova --version
+          ./nova --help >/dev/null
+
+      - name: Package tarball + checksum
+        id: pkg
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          ASSET="nova-v${VERSION}-universal-apple-darwin.tar.gz"
+          tar -czf "$ASSET" nova
+          SHA="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
+          echo "$SHA  $ASSET" > "$ASSET.sha256"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Built $ASSET — sha256 $SHA"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Nova ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+
+  # ── Which optional publish steps can run (presence of their secrets) ──
+  gate:
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      homebrew: ${{ steps.s.outputs.homebrew }}
+      npm: ${{ steps.s.outputs.npm }}
+    steps:
+      - id: s
+        run: |
+          echo "homebrew=${{ secrets.HOMEBREW_TAP_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+          echo "npm=${{ secrets.NPM_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+  # ── Update the Homebrew tap formula ──────────────────────────────────
+  homebrew:
+    runs-on: ubuntu-latest
+    needs: [build, gate]
+    if: needs.gate.outputs.homebrew == 'true'
+    steps:
+      - name: Check out the tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: bigduu/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Write Formula/nova.rb
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          mkdir -p tap/Formula
+          cat > tap/Formula/nova.rb <<RUBY
+          class Nova < Formula
+            desc "Computer Use MCP server — macOS desktop control for LLM agents"
+            homepage "https://github.com/bigduu/Nova"
+            version "${VERSION}"
+            url "https://github.com/bigduu/Nova/releases/download/v${VERSION}/${ASSET}"
+            sha256 "${SHA256}"
+            license "MIT"
+            depends_on :macos
+
+            def install
+              bin.install "nova"
+            end
+
+            test do
+              system "#{bin}/nova", "--version"
+            end
+          end
+          RUBY
+
+      - name: Commit + push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "formula already up to date"
+          else
+            git add Formula/nova.rb
+            git commit -m "nova ${{ needs.build.outputs.version }}"
+            git push
+          fi
+
+  # ── Publish the npm wrapper (downloads the release binary on install) ─
+  npm:
+    runs-on: ubuntu-latest
+    needs: [build, gate]
+    if: needs.gate.outputs.npm == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Set package version to the tag
+        working-directory: npm
+        run: npm version "${{ needs.build.outputs.version }}" --no-git-tag-version --allow-same-version
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

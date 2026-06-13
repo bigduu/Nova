@@ -13,3 +13,6 @@
 
 # Build artifacts
 *.dSYM/
+
+# npm wrapper: the platform binary is downloaded at install time, never committed
+npm/bin/nova
