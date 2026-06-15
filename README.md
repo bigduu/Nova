@@ -19,12 +19,13 @@ stdio or Streamable HTTP.
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
 | `ocr` | Recognize on-screen text via Apple Vision (on-device, no model files). Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. CJK + Latin. |
 | `click_mark` | Activate a numbered element straight through the Accessibility tree (no cursor, no pixel guessing). |
-| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input, in the pixel space of the last screenshot. |
+| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` / `cursor_position` | Pointer input and cursor query, in the pixel space of the last screenshot. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
 | `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
 | `read_clipboard` / `write_clipboard` | Clipboard access. |
 | `ax_click` / `ax_set_value` / `ax_focus` / `dump_ax` | Drive controls by Accessibility role/label. |
 | `batch_actions` | Run a sequence of input actions in one call. |
+| `wait` | Pause for a specified number of seconds. |
 
 ## Requirements
 
@@ -228,6 +229,8 @@ cargo test --test e2e_input mouse_move_roundtrips_through_cursor_position -- --i
 | `ocr_recognizes_text_on_the_display` (`e2e_ocr`) | Runs Apple Vision OCR on a live capture; asserts text + in-bounds line centers | Screen Recording |
 | `daemon_*` / `client_*` / `concurrent_*` (`e2e_capture_worker`) | Shared capture daemon: capture, kill→respawn recovery, concurrent clients, clean-error survival | Screen Recording |
 | `legacy_pipe_protocol_still_served` (`e2e_worker`) | Old `--capture-worker` pipe protocol, proxied into the daemon | Screen Recording |
+| `stdio_protocol` (`e2e_stdio`) | Exercises the stdio (JSON-RPC) transport end-to-end | — |
+| `safari_google_search` (`e2e_safari_google`) | Launches Safari, searches Google, asserts results — full browser automation flow | Accessibility |
 
 > `mouse_move_roundtrips…` is the strongest input check: it proves events
 > actually reach the window server *and* that the screenshot→logical coordinate
