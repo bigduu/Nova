@@ -49,12 +49,15 @@ pub fn collect_actionable(pid: i32, max: usize, clip: Option<Rect>) -> Vec<(UiEl
     // own off-screen collection still eats the budget without the cull.)
     let mut walk = Walk::run(&app, max, clip);
     // Chromium/Electron build their web tree ASYNCHRONOUSLY after the enable
-    // signal, so a freshly-loaded page can come back empty. Retry briefly when a
-    // web-capable app turned up nothing (or a web area that's still empty). Once
-    // content is found we don't retry, so a normal capture pays nothing.
+    // signal, so a freshly-loaded page comes back with its native chrome but no
+    // web area yet. Retry briefly when a web-capable app hasn't materialized its
+    // AXWebArea (gating on `walk.out.is_empty()` instead missed this: the chrome
+    // buttons are already in `out`, so the page silently marked chrome-only), or
+    // when the web area is present but still empty. Once web content is found we
+    // stop, so a warm capture pays nothing.
     let mut attempts = 0;
     while attempts < 2
-        && ((web_capable && walk.out.is_empty()) || (walk.saw_web_area && walk.web_actionable == 0))
+        && ((web_capable && !walk.saw_web_area) || (walk.saw_web_area && walk.web_actionable == 0))
     {
         std::thread::sleep(Duration::from_millis(350));
         let retry = Walk::run(&app, max, clip);

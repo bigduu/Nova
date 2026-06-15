@@ -227,6 +227,24 @@ pub struct CachedElement {
     pub pid: i32,
 }
 
+/// If `el` lives inside a web view, the `AXWebArea` ancestor's global-logical
+/// top-left origin (≈ the page viewport's origin) — used to translate the
+/// element's global center into in-page CSS-pixel coordinates for a
+/// `document.elementFromPoint(x, y)` click. `None` for native elements, which
+/// have no web area above them. Bounded to the tree depth cap so a pathological
+/// tree can't loop.
+pub fn web_area_origin(el: &AXUIElement) -> Option<(f64, f64)> {
+    let mut cur = el.clone();
+    for _ in 0..super::walk::MAX_DEPTH {
+        if ax_role(&cur) == "AXWebArea" {
+            let (x, y, _, _) = element_rect(&cur)?;
+            return Some((x, y));
+        }
+        cur = cur.attribute(&AXAttribute::parent()).ok()?;
+    }
+    None
+}
+
 /// Bring the application with `pid` to the front (so a subsequent coordinate
 /// click actually hits its content rather than just activating the window —
 /// the "first click only focuses" problem). Best-effort via AX `AXFrontmost`.

@@ -30,10 +30,11 @@ mod walk;
 mod warmth;
 
 pub mod actions;
+pub(crate) mod webclick;
 
 // Public surface (kept stable so `crate::tools::elements::X` paths don't move).
 pub use actions::{ax_click, ax_focus, ax_set_value};
 pub use debug::{ax_warm_probe, dump_tree, hit_dump};
 pub use discover::{actionable_elements, collect_actionable};
-pub use model::{raise_app, AxHandle, CachedElement, UiElement};
+pub use model::{raise_app, web_area_origin, AxHandle, CachedElement, UiElement};
 pub use warmth::{warmer, TreeWarmer};

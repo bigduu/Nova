@@ -400,8 +400,25 @@ pub(crate) fn pump_run_loop(seconds: f64) {
         static kCFRunLoopDefaultMode: *const std::ffi::c_void;
     }
     // SAFETY: standard CoreFoundation run-loop pump on the current thread.
+    let start = Instant::now();
     unsafe {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 0);
+    }
+    // CFRunLoopRunInMode returns IMMEDIATELY (kCFRunLoopRunFinished) when the run
+    // loop has no sources/timers to service — the daemon's steady state between
+    // captures, once the idle stream is stopped. Every caller uses this as a
+    // ~`seconds` poll interval (the capture thread's idle loop, wait_for_frame),
+    // so without backfilling the unslept remainder the idle loop spins a CPU core
+    // at 100% (a spinning daemon is also slow to answer handshakes, so clients
+    // mistake it for dead and spawn a SECOND daemon — two same-binary SCK clients,
+    // the exact replayd wedge this broker exists to prevent). Sleep the remainder
+    // so the interval holds regardless of source state; when sources DO exist
+    // CFRunLoopRunInMode already ran the full duration and checked_sub yields None
+    // (no extra sleep), leaving frame-delivery latency unchanged.
+    if seconds > 0.0 {
+        if let Some(rem) = Duration::from_secs_f64(seconds).checked_sub(start.elapsed()) {
+            std::thread::sleep(rem);
+        }
     }
 }
 

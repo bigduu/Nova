@@ -27,19 +27,31 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
         .collect())
 }
 
-/// Process id and global-logical frame `(x, y, w, h)` of the first on-screen
+/// Process id and global-logical frame `(x, y, w, h)` of the LARGEST on-screen
 /// window whose title OR owning-app name contains `query` (case-insensitive).
 /// For CLI debugging (`--dump-ax`, `--marks`) where we target an app by name.
 /// The frame is used as the off-screen cull clip. Needs Screen Recording.
 pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
     let q = query.to_lowercase();
-    shared_client().windows().ok()?.into_iter().find_map(|w| {
-        if w.title.to_lowercase().contains(&q) || w.app_name.to_lowercase().contains(&q) {
-            (w.pid > 0).then_some((w.pid, (w.x, w.y, w.width, w.height)))
-        } else {
-            None
-        }
-    })
+    shared_client()
+        .windows()
+        .ok()?
+        .into_iter()
+        .filter(|w| {
+            w.pid > 0
+                && (w.title.to_lowercase().contains(&q) || w.app_name.to_lowercase().contains(&q))
+        })
+        // Largest-area match, mirroring the capture path's `resolve_window`. A
+        // query like "Arc" matches several windows — the real main window PLUS
+        // tiny 600x600 auxiliary/PiP windows — and first-match returned an
+        // auxiliary one, giving a content-less clip that marked nothing. Largest
+        // area is the real window and is stable across enumeration-order shifts.
+        .max_by(|a, b| {
+            (a.width * a.height)
+                .partial_cmp(&(b.width * b.height))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|w| (w.pid, (w.x, w.y, w.width, w.height)))
 }
 
 /// System UI layers to skip when guessing the frontmost user app.

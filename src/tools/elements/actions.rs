@@ -44,17 +44,26 @@ fn find_matching<T: 'static>(
 
     let app = AXUIElement::application(pid);
     // Browser/Electron apps only expose their web tree once asked; it then
-    // builds asynchronously, so walk, and if nothing matched yet, give it a
-    // moment and walk once more.
-    enable_web_accessibility(&app);
+    // builds asynchronously over ~2-3s. `enable_web_accessibility` returns
+    // whether the app accepted the web-AX enable (i.e. it IS a Chromium/Electron
+    // view); for those, retry with backoff so a cold tree gets time to
+    // materialize. A native app exposes its whole tree on the first walk, so it
+    // gets a single attempt — a genuinely-missing query there still fails fast
+    // instead of stalling ~2s.
+    let web_capable = enable_web_accessibility(&app);
     let finder = Finder {
         query: query.to_lowercase(),
         accept,
         found: RefCell::new(None),
     };
-    for attempt in 0..2 {
-        if attempt == 1 {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+    let backoffs_ms: &[u64] = if web_capable {
+        &[0, 300, 500, 1000]
+    } else {
+        &[0]
+    };
+    for &delay in backoffs_ms {
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
         }
         TreeWalker::new().walk(&app, &finder);
         if finder.found.borrow().is_some() {
