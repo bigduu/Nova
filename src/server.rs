@@ -230,24 +230,30 @@ impl NovaServer {
         if plan.marks {
             self.set_marks(std::mem::take(&mut img.mark_targets));
         }
-        // Update the input delivery target. A `window=` capture targets that
-        // window's process (background input); a full-display capture clears it
-        // (global input); a `region=` zoom keeps whatever the prior capture set
-        // (it zooms into the same surface).
+        // Update the input delivery target AND the AX keep-warm target. A
+        // `window=` capture targets that window's process (background input) and
+        // keeps its accessibility tree warm; a full-display capture clears both
+        // (global input, no single app to warm); a `region=` zoom keeps whatever
+        // the prior capture set (it zooms into the same surface).
         if plan.region.is_some() {
             // preserve existing target
         } else if plan.window.is_some() {
             self.set_target_pid(img.target_pid);
+            // Keep the captured app's web/Electron AX tree materialized between
+            // captures. Chromium/WebKit reap their semantic tree back to a
+            // geometry-only skeleton once no assistive tech keeps polling, so
+            // WITHOUT this the NEXT marks capture races a cold (empty) web tree
+            // and silently marks only the native chrome — the "web content isn't
+            // clickable" failure. The warmer only re-asserts an idempotent AX
+            // enable on this one app; it never touches ScreenCaptureKit, moves
+            // focus, or posts input.
+            if let Some(pid) = img.target_pid {
+                crate::tools::elements::warmer().warm(pid);
+            }
         } else {
             self.set_target_pid(None);
+            crate::tools::elements::warmer().clear();
         }
-        // (Removed) AX keep-warm heartbeat. It re-asserted AXEnhancedUserInterface
-        // on the last-captured app every tick to keep a Chromium/Electron tree
-        // materialized for faster subsequent marks. Dropped to remove a background
-        // thread that continuously pokes app accessibility (fewer moving parts /
-        // less interference). Trade-off: the FIRST marks capture of a
-        // Chromium/Electron app now pays the cold AX materialization (~2-3s) again;
-        // native apps (e.g. WeChat) are unaffected since they expose no web tree.
         let note = screenshot_note(&img, plan);
         rmcp::model::CallToolResult::success(vec![
             rmcp::model::Content::text(note),
@@ -280,6 +286,36 @@ fn click_cached_mark(
              numbering no longer applies. Take a fresh screenshot(marks=true) and click the new number.",
             el.number
         ));
+    }
+
+    // Web content in a scriptable browser takes a special path: AXPress on page
+    // elements returns success but is a NO-OP (the page never reacts), and a
+    // pid-targeted click is ignored by the browser. So drive the page's own JS
+    // engine — `document.elementFromPoint(x, y).click()` — which fires the real
+    // handlers while staying fully background (no cursor, app need not be
+    // frontmost). Gated on BOTH the element living under an `AXWebArea` AND the
+    // owning app being a scriptable browser, so native chrome (the toolbar/tabs,
+    // even in Safari/Chrome) and non-browser apps keep the reliable AX path.
+    if let Some((wx, wy)) = crate::tools::elements::web_area_origin(el.handle.element()) {
+        if let Some(browser) = crate::tools::elements::webclick::browser_for_pid(el.pid) {
+            let (gx, gy) = el.center; // global-logical → in-page CSS px via web-area origin
+            match crate::tools::elements::webclick::js_click_at(&browser, gx - wx, gy - wy, &el.label)
+            {
+                Ok(desc) => {
+                    return Ok(format!(
+                        "clicked mark [{}] {} {:?} via {} in-page JS [{desc}] — background, no \
+                         cursor (AXPress is a no-op on web content)",
+                        el.number,
+                        el.role,
+                        el.label,
+                        browser.name()
+                    ));
+                }
+                // JS unavailable (Automation / "allow JS from Apple Events" off) or
+                // the point was empty — fall through to AX, then the coordinate path.
+                Err(e) => tracing::debug!(target: "nova::click", "web JS click fell back: {e}"),
+            }
+        }
     }
 
     let ax_err = match el.handle.click() {
@@ -325,7 +361,8 @@ fn format_marks(marks: &[crate::capture::screenshot::Mark]) -> String {
     }
     let mut s = format!(
         "\n{} actionable elements — call click_mark(number=N) to activate one by its [N] \
-         (drives the control directly in the background; falls back to clicking its center):",
+         (background, no cursor: web content via the page's JS engine, native controls via the \
+         Accessibility tree, else a click at its center):",
         marks.len()
     );
     for m in marks {
@@ -408,10 +445,11 @@ Targeting — how to click the right thing, in PRIORITY ORDER (do not jump to ra
 coordinates first):
 1. BEST — click by mark number. A window/display `screenshot` numbers every \
 actionable element BY DEFAULT (marks is on; needs Accessibility); each is listed \
-as `[N] role \"label\"`. Then call `click_mark(number=N)` to activate [N]. This drives the \
-control straight through the Accessibility tree (background, no cursor) and only \
-falls back to a coordinate click if the control has no AX action. It does NOT \
-guess pixels and does NOT match a label string, so it is the most reliable path — \
+as `[N] role \"label\"`. Then call `click_mark(number=N)` to activate [N]. This activates \
+the control in the background with no cursor — web-page content via the page's own \
+JavaScript engine (an Accessibility press is a no-op on web content), native controls \
+via the Accessibility tree — falling back to a coordinate click only if neither applies. \
+It is the most reliable path — \
 use it whenever the element you want appears in the marks list. The numbers reset \
 on every marks capture and go stale when the UI changes, so take a fresh \
 `screenshot(marks=true)` right before each `click_mark`.
@@ -1173,11 +1211,13 @@ impl NovaServer {
         name = "click_mark",
         description = "Activate an actionable element by the mark NUMBER shown in the most recent \
                        screenshot(marks=true) — the reliable way to click without guessing \
-                       coordinates. Drives the control directly through the Accessibility tree (no \
-                       cursor movement, works in the background); if the control exposes no AX \
-                       action, falls back to a click at the element's center. Numbers go stale when \
-                       the UI changes, so take a fresh screenshot(marks=true) right before calling \
-                       this. If the number is unknown, re-shoot with marks=true."
+                       coordinates. Always background, no cursor movement: web-page content in a \
+                       scriptable browser (Safari, Chrome, Arc, Edge, Brave, …) is clicked through \
+                       the page's OWN JavaScript engine (an Accessibility press is a silent no-op on \
+                       web content), native controls through the Accessibility tree; if neither \
+                       applies it falls back to a click at the element's center. Numbers go stale \
+                       when the UI changes, so take a fresh screenshot(marks=true) right before \
+                       calling this. If the number is unknown, re-shoot with marks=true."
     )]
     #[tracing::instrument(skip_all, fields(number = %p.number, background = %p.background), level = "info")]
     async fn click_mark(

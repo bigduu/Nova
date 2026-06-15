@@ -142,7 +142,7 @@ pub fn preflight_screen_capture() -> bool {
 
 /// Absolute executable path for `pid` via libproc's `proc_pidpath` (part of
 /// libSystem; no extra link needed). `None` if the lookup fails.
-fn proc_path(pid: i32) -> Option<String> {
+pub(crate) fn proc_path(pid: i32) -> Option<String> {
     extern "C" {
         fn proc_pidpath(pid: i32, buffer: *mut std::os::raw::c_void, buffersize: u32) -> i32;
     }
