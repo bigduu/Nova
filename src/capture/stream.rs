@@ -37,7 +37,9 @@ use screencapturekit::stream::{
 };
 
 use crate::capture::screenshot::{rgba_to_rgb, step, RawCapture};
-use crate::display::scaling::compute_target_dims;
+use crate::display::scaling::{
+    compute_target_dims, compute_target_dims_capped, REGION_MAX_DIMENSION, WINDOW_MAX_DIMENSION,
+};
 use crate::display::view::ViewFrame;
 
 /// What the live stream is currently targeting; used to decide whether a capture
@@ -574,7 +576,9 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
     let scale = main.pixels_wide() as f64 / logical.width;
     let region_native_w = (w * scale).round().max(1.0) as u32;
     let region_native_h = (h * scale).round().max(1.0) as u32;
-    let dims = compute_target_dims(region_native_w, region_native_h);
+    // A zoom is for reading fine detail — give it the larger region budget
+    // (high-res models accept up to 2576px @ 1:1). Already native pixels.
+    let dims = compute_target_dims_capped(region_native_w, region_native_h, REGION_MAX_DIMENSION);
 
     step("stream: resolve region (SCShareableContent::get)");
     let content = SCShareableContent::get().map_err(|e| format!("SCShareableContent::get: {e}"))?;
@@ -696,7 +700,18 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
         return Err(format!("window {query:?} has zero size"));
     }
-    let dims = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
+    // Size the capture from PHYSICAL (Retina) pixels, not logical points: a
+    // window smaller than the cap would otherwise be rendered at 1×, throwing
+    // away backing-scale detail and leaving small text soft. Multiplying by the
+    // display's scale factor lets SCK render at native resolution, capped to the
+    // window budget. `ViewFrame.region` stays in logical points, so clicks map
+    // correctly regardless of the output pixel size.
+    let scale = crate::display::geometry::primary_display()
+        .scale_factor
+        .max(1.0);
+    let phys_w = (frame.size.width * scale).round().max(1.0) as u32;
+    let phys_h = (frame.size.height * scale).round().max(1.0) as u32;
+    let dims = compute_target_dims_capped(phys_w, phys_h, WINDOW_MAX_DIMENSION);
     let pid = window.owning_application().map(|a| a.process_id());
     let window_id = window.window_id();
     let filter = SCContentFilter::create().with_window(window).build();
