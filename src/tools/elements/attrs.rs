@@ -6,7 +6,7 @@
 use accessibility::{AXAttribute, AXUIElement, Error as AxError};
 use accessibility_sys::{
     error_string, kAXErrorSuccess, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    AXUIElementCopyAttributeValue, AXValueGetValue, AXValueRef,
+    AXUIElementCopyAttributeValue, AXUIElementRef, AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
@@ -15,6 +15,26 @@ use std::ffi::c_void;
 
 /// A global-logical rectangle `(x, y, width, height)`.
 pub(crate) type Rect = (f64, f64, f64, f64);
+
+extern "C" {
+    /// Private but long-stable Accessibility API (used by yabai, Hammerspoon,
+    /// and friends): writes the element's owning `CGWindowID`. Returns
+    /// `kAXErrorSuccess` (0) on success. Linked from the same framework that
+    /// provides the rest of the AX FFI.
+    fn _AXUIElementGetWindow(element: AXUIElementRef, identifier: *mut u32) -> i32;
+}
+
+/// The `CGWindowID` of AX window element `el` (same id space as
+/// ScreenCaptureKit's `SCWindow::window_id`), via `_AXUIElementGetWindow`. Lets
+/// mark discovery match an AX window node to the captured window EXACTLY rather
+/// than by frame size. `None` if `el` is not a window or the call fails.
+pub(crate) fn ax_window_id(el: &AXUIElement) -> Option<u32> {
+    let mut id: u32 = 0;
+    // SAFETY: `as_concrete_TypeRef` is a live `AXUIElementRef`; the call only
+    // writes one `u32` through our out-pointer and returns an `AXError`.
+    let err = unsafe { _AXUIElementGetWindow(el.as_concrete_TypeRef(), &mut id) };
+    (err == kAXErrorSuccess && id != 0).then_some(id)
+}
 
 /// Click-like AX actions, in preference order. Different controls expose
 /// different ones — a button has `AXPress`, a list row / file often only has

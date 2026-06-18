@@ -54,6 +54,30 @@ pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
         .map(|w| (w.pid, (w.x, w.y, w.width, w.height)))
 }
 
+/// `CGWindowID` of the window owned by `pid` whose global frame matches `rect`
+/// (the capture's clip). Lets mark discovery match an AX window node to the
+/// captured window EXACTLY (via `_AXUIElementGetWindow`) instead of by size —
+/// which is ambiguous when an app has two same-sized windows. Two windows can't
+/// share the same global origin, so the closest-by-position match is unique.
+/// `None` if no window is within `TOL` points (or no Screen Recording).
+pub fn window_id_for_rect(pid: i32, rect: (f64, f64, f64, f64)) -> Option<u32> {
+    const TOL: f64 = 4.0;
+    let (rx, ry, rw, rh) = rect;
+    shared_client()
+        .windows()
+        .ok()?
+        .into_iter()
+        .filter(|w| w.pid == pid && w.window_id != 0)
+        .map(|w| {
+            let d =
+                (w.x - rx).abs() + (w.y - ry).abs() + (w.width - rw).abs() + (w.height - rh).abs();
+            (d, w.window_id)
+        })
+        .filter(|(d, _)| *d <= TOL)
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, id)| id)
+}
+
 /// System UI layers to skip when guessing the frontmost user app.
 fn is_system_ui(app: &str) -> bool {
     matches!(

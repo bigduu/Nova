@@ -3,7 +3,7 @@
 //! visible window. This is the "native chrome" half of mark discovery; the web
 //! content half is the hit-test pass (see [`super::hittest`]).
 
-use super::attrs::{ax_label, element_array, element_rect, rects_intersect, Rect};
+use super::attrs::{ax_label, ax_window_id, element_array, element_rect, rects_intersect, Rect};
 use super::model::{is_target, UiElement};
 use crate::tools::elements::attrs::ax_role;
 use accessibility::AXUIElement;
@@ -100,12 +100,20 @@ impl CoordLift {
     /// `clip` is the ONE captured window's rect, but the walk roots at the app and
     /// reaches every window it owns — so only the captured window may be anchored
     /// on `clip`; lifting a different window onto it would slide that window's
-    /// elements into `clip` and escape the cull. The captured window is the one
-    /// whose SIZE matches `clip` (AX reports the right size even when its origin is
-    /// view-local); others return `None` and keep their own coords to be culled.
-    fn derive(win: &AXUIElement, clip: Rect) -> Option<CoordLift> {
+    /// elements into `clip` and escape the cull (ghost marks from a sibling).
+    ///
+    /// `target_window` is the captured window's `CGWindowID`: when present, the
+    /// captured window is matched EXACTLY by id (`ax_window_id`), which is robust
+    /// even for two same-sized windows of one app. When it's `None` (no clip, or
+    /// the id couldn't be resolved) fall back to matching by frame SIZE — AX
+    /// reports the right size even when the origin is view-local.
+    fn derive(win: &AXUIElement, clip: Rect, target_window: Option<u32>) -> Option<CoordLift> {
         let raw = element_rect(win)?;
-        if (raw.2 - clip.2).abs() > 2.0 || (raw.3 - clip.3).abs() > 2.0 {
+        let is_captured = match target_window {
+            Some(id) => ax_window_id(win) == Some(id),
+            None => (raw.2 - clip.2).abs() <= 2.0 && (raw.3 - clip.3).abs() <= 2.0,
+        };
+        if !is_captured {
             return None;
         }
         Some(CoordLift {
@@ -144,6 +152,9 @@ pub(crate) struct Walk {
     /// scrolled-off rows (e.g. Arc's sidebar collection) that otherwise exhaust
     /// the node budget before the walk reaches the visible main content.
     clip: Option<Rect>,
+    /// `CGWindowID` of the captured window, so the coordinate lift anchors on
+    /// exactly that window (not a same-sized sibling). `None` ⇒ match by size.
+    target_window: Option<u32>,
     /// Whether an `AXWebArea` was seen — i.e. this is a browser/Electron view.
     pub(crate) saw_web_area: bool,
     /// Actionable elements found underneath a web area (0 ⇒ the web tree is
@@ -152,13 +163,19 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
-    pub(crate) fn run(root: &AXUIElement, max: usize, clip: Option<Rect>) -> Walk {
+    pub(crate) fn run(
+        root: &AXUIElement,
+        max: usize,
+        clip: Option<Rect>,
+        target_window: Option<u32>,
+    ) -> Walk {
         let mut w = Walk {
             out: Vec::new(),
             visited: 0,
             path: std::collections::HashSet::new(),
             max,
             clip,
+            target_window,
             saw_web_area: false,
             web_actionable: 0,
         };
@@ -191,7 +208,9 @@ impl Walk {
         // (Tauri/Safari) report their whole subtree in view-local coords, so this
         // captures the local→global offset for everything below.
         let lift = match (lift, self.clip) {
-            (None, Some(clip)) if role == "AXWindow" => CoordLift::derive(el, clip),
+            (None, Some(clip)) if role == "AXWindow" => {
+                CoordLift::derive(el, clip, self.target_window)
+            }
             _ => lift,
         };
         // This element's frame, lifted into global coords when the window exposes
