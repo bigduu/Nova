@@ -194,10 +194,6 @@ impl Walk {
             (None, Some(clip)) if role == "AXWindow" => CoordLift::derive(el, clip),
             _ => lift,
         };
-        let in_web = in_web || role == "AXWebArea";
-        if role == "AXWebArea" {
-            self.saw_web_area = true;
-        }
         // This element's frame, lifted into global coords when the window exposes
         // its content in view-local space — used for BOTH the cull and the stored
         // mark, so a page element is culled and positioned by where it is drawn.
@@ -209,6 +205,13 @@ impl Walk {
             (Some(clip), Some(r)) if r.2 >= 1.0 && r.3 >= 1.0 && !rects_intersect(r, clip)
         );
         if !culled {
+            // Only count a web area we actually descend into: a culled (fully
+            // off-screen) `AXWebArea` contributes no content, so flagging it would
+            // wrongly make discovery think a still-building page needs a retry.
+            let in_web = in_web || role == "AXWebArea";
+            if role == "AXWebArea" {
+                self.saw_web_area = true;
+            }
             if is_target(el, &role) {
                 if let Some(r) = rect {
                     if r.2 >= 1.0 && r.3 >= 1.0 {

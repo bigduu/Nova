@@ -44,9 +44,11 @@ pub fn compute_target_dims(display_width: u32, display_height: u32) -> TargetDim
 /// (window / region) that pick their own budget. Never upscales.
 pub fn compute_target_dims_capped(width: u32, height: u32, max_dim: u32) -> TargetDims {
     let max_edge = width.max(height);
-    if max_edge <= max_dim || max_edge == 0 {
+    if max_edge <= max_dim {
         return TargetDims { width, height };
     }
+    // Past here `max_edge > max_dim >= 0`, so `max_edge >= 1` — the divisor below
+    // can't be zero.
 
     let scale = max_dim as f64 / max_edge as f64;
     TargetDims {

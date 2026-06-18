@@ -35,6 +35,30 @@ pub fn primary_display() -> DisplayInfo {
     }
 }
 
+/// Backing-scale factor (2.0 on Retina, 1.0 otherwise) of the display that
+/// contains the global-logical point `(x, y)`.
+///
+/// Needed for per-window capture sizing on a MIXED-DPI multi-monitor setup: a
+/// window can live on a display whose scale differs from the primary's, so
+/// `primary_display().scale_factor` would over- or under-sample it. Finds the
+/// display whose logical bounds contain the point and returns its physical/
+/// logical ratio; falls back to the primary's scale (then 1.0) when no display
+/// matches (e.g. an off-screen point).
+pub fn scale_factor_at(x: f64, y: f64) -> f64 {
+    if let Ok(ids) = CGDisplay::active_displays() {
+        for id in ids {
+            let d = CGDisplay::new(id);
+            let b = d.bounds();
+            let in_x = x >= b.origin.x && x < b.origin.x + b.size.width;
+            let in_y = y >= b.origin.y && y < b.origin.y + b.size.height;
+            if in_x && in_y && b.size.width > 0.0 {
+                return (d.pixels_wide() as f64 / b.size.width).max(1.0);
+            }
+        }
+    }
+    primary_display().scale_factor.max(1.0)
+}
+
 /// Convert a coordinate from screenshot space (what the LLM sees) to the
 /// global logical point coordinates used to post mouse events.
 ///

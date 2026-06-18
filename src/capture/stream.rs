@@ -719,10 +719,13 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
     // away backing-scale detail and leaving small text soft. Multiplying by the
     // display's scale factor lets SCK render at native resolution, capped to the
     // window budget. `ViewFrame.region` stays in logical points, so clicks map
-    // correctly regardless of the output pixel size.
-    let scale = crate::display::geometry::primary_display()
-        .scale_factor
-        .max(1.0);
+    // correctly regardless of the output pixel size. Use the scale of the
+    // display the window is ON (not the primary's) so a window on a non-primary
+    // display in a mixed-DPI setup isn't under- or over-sampled.
+    let scale = crate::display::geometry::scale_factor_at(
+        frame.origin.x + frame.size.width / 2.0,
+        frame.origin.y + frame.size.height / 2.0,
+    );
     let phys_w = (frame.size.width * scale).round().max(1.0) as u32;
     let phys_h = (frame.size.height * scale).round().max(1.0) as u32;
     let dims = compute_target_dims_capped(phys_w, phys_h, WINDOW_MAX_DIMENSION);
