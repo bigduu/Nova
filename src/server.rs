@@ -296,11 +296,12 @@ fn click_cached_mark(
     // frontmost). Gated on BOTH the element living under an `AXWebArea` AND the
     // owning app being a scriptable browser, so native chrome (the toolbar/tabs,
     // even in Safari/Chrome) and non-browser apps keep the reliable AX path.
-    if let Some((wx, wy)) = crate::tools::elements::web_area_origin(el.handle.element()) {
+    if let Some((px, py)) = crate::tools::elements::web_click_point(el.handle.element()) {
         if let Some(browser) = crate::tools::elements::webclick::browser_for_pid(el.pid) {
-            let (gx, gy) = el.center; // global-logical → in-page CSS px via web-area origin
-            match crate::tools::elements::webclick::js_click_at(&browser, gx - wx, gy - wy, &el.label)
-            {
+            // `px,py` is the element's center RELATIVE to its web area, read in raw
+            // AX coords — not derived from the cached (possibly view-local-lifted)
+            // mark center, which would aim the click off-page on WKWebView windows.
+            match crate::tools::elements::webclick::js_click_at(&browser, px, py, &el.label) {
                 Ok(desc) => {
                     return Ok(format!(
                         "clicked mark [{}] {} {:?} via {} in-page JS [{desc}] — background, no \

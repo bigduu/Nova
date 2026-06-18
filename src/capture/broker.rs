@@ -92,8 +92,12 @@ fn daemon_idle_exit() -> Duration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CaptureRequest {
     Display,
-    Window { query: String },
-    Region { rect: (f64, f64, f64, f64) },
+    Window {
+        query: String,
+    },
+    Region {
+        rect: (f64, f64, f64, f64),
+    },
     /// Enumerate on-screen windows (metadata only, no pixels). Window
     /// enumeration ALSO goes through the daemon: `SCShareableContent` keeps a
     /// replayd XPC client connection open in whatever process calls it, and a
@@ -388,7 +392,10 @@ fn capture_thread(rx: std::sync::mpsc::Receiver<Job>) {
         match rx.try_recv() {
             Ok(job) => {
                 if job.cancelled.load(Ordering::Acquire) {
-                    step(&format!("REQ {:?} — skipped (client gave up while queued)", job.req));
+                    step(&format!(
+                        "REQ {:?} — skipped (client gave up while queued)",
+                        job.req
+                    ));
                     continue;
                 }
                 step(&format!("REQ {:?}", job.req));
@@ -772,7 +779,9 @@ impl CaptureClient {
                     // the daemon its peers just recovered onto.
                     let _recovery = RecoveryLock::acquire();
                     if healthy_daemon_answers() {
-                        step("client: a peer already recovered the daemon — retrying without kills");
+                        step(
+                            "client: a peer already recovered the daemon — retrying without kills",
+                        );
                         notes.push("peer recovered the daemon; retried".to_string());
                         continue;
                     }
@@ -931,11 +940,9 @@ fn connect_or_spawn() -> Result<Conn, AttemptError> {
                 // A daemon whose responsibility chain lacks the Screen
                 // Recording grant fails every capture forever; if WE hold the
                 // grant, replace it so the respawn inherits our granted chain.
-                let tcc_stale = !hello.preflight
-                    && crate::display::geometry::preflight_screen_capture();
-                if hello.proto < PROTO_VERSION
-                    || hello.exe_mtime_ms != exe_mtime_ms()
-                    || tcc_stale
+                let tcc_stale =
+                    !hello.preflight && crate::display::geometry::preflight_screen_capture();
+                if hello.proto < PROTO_VERSION || hello.exe_mtime_ms != exe_mtime_ms() || tcc_stale
                 {
                     step(&format!(
                         "client: daemon pid={} is stale (proto {} vs {PROTO_VERSION}, build {} \
@@ -1010,7 +1017,10 @@ fn spawn_daemon() -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn capture daemon ({}): {e}", exe.display()))?;
-    step(&format!("client: spawned capture daemon pid={}", child.id()));
+    step(&format!(
+        "client: spawned capture daemon pid={}",
+        child.id()
+    ));
     // A daemon that dies within its first instants is one of: lost election
     // (exit 0 — benign, another daemon is serving), or a binary that cannot run
     // `--capture-daemon` at all (e.g. a test harness without NOVA_CAPTURE_BIN)

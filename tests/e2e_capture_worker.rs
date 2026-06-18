@@ -43,7 +43,10 @@ fn daemon_captures_the_display() {
     let raw = capture_display(&c, "daemon display capture").expect("daemon should capture");
     assert!(raw.image.width() > 0 && raw.image.height() > 0);
     assert!(raw.image.width() <= 1280 && raw.image.height() <= 1280);
-    assert!(raw.window_pid.is_none(), "display capture has no window pid");
+    assert!(
+        raw.window_pid.is_none(),
+        "display capture has no window pid"
+    );
     stop_daemon(&c);
 }
 

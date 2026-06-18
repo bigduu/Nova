@@ -12,24 +12,48 @@ pub struct TargetDims {
     pub height: u32,
 }
 
-/// Maximum dimension for screenshot resizing (constrains to ~1MP).
-const MAX_DIMENSION: u32 = 1280;
+/// Long-edge cap for a FULL-DISPLAY capture. Kept modest: a full screen is an
+/// overview, and this value is recomputed at click time from the logical display
+/// size (see `geometry::screen_to_logical_coords`), so it must stay a pure
+/// function of the display — don't make it depend on the model or surface.
+pub const MAX_DIMENSION: u32 = 1280;
 
-/// Compute the target dimensions that fit within the max dimension,
-/// preserving the original aspect ratio.
+/// Long-edge cap for a SINGLE-WINDOW capture. Higher than the display cap because
+/// a window is the working surface where text/controls must be legible, and the
+/// window path now feeds PHYSICAL (Retina) pixels — at 1568 a small 2× window is
+/// captured sharp instead of at 1×. 1568 is the universal image cap (no model
+/// re-downscales it), ~2.0MP, so it never wastes pixels. Window clicks map via
+/// the capture's own `ViewFrame`, so a per-surface cap here is coordinate-safe.
+pub const WINDOW_MAX_DIMENSION: u32 = 1568;
+
+/// Long-edge cap for a `zoom_region` capture — the surface whose whole point is
+/// reading fine detail. Opus 4.7+/4.8 accept up to 2576px / 3.75MP at 1:1
+/// coordinates; 2200 stays under the area cap for typical aspect ratios. On an
+/// older model the API simply re-downscales to 1568 (wasted bytes, not a
+/// correctness issue). Region captures already use physical pixels and their own
+/// `ViewFrame`, so this is coordinate-safe.
+pub const REGION_MAX_DIMENSION: u32 = 2200;
+
+/// Compute the target dimensions that fit within [`MAX_DIMENSION`] (the
+/// full-display cap), preserving the original aspect ratio.
 pub fn compute_target_dims(display_width: u32, display_height: u32) -> TargetDims {
-    let max_edge = display_width.max(display_height);
-    if max_edge <= MAX_DIMENSION {
-        return TargetDims {
-            width: display_width,
-            height: display_height,
-        };
-    }
+    compute_target_dims_capped(display_width, display_height, MAX_DIMENSION)
+}
 
-    let scale = MAX_DIMENSION as f64 / max_edge as f64;
+/// Like [`compute_target_dims`] but with an explicit long-edge cap, for callers
+/// (window / region) that pick their own budget. Never upscales.
+pub fn compute_target_dims_capped(width: u32, height: u32, max_dim: u32) -> TargetDims {
+    let max_edge = width.max(height);
+    if max_edge <= max_dim {
+        return TargetDims { width, height };
+    }
+    // Past here `max_edge > max_dim >= 0`, so `max_edge >= 1` — the divisor below
+    // can't be zero.
+
+    let scale = max_dim as f64 / max_edge as f64;
     TargetDims {
-        width: (display_width as f64 * scale).round() as u32,
-        height: (display_height as f64 * scale).round() as u32,
+        width: (width as f64 * scale).round().max(1.0) as u32,
+        height: (height as f64 * scale).round().max(1.0) as u32,
     }
 }
 
@@ -98,6 +122,33 @@ mod tests {
         // 2560/1440 = 16/9 => 1280/720 = 16/9
         assert_eq!(dims.width, 1280);
         assert_eq!(dims.height, 720);
+    }
+
+    #[test]
+    fn capped_window_keeps_retina_detail() {
+        // A 1000×700pt window on a 2× display: feed PHYSICAL pixels (2000×1400),
+        // capped to the window budget (1568) — far sharper than the old 1× path
+        // that produced a 1000-wide image.
+        let dims = compute_target_dims_capped(2000, 1400, WINDOW_MAX_DIMENSION);
+        assert_eq!(dims.width, 1568);
+        assert_eq!(dims.height, 1098); // 1400 * 1568/2000
+    }
+
+    #[test]
+    fn capped_region_uses_larger_budget() {
+        // A native 3000×1800 zoom region maps to the 2200 long-edge budget.
+        let dims = compute_target_dims_capped(3000, 1800, REGION_MAX_DIMENSION);
+        assert_eq!(dims.width, 2200);
+        assert_eq!(dims.height, 1320);
+    }
+
+    #[test]
+    fn capped_never_upscales() {
+        // Below the cap, dimensions pass through unchanged (no upscaling a small
+        // window to fill the budget).
+        let dims = compute_target_dims_capped(800, 600, WINDOW_MAX_DIMENSION);
+        assert_eq!(dims.width, 800);
+        assert_eq!(dims.height, 600);
     }
 
     #[test]

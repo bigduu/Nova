@@ -210,10 +210,15 @@ fn build_marks(
     (marks, targets)
 }
 
-/// Encode an RGB image as base64 JPEG (quality 80).
+/// Encode an RGB image as base64 JPEG (quality 90).
+///
+/// Quality 90 over 80: image tokens are billed purely on pixel dimensions, never
+/// file size, so a higher quality costs ZERO extra tokens — it only adds a little
+/// upload bandwidth. UI screenshots are sharp text + thin mark/grid lines, where
+/// JPEG's ringing artifacts hurt most; 90 keeps glyphs and 1px overlays crisp.
 fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
     let mut buf = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90)
         .encode(
             img.as_raw(),
             img.width(),

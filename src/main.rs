@@ -108,7 +108,8 @@ async fn main() -> Result<()> {
         // SCK-touching probes, isolated in this short-lived process. Our exit
         // closes the replayd XPC connection these open — leaving it open in the
         // main selftest process would wedge the daemon probe that follows.
-        let probe = tokio::task::spawn_blocking(nova::display::geometry::screen_recording_available);
+        let probe =
+            tokio::task::spawn_blocking(nova::display::geometry::screen_recording_available);
         match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
             Ok(Ok(ok)) => eprintln!(
                 "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {ok}"
@@ -305,7 +306,10 @@ async fn main() -> Result<()> {
     // another app, `responsible/parent=` shows whose Screen Recording grant the OS
     // actually checks — if that parent is ad-hoc-signed, its grant won't persist
     // across rebuilds and `preflight=false` here even though nova is signed.
-    tracing::info!("permission diagnostics: {}", nova::display::geometry::permission_diagnostics());
+    tracing::info!(
+        "permission diagnostics: {}",
+        nova::display::geometry::permission_diagnostics()
+    );
 
     if cli.http {
         nova::server::run_http(&cli.addr).await

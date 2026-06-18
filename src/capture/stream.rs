@@ -37,7 +37,9 @@ use screencapturekit::stream::{
 };
 
 use crate::capture::screenshot::{rgba_to_rgb, step, RawCapture};
-use crate::display::scaling::compute_target_dims;
+use crate::display::scaling::{
+    compute_target_dims, compute_target_dims_capped, REGION_MAX_DIMENSION, WINDOW_MAX_DIMENSION,
+};
 use crate::display::view::ViewFrame;
 
 /// What the live stream is currently targeting; used to decide whether a capture
@@ -45,8 +47,8 @@ use crate::display::view::ViewFrame;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Target {
     Display,
-    Window(u32),  // SCWindow::window_id()
-    Region(u64),  // hash of the (rounded) source rect — different rect ⇒ retarget
+    Window(u32), // SCWindow::window_id()
+    Region(u64), // hash of the (rounded) source rect — different rect ⇒ retarget
 }
 
 /// The most recent decoded frame, plus a monotonically increasing sequence number
@@ -142,7 +144,9 @@ impl StreamCapturer {
     pub fn housekeeping(&mut self) {
         self.reset_if_dead();
         if SCREEN_REVEALED.swap(false, Ordering::Relaxed) && self.stream.is_some() {
-            step("stream: screen revealed (unlock/screensaver) — eagerly invalidating stale stream");
+            step(
+                "stream: screen revealed (unlock/screensaver) — eagerly invalidating stale stream",
+            );
             self.reset();
             pump_run_loop(0.3); // let replayd finish the teardown
         }
@@ -250,7 +254,9 @@ impl StreamCapturer {
                 // capture rebuilds a fresh one. No replayd restart, no process
                 // kill — just a clean in-process reset. The caller gets a plain
                 // error and can retry.
-                step(&format!("stream: stalled ({e}) — dropping stream for rebuild"));
+                step(&format!(
+                    "stream: stalled ({e}) — dropping stream for rebuild"
+                ));
                 self.reset();
                 return Err(e);
             }
@@ -486,7 +492,10 @@ fn register_screen_reveal_observer() {
             return;
         }
         let observer = &SCREEN_REVEALED as *const AtomicBool as *const c_void;
-        for name in ["com.apple.screenIsUnlocked", "com.apple.screensaver.didstop"] {
+        for name in [
+            "com.apple.screenIsUnlocked",
+            "com.apple.screensaver.didstop",
+        ] {
             let cf = CFString::new(name);
             let name_ref = cf.as_concrete_TypeRef() as *const c_void;
             std::mem::forget(cf);
@@ -574,7 +583,9 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
     let scale = main.pixels_wide() as f64 / logical.width;
     let region_native_w = (w * scale).round().max(1.0) as u32;
     let region_native_h = (h * scale).round().max(1.0) as u32;
-    let dims = compute_target_dims(region_native_w, region_native_h);
+    // A zoom is for reading fine detail — give it the larger region budget
+    // (high-res models accept up to 2576px @ 1:1). Already native pixels.
+    let dims = compute_target_dims_capped(region_native_w, region_native_h, REGION_MAX_DIMENSION);
 
     step("stream: resolve region (SCShareableContent::get)");
     let content = SCShareableContent::get().map_err(|e| format!("SCShareableContent::get: {e}"))?;
@@ -614,7 +625,9 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
 }
 
 fn resolve_window(query: &str) -> Result<Resolved, String> {
-    step(&format!("stream: resolve window:{query:?} (SCShareableContent::get)"));
+    step(&format!(
+        "stream: resolve window:{query:?} (SCShareableContent::get)"
+    ));
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(true)
         .with_exclude_desktop_windows(true)
@@ -679,7 +692,12 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
             avail.sort();
             avail.dedup();
             let more = avail.len().saturating_sub(25);
-            let shown = avail.iter().take(25).cloned().collect::<Vec<_>>().join("; ");
+            let shown = avail
+                .iter()
+                .take(25)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
             let suffix = if more > 0 {
                 format!(" (+{more} more)")
             } else {
@@ -696,7 +714,21 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
         return Err(format!("window {query:?} has zero size"));
     }
-    let dims = compute_target_dims(frame.size.width as u32, frame.size.height as u32);
+    // Size the capture from PHYSICAL (Retina) pixels, not logical points: a
+    // window smaller than the cap would otherwise be rendered at 1×, throwing
+    // away backing-scale detail and leaving small text soft. Multiplying by the
+    // display's scale factor lets SCK render at native resolution, capped to the
+    // window budget. `ViewFrame.region` stays in logical points, so clicks map
+    // correctly regardless of the output pixel size. Use the scale of the
+    // display the window is ON (not the primary's) so a window on a non-primary
+    // display in a mixed-DPI setup isn't under- or over-sampled.
+    let scale = crate::display::geometry::scale_factor_at(
+        frame.origin.x + frame.size.width / 2.0,
+        frame.origin.y + frame.size.height / 2.0,
+    );
+    let phys_w = (frame.size.width * scale).round().max(1.0) as u32;
+    let phys_h = (frame.size.height * scale).round().max(1.0) as u32;
+    let dims = compute_target_dims_capped(phys_w, phys_h, WINDOW_MAX_DIMENSION);
     let pid = window.owning_application().map(|a| a.process_id());
     let window_id = window.window_id();
     let filter = SCContentFilter::create().with_window(window).build();

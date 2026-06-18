@@ -21,7 +21,13 @@ fn ocr_recognizes_text_on_the_display() {
     })
     .expect("capture display");
     let shot: ScreenshotImage = with_timeout(15, "finish_capture", move || {
-        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+        finish_capture(
+            raw,
+            CaptureOptions {
+                grid: false,
+                marks: false,
+            },
+        )
     })
     .expect("finish_capture")
     .into();

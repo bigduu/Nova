@@ -36,5 +36,5 @@ pub(crate) mod webclick;
 pub use actions::{ax_click, ax_focus, ax_set_value};
 pub use debug::{ax_warm_probe, dump_tree, hit_dump};
 pub use discover::{actionable_elements, collect_actionable};
-pub use model::{raise_app, web_area_origin, AxHandle, CachedElement, UiElement};
+pub use model::{raise_app, web_area_origin, web_click_point, AxHandle, CachedElement, UiElement};
 pub use warmth::{warmer, TreeWarmer};

@@ -21,7 +21,13 @@ fn capture_display_shot() -> ScreenshotImage {
     })
     .expect("stream capture_display should succeed with permissions");
     with_timeout(15, "finish_capture", move || {
-        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+        finish_capture(
+            raw,
+            CaptureOptions {
+                grid: false,
+                marks: false,
+            },
+        )
     })
     .expect("finish_capture")
     .into()
@@ -131,7 +137,13 @@ fn e2e_window_screenshot_produces_view_frame() {
     })
     .expect("window screenshot");
     let shot: ScreenshotImage = with_timeout(15, "finish_capture", move || {
-        finish_capture(raw, CaptureOptions { grid: false, marks: false })
+        finish_capture(
+            raw,
+            CaptureOptions {
+                grid: false,
+                marks: false,
+            },
+        )
     })
     .expect("finish_capture")
     .into();
