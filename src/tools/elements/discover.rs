@@ -41,13 +41,20 @@ pub fn collect_actionable(pid: i32, max: usize, clip: Option<Rect>) -> Vec<(UiEl
     let app = AXUIElement::application(pid);
     let web_capable = enable_web_accessibility(&app);
 
+    // The captured window's `CGWindowID`, so the view-local→global coordinate
+    // lift fires for EXACTLY that window and not a same-sized sibling (the walk
+    // roots at the app and reaches every window it owns). `None` for a full-
+    // display walk or when it can't be resolved — the lift then falls back to
+    // matching the window by frame size.
+    let target_window = clip.and_then(|c| crate::tools::window::window_id_for_rect(pid, c));
+
     // Walk from the APP element (it reaches every window's content), but with
     // `clip` set to the visible window rect the off-screen cull throws away
     // background tabs and scrolled-off rows — so the budget actually reaches the
     // visible page. (Rooting at the focused window instead does NOT help: a
     // browser's web content often hangs off a sibling element, and the sidebar's
     // own off-screen collection still eats the budget without the cull.)
-    let mut walk = Walk::run(&app, max, clip);
+    let mut walk = Walk::run(&app, max, clip, target_window);
     // Chromium/Electron build their web tree ASYNCHRONOUSLY after the enable
     // signal, so a freshly-loaded page comes back with its native chrome but no
     // web area yet. Retry briefly when a web-capable app hasn't materialized its
@@ -60,7 +67,7 @@ pub fn collect_actionable(pid: i32, max: usize, clip: Option<Rect>) -> Vec<(UiEl
         && ((web_capable && !walk.saw_web_area) || (walk.saw_web_area && walk.web_actionable == 0))
     {
         std::thread::sleep(Duration::from_millis(350));
-        let retry = Walk::run(&app, max, clip);
+        let retry = Walk::run(&app, max, clip, target_window);
         if retry.out.len() > walk.out.len() {
             walk = retry;
         }

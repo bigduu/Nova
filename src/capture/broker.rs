@@ -119,6 +119,12 @@ pub struct WireWindow {
     pub width: f64,
     pub height: f64,
     pub is_visible: bool,
+    /// The window's `CGWindowID` (same id space as `_AXUIElementGetWindow`), used
+    /// to match an AX window node to the captured window exactly rather than by
+    /// size. `#[serde(default)]` so a newer server still parses an older daemon's
+    /// reply (it just falls back to size matching until the daemon is rebuilt).
+    #[serde(default)]
+    pub window_id: u32,
 }
 
 /// A successful daemon reply.
@@ -266,6 +272,7 @@ fn list_windows_wire() -> Result<Vec<WireWindow>, String> {
                 width: frame.size.width,
                 height: frame.size.height,
                 is_visible: w.is_on_screen(),
+                window_id: w.window_id(),
             }
         })
         .collect())
