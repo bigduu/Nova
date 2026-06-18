@@ -47,8 +47,8 @@ use crate::display::view::ViewFrame;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Target {
     Display,
-    Window(u32),  // SCWindow::window_id()
-    Region(u64),  // hash of the (rounded) source rect — different rect ⇒ retarget
+    Window(u32), // SCWindow::window_id()
+    Region(u64), // hash of the (rounded) source rect — different rect ⇒ retarget
 }
 
 /// The most recent decoded frame, plus a monotonically increasing sequence number
@@ -144,7 +144,9 @@ impl StreamCapturer {
     pub fn housekeeping(&mut self) {
         self.reset_if_dead();
         if SCREEN_REVEALED.swap(false, Ordering::Relaxed) && self.stream.is_some() {
-            step("stream: screen revealed (unlock/screensaver) — eagerly invalidating stale stream");
+            step(
+                "stream: screen revealed (unlock/screensaver) — eagerly invalidating stale stream",
+            );
             self.reset();
             pump_run_loop(0.3); // let replayd finish the teardown
         }
@@ -252,7 +254,9 @@ impl StreamCapturer {
                 // capture rebuilds a fresh one. No replayd restart, no process
                 // kill — just a clean in-process reset. The caller gets a plain
                 // error and can retry.
-                step(&format!("stream: stalled ({e}) — dropping stream for rebuild"));
+                step(&format!(
+                    "stream: stalled ({e}) — dropping stream for rebuild"
+                ));
                 self.reset();
                 return Err(e);
             }
@@ -488,7 +492,10 @@ fn register_screen_reveal_observer() {
             return;
         }
         let observer = &SCREEN_REVEALED as *const AtomicBool as *const c_void;
-        for name in ["com.apple.screenIsUnlocked", "com.apple.screensaver.didstop"] {
+        for name in [
+            "com.apple.screenIsUnlocked",
+            "com.apple.screensaver.didstop",
+        ] {
             let cf = CFString::new(name);
             let name_ref = cf.as_concrete_TypeRef() as *const c_void;
             std::mem::forget(cf);
@@ -618,7 +625,9 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
 }
 
 fn resolve_window(query: &str) -> Result<Resolved, String> {
-    step(&format!("stream: resolve window:{query:?} (SCShareableContent::get)"));
+    step(&format!(
+        "stream: resolve window:{query:?} (SCShareableContent::get)"
+    ));
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(true)
         .with_exclude_desktop_windows(true)
@@ -683,7 +692,12 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
             avail.sort();
             avail.dedup();
             let more = avail.len().saturating_sub(25);
-            let shown = avail.iter().take(25).cloned().collect::<Vec<_>>().join("; ");
+            let shown = avail
+                .iter()
+                .take(25)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
             let suffix = if more > 0 {
                 format!(" (+{more} more)")
             } else {

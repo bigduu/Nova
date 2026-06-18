@@ -48,7 +48,8 @@ fn wait_for_windows(secs: u64, pred: impl Fn(&[WindowInfo]) -> bool) -> Option<V
 }
 
 fn safari_window(ws: &[WindowInfo]) -> Option<&WindowInfo> {
-    ws.iter().find(|w| w.app_name.to_lowercase().contains("safari"))
+    ws.iter()
+        .find(|w| w.app_name.to_lowercase().contains("safari"))
 }
 
 fn title_containing<'a>(ws: &'a [WindowInfo], needle: &str) -> Option<&'a WindowInfo> {
@@ -64,7 +65,13 @@ fn shoot_safari() -> ScreenshotImage {
     })
     .expect("capture the Safari window via the live stream");
     with_timeout(15, "finish_capture (overlays + AX marks)", move || {
-        finish_capture(raw, CaptureOptions { grid: false, marks: true })
+        finish_capture(
+            raw,
+            CaptureOptions {
+                grid: false,
+                marks: true,
+            },
+        )
     })
     .expect("finish_capture")
     .into()
@@ -83,12 +90,18 @@ fn address_bar_point(shot: &ScreenshotImage, win: &WindowInfo) -> (f64, f64) {
         Some(m) => {
             // marks are in screenshot-pixel space; map back to global logical.
             let (lx, ly) = shot.view.to_logical(m.x, m.y);
-            eprintln!("[safari] address bar via AX text field {:?} -> ({lx:.0}, {ly:.0})", m.label);
+            eprintln!(
+                "[safari] address bar via AX text field {:?} -> ({lx:.0}, {ly:.0})",
+                m.label
+            );
             (lx, ly)
         }
         None => {
             let p = (win.x + win.width * 0.5, win.y + 40.0);
-            eprintln!("[safari] no AX text field marked; geometric fallback -> ({:.0}, {:.0})", p.0, p.1);
+            eprintln!(
+                "[safari] no AX text field marked; geometric fallback -> ({:.0}, {:.0})",
+                p.0, p.1
+            );
             p
         }
     }
@@ -103,13 +116,21 @@ fn safari_opens_google_and_nova_reads_the_homepage() {
     let ws0 = wait_for_windows(10, |ws| safari_window(ws).is_some())
         .expect("Safari never showed a window — installed? allowed to launch?");
     let win = safari_window(&ws0).unwrap().clone();
-    eprintln!("[safari] window up: {:?} ({}x{})", win.title, win.width as i32, win.height as i32);
+    eprintln!(
+        "[safari] window up: {:?} ({}x{})",
+        win.title, win.width as i32, win.height as i32
+    );
     std::thread::sleep(Duration::from_millis(1200));
 
     // 2. Locate the address bar from the Accessibility tree and MOUSE-click it
     //    (⌘L is remapped on this machine), then type the URL and press Return.
     let pre = shoot_safari();
-    eprintln!("[safari] pre-nav capture {}x{}, {} marked elements", pre.width, pre.height, pre.marks.len());
+    eprintln!(
+        "[safari] pre-nav capture {}x{}, {} marked elements",
+        pre.width,
+        pre.height,
+        pre.marks.len()
+    );
     let (ax, ay) = address_bar_point(&pre, &win);
     left_click_at(ax, ay, InputTarget::Global).expect("mouse-click the address bar");
     std::thread::sleep(Duration::from_millis(500));
@@ -123,13 +144,21 @@ fn safari_opens_google_and_nova_reads_the_homepage() {
          process running this test (or run under Bodhi). Also check the network.",
     );
     let gw = title_containing(&ws, "google").unwrap();
-    eprintln!("[safari] Google window on screen: {:?} ({}x{})", gw.title, gw.width as i32, gw.height as i32);
+    eprintln!(
+        "[safari] Google window on screen: {:?} ({}x{})",
+        gw.title, gw.width as i32, gw.height as i32
+    );
     std::thread::sleep(Duration::from_millis(1500));
 
     // 4. Capture the loaded homepage through the persistent-stream path + marks.
     let shot = shoot_safari();
     assert!(shot.width > 0 && shot.height > 0, "empty Safari capture");
-    eprintln!("[safari] homepage capture {}x{} px, {} actionable elements marked", shot.width, shot.height, shot.marks.len());
+    eprintln!(
+        "[safari] homepage capture {}x{} px, {} actionable elements marked",
+        shot.width,
+        shot.height,
+        shot.marks.len()
+    );
     for m in shot.marks.iter().take(20) {
         eprintln!("  mark [{}] {} {:?}", m.number, m.role, m.label);
     }
@@ -143,7 +172,10 @@ fn safari_opens_google_and_nova_reads_the_homepage() {
         recognize(&jpeg, w, h, &["en-US", "zh-Hans"])
     })
     .expect("OCR should not error");
-    eprintln!("[safari] OCR recognized {} text lines on the Google homepage:", lines.len());
+    eprintln!(
+        "[safari] OCR recognized {} text lines on the Google homepage:",
+        lines.len()
+    );
     for l in lines.iter().take(40) {
         eprintln!("  {:?} @ ({:.0}, {:.0})", l.text, l.center.0, l.center.1);
     }
@@ -151,7 +183,10 @@ fn safari_opens_google_and_nova_reads_the_homepage() {
     // 6. Assertions: navigation worked (Google title) and nova actually read the
     //    page (surfaced marked controls or OCR text — a blank read means the
     //    capture / AX / OCR pipeline is broken even though a window exists).
-    assert!(gw.title.to_lowercase().contains("google"), "expected the Safari title to contain \"Google\"");
+    assert!(
+        gw.title.to_lowercase().contains("google"),
+        "expected the Safari title to contain \"Google\""
+    );
     assert!(
         !lines.is_empty() || !shot.marks.is_empty(),
         "nova read NO content from the Google homepage (no OCR text, no marked elements) — \
