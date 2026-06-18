@@ -245,6 +245,21 @@ pub fn web_area_origin(el: &AXUIElement) -> Option<(f64, f64)> {
     None
 }
 
+/// The in-page CSS-pixel point to click on web element `el`: its center expressed
+/// RELATIVE to its `AXWebArea` ancestor. Both the element rect and the web-area
+/// origin are read here in raw AX coordinates so they share one frame — the
+/// cached [`UiElement::center`] must NOT be used, because the mark walk may have
+/// lifted it into global screen space (WKWebView view-local windows), and mixing
+/// a lifted center with the raw web-area origin would aim the click off-page. The
+/// lift is a pure translation, so the element-relative offset is identical in
+/// either frame; reading both raw is the simplest way to stay consistent.
+/// `None` for native elements (no web area above them) or an unreadable frame.
+pub fn web_click_point(el: &AXUIElement) -> Option<(f64, f64)> {
+    let (wx, wy) = web_area_origin(el)?;
+    let (x, y, w, h) = element_rect(el)?;
+    Some((x + w / 2.0 - wx, y + h / 2.0 - wy))
+}
+
 /// Bring the application with `pid` to the front (so a subsequent coordinate
 /// click actually hits its content rather than just activating the window —
 /// the "first click only focuses" problem). Best-effort via AX `AXFrontmost`.
