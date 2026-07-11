@@ -37,7 +37,8 @@ use crate::display::scaling::{
 use crate::display::view::ViewFrame;
 use crate::platform::WindowHandle;
 use std::ffi::c_void;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -346,11 +347,44 @@ pub fn capture_display() -> Result<RawCapture, String> {
     })
 }
 
+/// The rect the DWM compositor actually draws `hwnd`'s content into —
+/// `DWMWA_EXTENDED_FRAME_BOUNDS`, NOT `GetWindowRect`. On Windows 10/11 a
+/// top-level window carries an invisible resize-border margin (a few px)
+/// that `GetWindowRect` includes but which is never part of the visible,
+/// DWM-composited surface. [`wgc::capture_window`] asks the compositor
+/// directly for that same composited surface, so its pixels cover this
+/// smaller rect, not the `GetWindowRect` one — see `capture_window`'s call
+/// site for why conflating the two misaligns both the downscale aspect ratio
+/// and the `ViewFrame` a caller maps clicks through.
+fn extended_frame_bounds(hwnd: HWND) -> Result<RECT, String> {
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is a live top-level handle (the same one just handed to
+    // WGC); we pass a pointer to our own `RECT` and its exact size, exactly
+    // as `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS, ...)` documents.
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .map_err(|e| format!("DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed: {e}"))?;
+    Ok(rect)
+}
+
 /// Capture a single on-screen window matching `query`. Tries
 /// [`wgc::capture_window`] (Windows.Graphics.Capture) FIRST — see this
 /// module's doc for why that must be the primary path — falling back to the
 /// P1 `PrintWindow`/`BitBlt` ladder ([`capture_window_pixels`]) on any WGC
 /// failure.
+///
+/// The two paths cover DIFFERENT on-screen regions, so `ViewFrame`/`dims` are
+/// built per-path rather than shared: WGC's composited texture covers the
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` rect (see [`extended_frame_bounds`]), which
+/// excludes the invisible resize-border `GetWindowRect` (`win.x/y/w/h`)
+/// includes; `PrintWindow` renders the full `GetWindowRect` area, so the
+/// fallback keeps using `win.*` exactly as before.
 pub fn capture_window(query: &str) -> Result<RawCapture, String> {
     let win = resolve_window(query)?;
     // SAFETY: reconstructs the `HWND` from the id `platform::windows::window
@@ -363,26 +397,76 @@ pub fn capture_window(query: &str) -> Result<RawCapture, String> {
         win.width as i32,
         win.height as i32,
     );
-    let native = match wgc::capture_window(hwnd) {
-        Ok(img) => img,
+    match wgc::capture_window(hwnd) {
+        Ok(native) => {
+            // WGC path: dims come from the ACTUAL captured texture
+            // (native.width()/height()), and origin/region from the DWM
+            // extended-frame-bounds rect it corresponds to — NOT win.x/y/w/h,
+            // which is the (larger) GetWindowRect area. Falls back to win.*
+            // only if the DWM query itself fails (best-effort, never a hard
+            // capture failure at this point — we already have real pixels).
+            let (origin, region) = match extended_frame_bounds(hwnd) {
+                Ok(rect) => {
+                    let region_w = (rect.right - rect.left) as f64;
+                    let region_h = (rect.bottom - rect.top) as f64;
+                    // PER_MONITOR_AWARE_V2 means logical == physical == native
+                    // px (see this module's doc), so the WGC texture's real
+                    // size should closely track the extended-frame-bounds
+                    // rect it was composited from. Log if they drift so a
+                    // future regression here (e.g. a DPI-awareness change) is
+                    // visible instead of silently misaligning clicks again.
+                    let (nw, nh) = (native.width() as f64, native.height() as f64);
+                    if (nw - region_w).abs() > 2.0 || (nh - region_h).abs() > 2.0 {
+                        tracing::warn!(
+                            "WGC native size {nw}x{nh} vs DWMWA_EXTENDED_FRAME_BOUNDS \
+                             {region_w}x{region_h} differ by more than 2px — dims reconciliation \
+                             may be off"
+                        );
+                    }
+                    ((rect.left as f64, rect.top as f64), (region_w, region_h))
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed ({e}); \
+                         falling back to GetWindowRect for ViewFrame (may be off by the \
+                         invisible resize-border on the WGC path)"
+                    );
+                    ((win.x, win.y), (win.width, win.height))
+                }
+            };
+            let dims =
+                compute_target_dims_capped(native.width(), native.height(), WINDOW_MAX_DIMENSION);
+            Ok(RawCapture {
+                image: downscale(native, dims),
+                view: ViewFrame {
+                    origin,
+                    region,
+                    screenshot: (dims.width as f64, dims.height as f64),
+                },
+                window_pid: Some(win.pid),
+            })
+        }
         Err(e) => {
             tracing::debug!(
                 "Windows.Graphics.Capture failed ({e}); falling back to PrintWindow/BitBlt (may \
                  return a black bitmap on a GPU-composited surface — see this module's doc)"
             );
-            capture_window_pixels(hwnd, x, y, w, h)?
+            let native = capture_window_pixels(hwnd, x, y, w, h)?;
+            // PrintWindow fallback: native IS w×h (PrintWindow renders the
+            // full GetWindowRect area), so origin/region/dims stay win.*
+            // exactly as before P4's WGC reconciliation.
+            let dims = compute_target_dims_capped(w as u32, h as u32, WINDOW_MAX_DIMENSION);
+            Ok(RawCapture {
+                image: downscale(native, dims),
+                view: ViewFrame {
+                    origin: (win.x, win.y),
+                    region: (win.width, win.height),
+                    screenshot: (dims.width as f64, dims.height as f64),
+                },
+                window_pid: Some(win.pid),
+            })
         }
-    };
-    let dims = compute_target_dims_capped(w as u32, h as u32, WINDOW_MAX_DIMENSION);
-    Ok(RawCapture {
-        image: downscale(native, dims),
-        view: ViewFrame {
-            origin: (win.x, win.y),
-            region: (win.width, win.height),
-            screenshot: (dims.width as f64, dims.height as f64),
-        },
-        window_pid: Some(win.pid),
-    })
+    }
 }
 
 /// Capture exactly the rectangle `(x, y, w, h)` in global logical points.
@@ -525,9 +609,28 @@ pub fn capture_probe(query: &str) -> Result<String, String> {
     let mut report = String::new();
     let _ = writeln!(
         report,
-        "[capture-probe] {query:?} -> {:?} @({:.0},{:.0} {:.0}x{:.0})",
+        "[capture-probe] {query:?} -> {:?} @({:.0},{:.0} {:.0}x{:.0}) [GetWindowRect]",
         win.title, win.x, win.y, win.width, win.height
     );
+    // Make the P4 dims/ViewFrame reconciliation directly visible: print the
+    // DWM extended-frame-bounds rect (what WGC's ViewFrame/dims now use)
+    // right next to the GetWindowRect one above (what the PrintWindow
+    // fallback still uses) — see `capture_window`'s doc for why they differ.
+    match extended_frame_bounds(hwnd) {
+        Ok(rect) => {
+            let _ = writeln!(
+                report,
+                "  DWMWA_EXTENDED_FRAME_BOUNDS: ({},{}) {}x{} [WGC ViewFrame]",
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(report, "  DWMWA_EXTENDED_FRAME_BOUNDS: FAILED: {e}");
+        }
+    }
 
     match print_window_only(hwnd, w, h) {
         Ok(img) => {
