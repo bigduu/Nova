@@ -1,4 +1,4 @@
-//! End-to-end tests for the shared capture daemon (capture::broker).
+//! End-to-end tests for the shared capture daemon (platform::mac::capture::broker).
 //!
 //! Spawns the real `nova --capture-daemon` and drives it through CaptureClient.
 //! Needs Screen Recording permission, so `#[ignore]`d by default. Run
@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use nova::capture::broker::{CaptureClient, CaptureRequest};
+use nova::platform::mac::capture::broker::{CaptureClient, CaptureRequest};
 
 mod common;
 use common::with_timeout;

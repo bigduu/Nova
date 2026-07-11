@@ -63,10 +63,12 @@ fn legacy_pipe_protocol_still_served() {
     // find it) and kill the pid its handshake reports.
     std::env::set_var("NOVA_CAPTURE_BIN", env!("CARGO_BIN_EXE_nova"));
     std::env::set_var("NOVA_CAPTURE_SOCK", &sock);
-    let c = nova::capture::broker::CaptureClient::new();
-    let _ = c.capture(&nova::capture::broker::CaptureRequest::Window {
-        query: "__nova_no_such_window_zzzqx__".to_string(),
-    });
+    let c = nova::platform::mac::capture::broker::CaptureClient::new();
+    let _ = c.capture(
+        &nova::platform::mac::capture::broker::CaptureRequest::Window {
+            query: "__nova_no_such_window_zzzqx__".to_string(),
+        },
+    );
     if let Some(pid) = c.daemon_pid() {
         // SAFETY: SIGKILL to the daemon this test caused to spawn.
         unsafe { libc::kill(pid, libc::SIGKILL) };

@@ -5,7 +5,7 @@
 
 use base64::Engine;
 use nova::capture::screenshot::{finish_capture, CaptureOptions};
-use nova::capture::stream::StreamCapturer;
+use nova::platform::mac::capture::stream::StreamCapturer;
 use nova::tools::screenshot::ScreenshotImage;
 
 mod common;
@@ -37,7 +37,7 @@ fn ocr_recognizes_text_on_the_display() {
 
     let (w, h) = (shot.width, shot.height);
     let lines = with_timeout(20, "Vision OCR", move || {
-        nova::ocr::recognize(&jpeg, w, h, &["zh-Hans", "en-US"])
+        nova::platform::mac::ocr::recognize(&jpeg, w, h, &["zh-Hans", "en-US"])
     })
     .expect("OCR should not error");
 

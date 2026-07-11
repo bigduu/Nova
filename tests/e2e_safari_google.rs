@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use nova::capture::screenshot::{finish_capture, CaptureOptions};
-use nova::capture::stream::StreamCapturer;
-use nova::ocr::recognize;
+use nova::platform::mac::capture::stream::StreamCapturer;
+use nova::platform::mac::input::{key_combo, left_click_at, type_text};
+use nova::platform::mac::ocr::recognize;
 use nova::tools::application::open_application;
-use nova::tools::input::{key_combo, left_click_at, type_text, InputTarget};
+use nova::tools::input::InputTarget;
 use nova::tools::screenshot::ScreenshotImage;
 use nova::tools::window::list_windows;
 use nova::types::WindowInfo;

@@ -23,17 +23,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Screenshot capture (Apple ScreenCaptureKit)
-screencapturekit = { version = "7.0", features = ["macos_14_0"] }
-
-# Mouse/keyboard events (CoreGraphics CGEvent)
-core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
-
-# macOS Accessibility API (window/app introspection)
-accessibility = "0.2"
-accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
-core-foundation = "0.10"            # CFString/CFType — must match accessibility's
-
 # Image processing
 image = "0.25"
 
@@ -60,6 +49,27 @@ clap = { version = "4", features = ["derive"] }
 
 # Error helpers
 anyhow = "1"
+
+# ── Platform-specific (macOS) ────────────────────────────────────────
+# Everything below is Apple-framework-only and belongs exclusively to
+# `src/platform/mac/*` (see src/platform/mod.rs for the cross-platform
+# capability traits these implement). Gated so `cargo check`/`cargo build` on a
+# non-macOS host never even attempts to compile Apple-only FFI bindings — the
+# crate itself still refuses to build off macOS (see the `compile_error!` in
+# `src/platform/mod.rs`), but that should be a fast, clean failure, not a
+# dependency-compile failure.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Screenshot capture (Apple ScreenCaptureKit)
+screencapturekit = { version = "7.0", features = ["macos_14_0"] }
+
+# Mouse/keyboard events (CoreGraphics CGEvent)
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
+
+# macOS Accessibility API (window/app introspection)
+accessibility = "0.2"
+accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
+core-foundation = "0.10"            # CFString/CFType — must match accessibility's
+
 # Apple Vision OCR (VNRecognizeTextRequest) — native, on-device, no model files.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSData", "NSDictionary", "NSError"] }

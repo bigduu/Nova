@@ -1,8 +1,10 @@
 /// Application management tools — list installed apps, launch/focus apps.
 ///
-/// Uses `mdfind` for app discovery and `open` command for launching.
+/// The actual OS work (mdfind discovery, `open` launching) now lives behind
+/// `crate::platform::WindowManager` (`src/platform/mac/window.rs`); this
+/// module keeps `ApplicationInfo` (the neutral shape the trait returns) and a
+/// thin, stable wrapper so existing tool/test call sites don't need to change.
 use crate::error::Result;
-use std::process::Command;
 
 /// Information about an installed application.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -14,55 +16,10 @@ pub struct ApplicationInfo {
 
 /// List installed applications using mdfind (Spotlight).
 pub fn list_applications() -> Result<Vec<ApplicationInfo>> {
-    let output = Command::new("mdfind")
-        .arg("kMDItemContentType == 'com.apple.application-bundle'")
-        .output()
-        .map_err(|e| crate::error::NovaError::Application(format!("mdfind failed: {e}")))?;
-
-    let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        // The `application-bundle` content type also matches non-`.app`
-        // directories Spotlight has tagged (e.g. CocoaPods test fixtures), which
-        // are not launchable apps. Keep only real `.app` bundles.
-        .filter(|l| l.ends_with(".app"))
-        .map(|l| l.to_string())
-        .collect();
-
-    let mut apps: Vec<ApplicationInfo> = paths
-        .into_iter()
-        .filter_map(|path| {
-            let name = std::path::Path::new(&path)
-                .file_stem()?
-                .to_str()?
-                .to_string();
-            Some(ApplicationInfo {
-                name,
-                path,
-                bundle_id: None, // TODO: read Info.plist for bundle ID
-            })
-        })
-        .collect();
-
-    // Stable, de-duplicated ordering so the agent gets a predictable list.
-    apps.sort_by_key(|a| a.name.to_lowercase());
-    apps.dedup_by(|a, b| a.name == b.name && a.path == b.path);
-
-    Ok(apps)
+    crate::platform::window_manager().list_applications()
 }
 
 /// Launch or focus an application by name.
 pub fn open_application(name: &str) -> Result<()> {
-    let status = Command::new("open")
-        .arg("-a")
-        .arg(name)
-        .status()
-        .map_err(|e| crate::error::NovaError::Application(format!("open failed: {e}")))?;
-
-    if !status.success() {
-        return Err(crate::error::NovaError::Application(format!(
-            "failed to open: {name}"
-        )));
-    }
-    Ok(())
+    crate::platform::window_manager().open_application(name)
 }

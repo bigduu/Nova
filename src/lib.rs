@@ -11,7 +11,7 @@
 pub mod capture;
 pub mod display;
 pub mod error;
-pub mod ocr;
+pub mod platform;
 pub mod server;
 pub mod tools;
 pub mod types;

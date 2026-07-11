@@ -538,7 +538,7 @@ fn resolve_display() -> Result<Resolved, String> {
         .find(|d| d.display_id() == main_id)
         .or_else(|| displays.first())
         .ok_or_else(|| "no displays found — SCShareableContent lists no displays while the display is asleep/locked; wake it and retry".to_string())?;
-    let disp = crate::display::geometry::primary_display();
+    let disp = crate::platform::mac::geometry::primary_display();
     let dims = compute_target_dims(disp.width, disp.height);
     let filter = SCContentFilter::create()
         .with_display(display)
@@ -722,7 +722,7 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
     // correctly regardless of the output pixel size. Use the scale of the
     // display the window is ON (not the primary's) so a window on a non-primary
     // display in a mixed-DPI setup isn't under- or over-sampled.
-    let scale = crate::display::geometry::scale_factor_at(
+    let scale = crate::platform::mac::geometry::scale_factor_at(
         frame.origin.x + frame.size.width / 2.0,
         frame.origin.y + frame.size.height / 2.0,
     );

@@ -54,41 +54,41 @@ async fn execute_action(
     view: ViewFrame,
     target: InputTarget,
 ) -> Result<String> {
-    use crate::tools::input;
+    let input = crate::platform::input();
 
     match action {
         BatchAction::MouseMove { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::mouse_move(lx, ly)?;
+            input.mouse_move(lx, ly)?;
             Ok(format!("moved to ({x}, {y})"))
         }
         BatchAction::LeftClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::left_click_at(lx, ly, target)?;
+            input.left_click_at(lx, ly, target)?;
             Ok(format!("left clicked at ({x}, {y})"))
         }
         BatchAction::RightClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::right_click_at(lx, ly, target)?;
+            input.right_click_at(lx, ly, target)?;
             Ok(format!("right clicked at ({x}, {y})"))
         }
         BatchAction::DoubleClick { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
-            input::double_click_at(lx, ly, target)?;
+            input.double_click_at(lx, ly, target)?;
             Ok(format!("double clicked at ({x}, {y})"))
         }
         BatchAction::Scroll { lines } => {
             // Scroll at the view's center when no explicit position is given.
             let (cx, cy) = view.to_logical(view.screenshot.0 / 2.0, view.screenshot.1 / 2.0);
-            input::scroll_at(cx, cy, lines, target)?;
+            input.scroll_at(cx, cy, lines, target)?;
             Ok(format!("scrolled {lines} lines"))
         }
         BatchAction::KeyCombo { key } => {
-            input::key_combo(&key, target)?;
+            input.key_combo(&key, target)?;
             Ok(format!("pressed {key}"))
         }
         BatchAction::TypeText { text } => {
-            input::type_text(&text, target)?;
+            input.type_text(&text, target)?;
             Ok(format!("typed {text:?}"))
         }
         BatchAction::Wait { ms } => {

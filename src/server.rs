@@ -48,7 +48,12 @@ pub struct NovaServer {
     >,
 }
 
-use crate::capture::broker::shared_client as capture_client;
+// The capture daemon's connection-drop backstop (used by `acquire_capture`
+// and `list_windows` below) is an implementation detail of the macOS daemon
+// client, not part of the neutral `ScreenCapture`/`WindowManager` traits (it
+// has no equivalent method there) — called directly, same as the
+// diagnostics-only direct calls in `main.rs`'s `--selftest`.
+use crate::platform::mac::capture::broker::shared_client as capture_client;
 
 /// Outer backstop on any daemon round-trip. The client's recovery ladder is
 /// self-limiting (every honest daemon reply lands within QUEUE_BUDGET +
@@ -75,7 +80,7 @@ impl NovaServer {
         self.view
             .lock()
             .expect("view mutex")
-            .unwrap_or_else(crate::display::geometry::display_view_frame)
+            .unwrap_or_else(crate::platform::mac::geometry::display_view_frame)
     }
 
     /// Convert screenshot-space coordinates (what the LLM sees) into the global
@@ -145,10 +150,11 @@ impl NovaServer {
 
     /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
     ///
-    /// Phase 1 — the raw pixel capture runs in the SHARED capture daemon (one
-    /// per user, all nova processes; see [`crate::capture::broker`] for why two
-    /// same-binary ScreenCaptureKit clients wedge each other). The client call
-    /// below already contains the whole recovery ladder — daemon watchdog,
+    /// Phase 1 — the raw pixel capture runs behind [`crate::platform::ScreenCapture`]
+    /// (on macOS: the SHARED capture daemon, one per user, all nova processes;
+    /// see [`crate::platform::mac::capture::broker`] for why two same-binary
+    /// ScreenCaptureKit clients wedge each other). The client call below
+    /// already contains the whole recovery ladder — daemon watchdog,
     /// kill+respawn, stray-process sweep, `killall -9 replayd` — so by the time
     /// it returns an error, recovery has genuinely been attempted; the outer
     /// timeout here is only a backstop. Phase 2 — overlays + the Set-of-Mark
@@ -158,26 +164,35 @@ impl NovaServer {
         &self,
         plan: &CapturePlan,
     ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
-        use crate::capture::broker::CaptureRequest;
-        let request = match (plan.region, &plan.window) {
-            (Some(rect), _) => CaptureRequest::Region { rect },
-            (None, Some(query)) => CaptureRequest::Window {
-                query: query.clone(),
-            },
-            (None, None) => CaptureRequest::Display,
-        };
+        let region = plan.region;
+        let window = plan.window.clone();
         let opts = crate::capture::screenshot::CaptureOptions {
             grid: plan.grid,
             marks: plan.marks,
         };
 
-        // Phase 1: capture via the shared daemon. `preflight` in the error
-        // distinguishes a real Screen-Recording denial (fix the responsible
-        // `parent=` process) from a capture-stack failure.
-        let diag = crate::display::geometry::permission_diagnostics();
-        tracing::info!(target: "nova::capture", "capture {:?} — {}", request, diag);
-        let req = request.clone();
-        let task = tokio::task::spawn_blocking(move || capture_client().capture(&req));
+        // Phase 1: capture via `crate::platform::screen_capture()`. `preflight`
+        // in the error distinguishes a real Screen-Recording denial (fix the
+        // responsible `parent=` process) from a capture-stack failure.
+        let diag = crate::platform::mac::geometry::permission_diagnostics();
+        // Matches the old derived-Debug rendering of the broker's
+        // `CaptureRequest` (`Region { rect: (…) }` / `Window { query: "…" }`)
+        // so log lines and the backstop-timeout error stay byte-identical
+        // across the platform-abstraction move.
+        let desc = match (region, &window) {
+            (Some(rect), _) => format!("Region {{ rect: {rect:?} }}"),
+            (None, Some(query)) => format!("Window {{ query: {query:?} }}"),
+            (None, None) => "Display".to_string(),
+        };
+        tracing::info!(target: "nova::capture", "capture {desc} — {diag}");
+        let task = tokio::task::spawn_blocking(move || {
+            let sc = crate::platform::screen_capture();
+            match (region, &window) {
+                (Some(rect), _) => sc.capture_region(rect),
+                (None, Some(query)) => sc.capture_window(query),
+                (None, None) => sc.capture_display(),
+            }
+        });
         let raw = match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
             Ok(Ok(Ok(raw))) => raw,
             Ok(Ok(Err(e))) => {
@@ -189,7 +204,7 @@ impl NovaServer {
             Err(_) => {
                 capture_client().disconnect();
                 return Err(format!(
-                    "capture of {request:?} did not return within {CAPTURE_BACKSTOP:?} — \
+                    "capture of {desc} did not return within {CAPTURE_BACKSTOP:?} — \
                      the recovery ladder itself is stuck (preflight below: \
                      preflight=false ⇒ Screen Recording not granted to the responsible \
                      `parent=` process). [{diag}]"
@@ -248,11 +263,11 @@ impl NovaServer {
             // enable on this one app; it never touches ScreenCaptureKit, moves
             // focus, or posts input.
             if let Some(pid) = img.target_pid {
-                crate::tools::elements::warmer().warm(pid);
+                crate::platform::ui_tree().keep_warm(pid);
             }
         } else {
             self.set_target_pid(None);
-            crate::tools::elements::warmer().clear();
+            crate::platform::ui_tree().clear_warm();
         }
         let note = screenshot_note(&img, plan);
         rmcp::model::CallToolResult::success(vec![
@@ -274,7 +289,7 @@ fn click_cached_mark(
     el: crate::tools::elements::CachedElement,
     target: crate::tools::input::InputTarget,
 ) -> Result<String, String> {
-    use crate::tools::input::{cursor_position, left_click_at, mouse_move};
+    let input = crate::platform::input();
 
     // A page refresh / navigation destroys and rebuilds the app's AX tree, so a
     // handle cached from an earlier marks shot can dangle. Detect that up front
@@ -296,27 +311,18 @@ fn click_cached_mark(
     // frontmost). Gated on BOTH the element living under an `AXWebArea` AND the
     // owning app being a scriptable browser, so native chrome (the toolbar/tabs,
     // even in Safari/Chrome) and non-browser apps keep the reliable AX path.
-    if let Some((px, py)) = crate::tools::elements::web_click_point(el.handle.element()) {
-        if let Some(browser) = crate::tools::elements::webclick::browser_for_pid(el.pid) {
-            // `px,py` is the element's center RELATIVE to its web area, read in raw
-            // AX coords — not derived from the cached (possibly view-local-lifted)
-            // mark center, which would aim the click off-page on WKWebView windows.
-            match crate::tools::elements::webclick::js_click_at(&browser, px, py, &el.label) {
-                Ok(desc) => {
-                    return Ok(format!(
-                        "clicked mark [{}] {} {:?} via {} in-page JS [{desc}] — background, no \
-                         cursor (AXPress is a no-op on web content)",
-                        el.number,
-                        el.role,
-                        el.label,
-                        browser.name()
-                    ));
-                }
-                // JS unavailable (Automation / "allow JS from Apple Events" off) or
-                // the point was empty — fall through to AX, then the coordinate path.
-                Err(e) => tracing::debug!(target: "nova::click", "web JS click fell back: {e}"),
-            }
+    match el.handle.try_web_click(el.pid, &el.label) {
+        Some(Ok(desc)) => {
+            return Ok(format!(
+                "clicked mark [{}] {} {:?} via {desc} — background, no cursor (AXPress is a \
+                 no-op on web content)",
+                el.number, el.role, el.label
+            ));
         }
+        // JS unavailable (Automation / "allow JS from Apple Events" off) or the
+        // point was empty — fall through to AX, then the coordinate path.
+        Some(Err(e)) => tracing::debug!(target: "nova::click", "web JS click fell back: {e}"),
+        None => {}
     }
 
     let ax_err = match el.handle.click() {
@@ -332,14 +338,14 @@ fn click_cached_mark(
     // Coordinate fallback. Remember the cursor so we can put it back, and raise
     // the target app so the click registers on its content rather than just
     // activating the window.
-    let saved = cursor_position().ok();
-    crate::tools::elements::raise_app(el.pid);
+    let saved = input.cursor_position().ok();
+    crate::platform::ui_tree().raise_app(el.pid);
     std::thread::sleep(std::time::Duration::from_millis(120));
 
     let (cx, cy) = el.center;
-    let click = left_click_at(cx, cy, target);
+    let click = input.left_click_at(cx, cy, target);
     if let Some((sx, sy)) = saved {
-        let _ = mouse_move(sx, sy); // restore the user's pointer
+        let _ = input.mouse_move(sx, sy); // restore the user's pointer
     }
     click.map_err(|e| {
         format!(
@@ -870,7 +876,7 @@ impl NovaServer {
         // hard timeout so a stuck recognizer can't starve the server.
         let task = tokio::task::spawn_blocking(move || {
             let lang_refs: Vec<&str> = languages.iter().map(String::as_str).collect();
-            crate::ocr::recognize(&jpeg, w, h, &lang_refs)
+            crate::platform::ocr().recognize(&jpeg, w, h, &lang_refs)
         });
         let lines = match tokio::time::timeout(std::time::Duration::from_secs(20), task).await {
             Ok(Ok(Ok(lines))) => lines,
@@ -920,7 +926,7 @@ impl NovaServer {
         Parameters(p): Parameters<MouseMoveParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::mouse_move(lx, ly) {
+        match crate::platform::input().mouse_move(lx, ly) {
             Ok(()) => ok_text(format!("mouse moved to ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -939,7 +945,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::left_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().left_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -955,7 +961,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::right_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().right_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -971,7 +977,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::double_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().double_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -986,7 +992,8 @@ impl NovaServer {
         // scroll_at positions the scroll at (lx, ly): it moves the cursor there
         // for global delivery, or sets the event location for a process target.
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::scroll_at(lx, ly, p.lines, self.current_target(p.background)) {
+        match crate::platform::input().scroll_at(lx, ly, p.lines, self.current_target(p.background))
+        {
             Ok(()) => ok_text(format!("scrolled {} lines at ({}, {})", p.lines, p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -998,7 +1005,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(key = %p.key), level = "info")]
     async fn key_combo(&self, Parameters(p): Parameters<KeyParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::key_combo(&p.key, self.current_target(p.background)) {
+        match crate::platform::input().key_combo(&p.key, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("pressed {}", p.key)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -1013,7 +1020,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::input::type_text(&p.text, self.current_target(p.background)) {
+        match crate::platform::input().type_text(&p.text, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -1025,7 +1032,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn cursor_position(&self) -> rmcp::model::CallToolResult {
-        match crate::tools::input::cursor_position() {
+        match crate::platform::input().cursor_position() {
             Ok((x, y)) => ok_text(format!("cursor at ({:.0}, {:.0})", x, y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -1161,7 +1168,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_click(pid, &p.query) {
+        match crate::platform::ui_tree().ax_click(pid, &p.query) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1182,7 +1189,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_set_value(pid, &p.query, &p.value) {
+        match crate::platform::ui_tree().ax_set_value(pid, &p.query, &p.value) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1202,7 +1209,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_focus(pid, &p.query) {
+        match crate::platform::ui_tree().ax_focus(pid, &p.query) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1252,7 +1259,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500))
+        match tokio::task::spawn_blocking(move || crate::platform::ui_tree().dump_tree(pid, 2500))
             .await
         {
             Ok(text) => ok_text(text),

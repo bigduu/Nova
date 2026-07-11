@@ -391,11 +391,11 @@ pub fn run_daemon() -> ! {
 /// distributed notification land there) and does stream housekeeping (eager
 /// unlock invalidation, idle TTL).
 fn capture_thread(rx: std::sync::mpsc::Receiver<Job>) {
-    let mut capturer = crate::capture::stream::StreamCapturer::new();
+    let mut capturer = super::stream::StreamCapturer::new();
     loop {
         // Pump doubles as the poll sleep — keeps notification delivery and
         // SCStream scheduling serviced while idle.
-        crate::capture::stream::pump_run_loop(0.02);
+        super::stream::pump_run_loop(0.02);
         match rx.try_recv() {
             Ok(job) => {
                 if job.cancelled.load(Ordering::Acquire) {
@@ -445,7 +445,7 @@ fn serve_conn(
         proto: PROTO_VERSION,
         pid: std::process::id() as i32,
         exe_mtime_ms,
-        preflight: crate::display::geometry::preflight_screen_capture(),
+        preflight: crate::platform::mac::geometry::preflight_screen_capture(),
     })
     .unwrap_or_default();
     if writeln!(writer, "{hello}").is_err() {
@@ -948,7 +948,7 @@ fn connect_or_spawn() -> Result<Conn, AttemptError> {
                 // Recording grant fails every capture forever; if WE hold the
                 // grant, replace it so the respawn inherits our granted chain.
                 let tcc_stale =
-                    !hello.preflight && crate::display::geometry::preflight_screen_capture();
+                    !hello.preflight && crate::platform::mac::geometry::preflight_screen_capture();
                 if hello.proto < PROTO_VERSION || hello.exe_mtime_ms != exe_mtime_ms() || tcc_stale
                 {
                     step(&format!(
