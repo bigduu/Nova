@@ -6,7 +6,7 @@
 //! surface to just the `windows` crate (see Cargo.toml's
 //! `[target.'cfg(target_os = "windows")'.dependencies]` doc comment).
 use crate::error::{NovaError, Result};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{GlobalFree, HANDLE};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -94,10 +94,20 @@ fn write_locked(utf16: &[u16]) -> Result<()> {
     let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }
         .map_err(|e| NovaError::Clipboard(format!("GlobalAlloc failed: {e}")))?;
 
+    // Until SetClipboardData SUCCEEDS, `hmem` is still OURS — every early
+    // return below must GlobalFree it or it leaks (a realistic trigger is a
+    // clipboard-manager holding the clipboard, making GlobalLock/
+    // SetClipboardData fail). Ownership transfers to the clipboard ONLY on a
+    // successful SetClipboardData; we free on every failing path before then.
     // SAFETY: `hmem` was just allocated above with exactly `bytes` capacity;
     // the returned pointer is valid until the matching `GlobalUnlock` below.
     let ptr = unsafe { GlobalLock(hmem) };
     if ptr.is_null() {
+        // SAFETY: `hmem` is still owned by us (SetClipboardData not yet called)
+        // and is not locked (GlobalLock returned null), so freeing it is sound.
+        unsafe {
+            let _ = GlobalFree(hmem);
+        }
         return Err(NovaError::Clipboard(
             "GlobalLock returned null right after a successful GlobalAlloc".to_string(),
         ));
@@ -111,8 +121,16 @@ fn write_locked(utf16: &[u16]) -> Result<()> {
 
     // SAFETY: `hmem` is a live HGLOBAL we just filled; on success the
     // clipboard now owns it (see the GlobalAlloc comment above).
-    unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)) }
-        .map_err(|e| NovaError::Clipboard(format!("SetClipboardData failed: {e}")))?;
+    if let Err(e) = unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)) } {
+        // SetClipboardData failed, so ownership did NOT transfer — free our block.
+        // SAFETY: `hmem` is still ours and is unlocked (GlobalUnlock above).
+        unsafe {
+            let _ = GlobalFree(hmem);
+        }
+        return Err(NovaError::Clipboard(format!(
+            "SetClipboardData failed: {e}"
+        )));
+    }
     Ok(())
 }
 
