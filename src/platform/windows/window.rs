@@ -3,16 +3,30 @@
 //! Window listing is a single `EnumWindows` pass (Windows enumerates top-level
 //! windows in Z-order, frontmost first — the same ordering
 //! `tools::window::frontmost_app_pid` relies on for its "first titled,
-//! non-system window" heuristic, so no extra sorting is needed here).
+//! non-system window" heuristic, so no extra sorting is needed here),
+//! **filtered to on-screen windows** (see [`enum_all_windows`]): this reproduces
+//! the invariant macOS's `list_windows` gets for free from
+//! `SCShareableContent`'s `on_screen_only`/`exclude_desktop`, so the neutral
+//! `tools::window::list_windows` filter (`!title.is_empty()`) stays sufficient
+//! on BOTH platforms. Without it, a raw `EnumWindows` sweep leaks hidden
+//! IME/tray/helper windows and minimized windows (whose rect is off at
+//! ~(-32000,-32000)), which would in turn let `frontmost_app_pid`/
+//! `pid_for_window` mistarget and let `capture`'s largest-area `resolve_window`
+//! pick a minimized window → a black/garbage grab.
+//!
 //! Application listing walks the two Start-Menu "Programs" folders for
 //! shortcuts (no COM shell-link parsing needed for a name/path listing — P1
 //! MVP, same spirit as the macOS `mdfind` scan). `open_application` prefers
-//! raising an already-running window over spawning a second instance
-//! (mirroring macOS's `open -a`), falling back to `ShellExecuteW`.
+//! raising an already-running, ON-SCREEN window over spawning a second
+//! instance (mirroring macOS's `open -a`), falling back to `ShellExecuteW`
+//! whenever no such window is found (so it never reports success for a
+//! tray-only background instance it couldn't actually raise).
 use crate::platform::WindowHandle;
 use crate::tools::application::ApplicationInfo;
+use std::ffi::c_void;
 use windows::core::{Result as WinResult, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -82,11 +96,52 @@ fn process_base_name(pid: u32) -> String {
     String::from_utf16_lossy(&buf[..len as usize])
 }
 
-/// One `EnumWindows` pass, decorated with pid/title/rect/visibility. Raw and
-/// unfiltered (matches the macOS `list_windows`'s contract: includes
-/// untitled/invisible windows — callers filter on top, e.g.
-/// `tools::window::list_windows` drops empty titles).
-fn enum_all_windows() -> Result<Vec<RawWindow>, String> {
+/// Whether `hwnd` is DWM-**cloaked** — composited but deliberately hidden by
+/// the shell (a suspended background UWP/Store app, a window on another virtual
+/// desktop, etc.). Such a window reports `IsWindowVisible == TRUE` yet is not
+/// actually on screen, so it must be excluded alongside the minimized check.
+/// Best-effort: any `DwmGetWindowAttribute` failure is treated as "not cloaked"
+/// (never hides a window we couldn't classify).
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    // SAFETY: `hwnd` is a live top-level handle from `EnumWindows`; we pass a
+    // pointer to our own `u32` and its exact size, exactly as
+    // `DwmGetWindowAttribute(DWMWA_CLOAKED, ...)` documents. On any error the
+    // `Result` is `Err` and `cloaked` stays 0 (untouched).
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    ok.is_ok() && cloaked != 0
+}
+
+/// Whether `hwnd` is genuinely ON SCREEN — visible, not minimized, not cloaked.
+/// `IsWindowVisible` alone is insufficient: it stays `TRUE` for a minimized
+/// window (hence the `IsIconic` check) and for a DWM-cloaked one (hence
+/// [`is_cloaked`]). This is the predicate that reproduces macOS
+/// `SCShareableContent`'s on-screen invariant — see the module doc.
+fn is_on_screen(hwnd: HWND) -> bool {
+    // SAFETY: both are argless-per-handle Win32 queries on a live top-level
+    // handle from `EnumWindows`.
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && !is_cloaked(hwnd) }
+}
+
+/// One `EnumWindows` pass, decorated with pid/title/rect, WITHOUT the on-screen
+/// filter — includes minimized and hidden windows. `is_visible` is the raw
+/// `IsWindowVisible` result per window. Only `open_application`'s "raise an
+/// existing instance" path uses this directly (it must see a MINIMIZED window
+/// in order to restore it); every other caller goes through the filtered
+/// [`enum_all_windows`].
+fn enum_windows_raw() -> Result<Vec<RawWindow>, String> {
+    // Ensure DPI awareness even if reached without main() (direct call / e2e
+    // test): GetWindowRect below returns scaled coordinates for an unaware
+    // process on a non-100% display, which would then misplace window captures
+    // and coordinate clicks. Idempotent + cheap after the first call.
+    super::ensure_dpi_awareness();
     let mut hwnds: Vec<HWND> = Vec::new();
     // SAFETY: `collect_hwnd` only pushes onto the `Vec` behind `lparam`, which
     // outlives the call (it's `hwnds` below, borrowed for the duration of
@@ -107,8 +162,8 @@ fn enum_all_windows() -> Result<Vec<RawWindow>, String> {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
         let mut rect = RECT::default();
-        // SAFETY: `rect` is a local we own; a stale/invisible hwnd just yields
-        // an error, which we treat as a zero rect rather than propagating.
+        // SAFETY: `rect` is a local we own; a stale hwnd just yields an error,
+        // which we treat as a zero rect rather than propagating.
         let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
         // SAFETY: argless-per-handle Win32 query.
         let is_visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
@@ -124,6 +179,21 @@ fn enum_all_windows() -> Result<Vec<RawWindow>, String> {
         });
     }
     Ok(out)
+}
+
+/// On-screen windows only ([`is_on_screen`] applied to [`enum_windows_raw`]),
+/// so the output matches the invariant macOS's `SCShareableContent`-backed
+/// `list_windows` provides — hidden/minimized/cloaked windows never reach
+/// `tools::window`. This is what list/targeting/capture all consume (baking the
+/// filter in HERE, not leaving it to callers, keeps the neutral
+/// `tools::window::list_windows` filter — `!title.is_empty()` — sufficient on
+/// both platforms). Still includes UNTITLED on-screen windows, which that
+/// neutral filter then drops, same as on macOS.
+fn enum_all_windows() -> Result<Vec<RawWindow>, String> {
+    Ok(enum_windows_raw()?
+        .into_iter()
+        .filter(|w| is_on_screen(w.hwnd))
+        .collect())
 }
 
 /// On-screen windows, frontmost first (Z-order, as `EnumWindows` yields them).
@@ -199,41 +269,69 @@ fn collect_shortcuts(dir: &std::path::Path, out: &mut Vec<ApplicationInfo>) {
     }
 }
 
-/// Bring a window owned by `pid` to the foreground, if one is on screen.
-/// Best-effort: `SetForegroundWindow` can be refused by Windows' focus-
-/// stealing prevention when the calling process isn't itself foreground/
-/// recently input-active — in that case the window may only flash in the
-/// taskbar instead of actually raising, which is a Windows OS policy, not a
-/// bug here. See `windows::window::raise_pid` callers for how this is used as
-/// a best-effort nicety, never a hard requirement for a click to succeed.
-pub fn raise_pid(pid: i32) {
-    let Ok(windows) = enum_all_windows() else {
-        return;
-    };
-    if let Some(w) = windows
-        .into_iter()
-        .find(|w| w.pid == pid && w.is_visible && !w.title.is_empty())
-    {
-        // SAFETY: `w.hwnd` came from a just-completed `EnumWindows` pass.
-        unsafe {
-            if IsIconic(w.hwnd).as_bool() {
-                let _ = ShowWindow(w.hwnd, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(w.hwnd);
-        }
-    }
+/// A window this process can actually bring to the user's foreground: a
+/// titled, non-cloaked, `IsWindowVisible` window — INCLUDING a minimized one,
+/// which we restore. Excludes hidden helper/tray windows (`IsWindowVisible ==
+/// FALSE`) and cloaked (background-UWP/other-desktop) windows, so a match here
+/// is genuinely something the user would see raised — the distinction that
+/// stops `open_application` reporting success for a tray-only instance.
+fn is_raisable(hwnd: HWND, title: &str) -> bool {
+    // SAFETY: argless-per-handle Win32 query on a live top-level handle.
+    !title.is_empty() && unsafe { IsWindowVisible(hwnd).as_bool() } && !is_cloaked(hwnd)
 }
 
-/// Find the pid of an on-screen window whose owning process's base name
-/// matches `name` (case-insensitive, with or without a `.exe` suffix on
-/// either side) — used by `open_application` to prefer raising an existing
-/// instance over spawning a second one.
-fn find_pid_by_name(name: &str) -> Option<i32> {
+/// Bring a raisable window owned by `pid` to the foreground, restoring it first
+/// if minimized. Returns whether such a window was FOUND and a raise attempted
+/// (`false` = `pid` has no user-visible/restorable window — e.g. a tray-only
+/// background instance). The raise itself is still best-effort even when this
+/// returns `true`: `SetForegroundWindow` can be refused by Windows' focus-
+/// stealing prevention when the calling process isn't itself foreground/
+/// recently input-active — in that case the window may only flash in the
+/// taskbar, which is a Windows OS policy, not a bug here.
+pub fn raise_pid(pid: i32) -> bool {
+    // Raw (unfiltered) sweep on purpose: a minimized existing instance is a
+    // valid raise target (we restore it), but `enum_all_windows` would have
+    // filtered it out as "not on screen".
+    let Ok(windows) = enum_windows_raw() else {
+        return false;
+    };
+    let Some(w) = windows
+        .into_iter()
+        .find(|w| w.pid == pid && is_raisable(w.hwnd, &w.title))
+    else {
+        return false;
+    };
+    // SAFETY: `w.hwnd` came from a just-completed `EnumWindows` pass.
+    unsafe {
+        if IsIconic(w.hwnd).as_bool() {
+            let _ = ShowWindow(w.hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(w.hwnd);
+    }
+    true
+}
+
+/// Raise an already-running instance whose owning process's base name matches
+/// `name` (case-insensitive, `.exe` suffix optional on either side), restoring
+/// it if minimized. Returns whether one was found and raised — `false` means
+/// no user-visible/restorable window exists for that name (so `open_application`
+/// must fall through to actually launching it, never reporting a phantom
+/// success).
+fn raise_existing_instance(name: &str) -> bool {
     let want = name.trim_end_matches(".exe").to_lowercase();
-    enum_all_windows().ok()?.into_iter().find_map(|w| {
-        let got = process_base_name(w.pid as u32);
-        (got.trim_end_matches(".exe").eq_ignore_ascii_case(&want)).then_some(w.pid)
-    })
+    let Ok(windows) = enum_windows_raw() else {
+        return false;
+    };
+    windows
+        .into_iter()
+        .filter(|w| is_raisable(w.hwnd, &w.title))
+        .find(|w| {
+            process_base_name(w.pid as u32)
+                .trim_end_matches(".exe")
+                .eq_ignore_ascii_case(&want)
+        })
+        .map(|w| raise_pid(w.pid))
+        .unwrap_or(false)
 }
 
 /// `ShellExecuteW(open, target)` — resolves a bare executable name via the
@@ -267,10 +365,12 @@ fn launch(target: &str) -> WinResult<()> {
 }
 
 /// Launch or focus an application by name — see the module doc for the
-/// "raise an existing instance first" rationale.
+/// "raise an existing instance first" rationale. Only reports success from the
+/// raise path when a user-visible/restorable window was actually raised;
+/// otherwise it falls through to launching (so a tray-only background instance
+/// never yields a phantom "opened" with nothing on screen).
 pub fn open_application(name: &str) -> crate::error::Result<()> {
-    if let Some(pid) = find_pid_by_name(name) {
-        raise_pid(pid);
+    if raise_existing_instance(name) {
         return Ok(());
     }
     launch(name)
