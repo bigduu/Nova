@@ -1,8 +1,8 @@
 //! Thread-local COM/UI Automation plumbing shared by every other submodule
-//! here: joining the process's Multi-Threaded Apartment, one `IUIAutomation`
-//! instance per worker thread, the `CacheRequest`/`Condition` builders
-//! discovery and the query-driven actions both need, and the pattern-ladder
-//! helpers `handle.rs`/`actions.rs` drive a click through.
+//! here: joining the process's Multi-Threaded Apartment, activating
+//! `IUIAutomation`, the `CacheRequest`/`Condition` builders discovery and the
+//! query-driven actions both need, and the pattern-ladder helpers
+//! `handle.rs`/`actions.rs` drive a click through.
 //!
 //! # COM threading model (read this before touching anything else here)
 //!
@@ -19,12 +19,13 @@
 //! `platform::windows::ensure_dpi_awareness`'s "cheap to call every time"
 //! contract.
 //!
-//! Because tokio's blocking pool reuses OS threads non-deterministically,
-//! [`with_automation`] additionally caches one `IUIAutomation` instance PER
-//! THREAD (`thread_local!`) rather than creating one per call —
-//! `CoCreateInstance(CUIAutomation)` is itself not free, and (per Microsoft's
-//! guidance) an `IUIAutomation` instance must never be shared across threads
-//! directly; each thread gets its own.
+//! [`with_automation`] activates a FRESH `IUIAutomation` instance every call
+//! rather than caching one in a `thread_local` — see its doc comment for why
+//! that caching was tried first and had to be reverted: a live COM interface
+//! pointer sitting in a `thread_local` is only released by a TLS destructor
+//! at thread/process-exit time, whose ordering against COM's own internal
+//! per-thread teardown is unguaranteed and, in testing, reproducibly crashed
+//! (`STATUS_ACCESS_VIOLATION`) on exit.
 //!
 //! A COM interface pointer obtained on one MTA thread (e.g. the thread that
 //! ran `collect_actionable`) CAN be handed directly (unmarshaled) to another
@@ -32,7 +33,13 @@
 //! on) — within one process there is only ever one MTA, and COM permits
 //! direct use of an interface from any thread that has joined it. This is
 //! what makes `WinElementHandle` (in `handle.rs`) sound as `Send`: see its
-//! doc comment for the exact invariant.
+//! doc comment for the exact invariant. (This is unrelated to the
+//! `thread_local`/`IUIAutomation` caching hazard above: `WinElementHandle`
+//! holds an `IUIAutomationElement`, which — unlike the `automation.rs`
+//! coordinator object — is NEVER cached in a `thread_local`; it is owned by
+//! ordinary Rust values — `Vec`s, `Box<dyn ElementHandle>` — with normal,
+//! deterministic scope-based `Drop`, which is exactly the safe pattern this
+//! module's own `IUIAutomation` handling now follows too.)
 use windows::core::VARIANT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -87,11 +94,6 @@ thread_local! {
             );
         }
     };
-
-    /// One `IUIAutomation` instance per thread — never shared across threads
-    /// (see the module doc); created lazily on first use.
-    static AUTOMATION: std::cell::RefCell<Option<IUIAutomation>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// Join this thread to the process's Multi-Threaded Apartment. MUST run
@@ -101,27 +103,43 @@ pub(super) fn ensure_com_mta() {
     COM_MTA_JOINED.with(|_| {});
 }
 
-/// Run `f` with this thread's `IUIAutomation` instance, creating it on first
-/// use via `CoCreateInstance(CUIAutomation)`. The instance never leaves this
-/// thread (it lives in a `thread_local!`), so this is sound despite
-/// `IUIAutomation` not being `Sync`/`Send`.
+/// Run `f` with a fresh `IUIAutomation` instance, activated via
+/// `CoCreateInstance(CUIAutomation)` for THIS call and dropped (released)
+/// again before returning — deliberately NOT cached in a `thread_local!`
+/// despite `ensure_com_mta`'s join being cached that way. This was an earlier
+/// design (one instance per thread, reused across calls) that turned out to
+/// be a real, reproducible crash: a `thread_local`-cached `IUIAutomation`
+/// (or any live COM interface pointer) can outlive ordinary Rust scoping and
+/// only gets `Release`d by a TLS destructor running at thread-exit or
+/// process-exit time — and that destructor's ordering relative to COM's OWN
+/// internal per-thread/per-process teardown (`combase.dll`'s
+/// `DLL_THREAD_DETACH`/`DLL_PROCESS_DETACH` handling) is NOT guaranteed by
+/// either Rust or Win32. In practice this manifested as a real
+/// `STATUS_ACCESS_VIOLATION` (0xC0000005) on process exit, reproduced via
+/// `--marks` against a live Calculator window in the Windows VM (COM's own
+/// teardown had already invalidated the apartment/proxy state by the time
+/// Rust's thread-local destructor tried to `Release()` the cached instance) —
+/// see the PR body for the exact repro. `CoCreateInstance(CUIAutomation)` is
+/// a cheap, purely in-process activation (not the cross-process RPC that
+/// actually costs time — that's the `FindAllBuildCache` call itself), so
+/// creating one per call and letting ordinary Rust `Drop` release it at the
+/// end of THIS synchronous call (always well before any thread/process
+/// teardown could race it) costs nothing meaningful while removing the whole
+/// hazard. `ensure_com_mta`'s apartment join stays cached in a `thread_local`
+/// because its value is `()` — no `Drop` glue, hence nothing for a teardown
+/// race to corrupt.
 pub(super) fn with_automation<T>(
     f: impl FnOnce(&IUIAutomation) -> Result<T, String>,
 ) -> Result<T, String> {
     ensure_com_mta();
-    AUTOMATION.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            // SAFETY: standard in-process COM activation of a well-known
-            // Microsoft coclass (`CUIAutomation`); no pointers of ours
-            // involved beyond the out-param `windows-rs` fills in.
-            let automation: IUIAutomation =
-                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                    .map_err(|e| format!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
-            *slot = Some(automation);
-        }
-        f(slot.as_ref().expect("just set above if it was None"))
-    })
+    // SAFETY: standard in-process COM activation of a well-known Microsoft
+    // coclass (`CUIAutomation`); no pointers of ours involved beyond the
+    // out-param `windows-rs` fills in. `automation` is dropped (released) at
+    // the end of this function, on this same thread, synchronously.
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| format!("CoCreateInstance(CUIAutomation) failed: {e}"))?;
+    f(&automation)
 }
 
 // ── CacheRequest: batch every property/pattern into ONE round trip ──────
