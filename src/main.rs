@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
         match nova::tools::window::pid_for_window(app) {
             Some((pid, _frame)) => {
                 eprintln!("[dump-ax] {app:?} -> pid {pid}");
-                print!("{}", nova::tools::elements::dump_tree(pid, 4000));
+                print!("{}", nova::platform::ui_tree().dump_tree(pid, 4000));
             }
             None => eprintln!("[dump-ax] no on-screen window matching {app:?}"),
         }
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
         match nova::tools::window::pid_for_window(app) {
             Some((pid, frame)) => {
                 eprintln!("[marks] {app:?} -> pid {pid} clip={frame:?}");
-                let els = nova::tools::elements::collect_actionable(pid, 400, Some(frame));
+                let els = nova::platform::ui_tree().collect_actionable(pid, 400, Some(frame));
                 eprintln!("[marks] {} actionable elements:", els.len());
                 for (i, (el, _)) in els.iter().enumerate() {
                     println!(
@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
                 // web/content region whose rows aren't getting marked.
                 print!(
                     "{}",
-                    nova::tools::elements::hit_dump(pid, frame, 24.0, 280.0)
+                    nova::platform::mac::elements::debug::hit_dump(pid, frame, 24.0, 280.0)
                 );
             }
             None => eprintln!("[hit-dump] no on-screen window matching {app:?}"),
@@ -288,7 +288,10 @@ async fn main() -> Result<()> {
         match nova::tools::window::pid_for_window(app) {
             Some((pid, frame)) => {
                 eprintln!("[ax-warm] {app:?} -> pid {pid} clip={frame:?}");
-                print!("{}", nova::tools::elements::ax_warm_probe(pid, frame, 12));
+                print!(
+                    "{}",
+                    nova::platform::mac::elements::debug::ax_warm_probe(pid, frame, 12)
+                );
             }
             None => eprintln!("[ax-warm] no on-screen window matching {app:?}"),
         }

@@ -354,3 +354,12 @@ static MAC_INPUT: mac::input::MacInputInjector = mac::input::MacInputInjector;
 pub fn input() -> &'static dyn InputInjector {
     &MAC_INPUT
 }
+
+#[cfg(target_os = "macos")]
+static MAC_UI_TREE: mac::elements::MacUiTree = mac::elements::MacUiTree;
+
+/// Set-of-Mark element discovery + AX actions (the macOS Accessibility API).
+#[cfg(target_os = "macos")]
+pub fn ui_tree() -> &'static dyn UiTree {
+    &MAC_UI_TREE
+}

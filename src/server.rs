@@ -259,11 +259,11 @@ impl NovaServer {
             // enable on this one app; it never touches ScreenCaptureKit, moves
             // focus, or posts input.
             if let Some(pid) = img.target_pid {
-                crate::tools::elements::warmer().warm(pid);
+                crate::platform::ui_tree().keep_warm(pid);
             }
         } else {
             self.set_target_pid(None);
-            crate::tools::elements::warmer().clear();
+            crate::platform::ui_tree().clear_warm();
         }
         let note = screenshot_note(&img, plan);
         rmcp::model::CallToolResult::success(vec![
@@ -307,27 +307,18 @@ fn click_cached_mark(
     // frontmost). Gated on BOTH the element living under an `AXWebArea` AND the
     // owning app being a scriptable browser, so native chrome (the toolbar/tabs,
     // even in Safari/Chrome) and non-browser apps keep the reliable AX path.
-    if let Some((px, py)) = crate::tools::elements::web_click_point(el.handle.element()) {
-        if let Some(browser) = crate::tools::elements::webclick::browser_for_pid(el.pid) {
-            // `px,py` is the element's center RELATIVE to its web area, read in raw
-            // AX coords — not derived from the cached (possibly view-local-lifted)
-            // mark center, which would aim the click off-page on WKWebView windows.
-            match crate::tools::elements::webclick::js_click_at(&browser, px, py, &el.label) {
-                Ok(desc) => {
-                    return Ok(format!(
-                        "clicked mark [{}] {} {:?} via {} in-page JS [{desc}] — background, no \
-                         cursor (AXPress is a no-op on web content)",
-                        el.number,
-                        el.role,
-                        el.label,
-                        browser.name()
-                    ));
-                }
-                // JS unavailable (Automation / "allow JS from Apple Events" off) or
-                // the point was empty — fall through to AX, then the coordinate path.
-                Err(e) => tracing::debug!(target: "nova::click", "web JS click fell back: {e}"),
-            }
+    match el.handle.try_web_click(el.pid, &el.label) {
+        Some(Ok(desc)) => {
+            return Ok(format!(
+                "clicked mark [{}] {} {:?} via {desc} — background, no cursor (AXPress is a \
+                 no-op on web content)",
+                el.number, el.role, el.label
+            ));
         }
+        // JS unavailable (Automation / "allow JS from Apple Events" off) or the
+        // point was empty — fall through to AX, then the coordinate path.
+        Some(Err(e)) => tracing::debug!(target: "nova::click", "web JS click fell back: {e}"),
+        None => {}
     }
 
     let ax_err = match el.handle.click() {
@@ -344,7 +335,7 @@ fn click_cached_mark(
     // the target app so the click registers on its content rather than just
     // activating the window.
     let saved = input.cursor_position().ok();
-    crate::tools::elements::raise_app(el.pid);
+    crate::platform::ui_tree().raise_app(el.pid);
     std::thread::sleep(std::time::Duration::from_millis(120));
 
     let (cx, cy) = el.center;
@@ -1173,7 +1164,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_click(pid, &p.query) {
+        match crate::platform::ui_tree().ax_click(pid, &p.query) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1194,7 +1185,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_set_value(pid, &p.query, &p.value) {
+        match crate::platform::ui_tree().ax_set_value(pid, &p.query, &p.value) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1214,7 +1205,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match crate::tools::elements::ax_focus(pid, &p.query) {
+        match crate::platform::ui_tree().ax_focus(pid, &p.query) {
             Ok(msg) => ok_text(msg),
             Err(e) => err_result(&e),
         }
@@ -1264,7 +1255,7 @@ impl NovaServer {
         let Some(pid) = self.current_ax_pid().await else {
             return err_result("no target app (take a window screenshot first)");
         };
-        match tokio::task::spawn_blocking(move || crate::tools::elements::dump_tree(pid, 2500))
+        match tokio::task::spawn_blocking(move || crate::platform::ui_tree().dump_tree(pid, 2500))
             .await
         {
             Ok(text) => ok_text(text),

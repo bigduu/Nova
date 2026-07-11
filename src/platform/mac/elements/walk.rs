@@ -5,7 +5,7 @@
 
 use super::attrs::{ax_label, ax_window_id, element_array, element_rect, rects_intersect, Rect};
 use super::model::{is_target, UiElement};
-use crate::tools::elements::attrs::ax_role;
+use crate::platform::mac::elements::attrs::ax_role;
 use accessibility::AXUIElement;
 
 /// Attributes that hold an element's children, in the order we follow them.
