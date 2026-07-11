@@ -98,6 +98,16 @@ objc2-vision = { version = "0.3", default-features = false, features = ["VNReque
 #   - Storage_Xps                    — PrintWindow (window capture)
 #   - Graphics_Dwm                   — DwmGetWindowAttribute DWMWA_CLOAKED (hide
 #                                      DWM-cloaked windows, e.g. background UWP)
+#   - UI_Accessibility (P2)          — IUIAutomation/IUIAutomationElement &c.
+#                                      (`platform::windows::elements`'s real
+#                                      `UiTree` impl — Set-of-Mark discovery +
+#                                      `click_mark` via UI Automation)
+#   - System_Com (P2)                — CoCreateInstance/CoInitializeEx/CLSCTX
+#                                      (activating `CUIAutomation` + joining
+#                                      the process's Multi-Threaded Apartment;
+#                                      also a transitive requirement of
+#                                      UI_Accessibility's SAFEARRAY-bearing
+#                                      methods)
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -113,4 +123,6 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Ole",
     "Win32_Storage_Xps",
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
 ] }

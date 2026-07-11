@@ -10,8 +10,9 @@
 //! - [`capture`] — `ScreenCapture` via GDI `BitBlt` / `PrintWindow`
 //! - [`window`] — `WindowManager` via `EnumWindows` / `ShellExecuteW`
 //! - [`clipboard`] — `Clipboard` via `OpenClipboard`/`CF_UNICODETEXT`
-//! - [`elements`] — `UiTree` STUB (P2: UI Automation) + the `UiElement`/`CachedElement`
-//!   value types `crate::tools::elements` re-exports on Windows
+//! - [`elements`] — `UiTree` via Microsoft UI Automation (P2 — Set-of-Mark
+//!   discovery + `click_mark`) + the `UiElement`/`CachedElement` value types
+//!   `crate::tools::elements` re-exports on Windows
 //! - [`ocr`] — `OcrEngine` STUB (P3: Windows.Media.Ocr)
 //! - [`geometry`] — shared display/virtual-desktop geometry helpers used by
 //!   `input`/`capture`/`server.rs`'s default view frame

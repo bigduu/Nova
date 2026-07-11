@@ -67,6 +67,30 @@ struct Cli {
     /// full semantic tree (the "Homerow way"). No MCP needed. macOS only.
     #[arg(long, value_name = "APP")]
     ax_warm: Option<String>,
+
+    /// DEBUG: UI Automation smoke test (Windows only) — list the actionable
+    /// elements nova would mark for the app matching this substring, then
+    /// Invoke one of them (see `--uia-probe-query`) and report whether the
+    /// click actually landed. No MCP needed. The P2 UI Automation analog of
+    /// `--marks` (discovery) plus a real `click_mark` (activation) in one
+    /// shot — proves `collect_actionable`/`WinElementHandle::click` work
+    /// against a live app, not just that they compile.
+    #[arg(long, value_name = "APP")]
+    uia_probe: Option<String>,
+
+    /// With `--uia-probe`: only consider elements whose role/label contains
+    /// this substring (case-insensitive) as the Invoke target; defaults to
+    /// the first actionable element found.
+    #[arg(long, value_name = "SUBSTR")]
+    uia_probe_query: Option<String>,
+
+    /// DEBUG: list every on-screen window (title, owning app, frame,
+    /// visibility) nova's `WindowManager`/`list_windows` sees, then exit. No
+    /// MCP needed. Useful to sanity-check window enumeration/attribution
+    /// directly (e.g. a UWP app's `ApplicationFrameHost` pid quirk) without
+    /// guessing from a screenshot.
+    #[arg(long)]
+    list_windows: bool,
 }
 
 #[tokio::main]
@@ -113,9 +137,8 @@ async fn main() -> Result<()> {
     //
     // `dump_ax`/`marks` below go entirely through the neutral
     // `crate::platform::ui_tree()`/`tools::window` facade, so they need no
-    // per-OS gating — on Windows they just report the `UiTree` stub's "not yet
-    // implemented" error (see `platform::windows::elements`), same as any
-    // other tool hitting that capability today.
+    // per-OS gating — real Accessibility/UI Automation discovery on both
+    // OSes now (see `platform::mac::elements`/`platform::windows::elements`).
     if let Some(app) = cli.dump_ax.as_deref() {
         match nova::tools::window::pid_for_window(app) {
             Some((pid, _frame)) => {
@@ -154,6 +177,24 @@ async fn main() -> Result<()> {
     }
     if let Some(app) = cli.ax_warm.as_deref() {
         return run_ax_warm(app);
+    }
+    if let Some(app) = cli.uia_probe.as_deref() {
+        return run_uia_probe(app, cli.uia_probe_query.as_deref());
+    }
+    if cli.list_windows {
+        match nova::tools::window::list_windows() {
+            Ok(windows) => {
+                eprintln!("[list-windows] {} on-screen windows:", windows.len());
+                for w in windows {
+                    println!(
+                        "{:?} app={:?} @({:.0},{:.0} {:.0}x{:.0}) visible={}",
+                        w.title, w.app_name, w.x, w.y, w.width, w.height, w.is_visible
+                    );
+                }
+            }
+            Err(e) => eprintln!("[list-windows] failed: {e}"),
+        }
+        return Ok(());
     }
 
     // Per-OS permission/capability diagnostics, logged once before serving.
@@ -437,6 +478,80 @@ fn run_ax_warm(_app: &str) -> Result<()> {
     eprintln!(
         "--ax-warm is macOS-only (probes Accessibility's Chromium warm-tree behavior); no \
          Windows analog (tracked for a later phase alongside UI Automation support)."
+    );
+    Ok(())
+}
+
+// ── --uia-probe (Windows UI Automation P2 smoke test) ────────────────
+
+/// Discover UI Automation actionable elements for the app matching `app`
+/// (same discovery path `screenshot(marks=true)` uses), print them, then
+/// `click()` one of them (the first matching `query`, or the first overall)
+/// and report whether the Invoke/Toggle/SelectionItem/ExpandCollapse actually
+/// landed. Exists to prove `WinUiTree::collect_actionable`/`WinElementHandle::click`
+/// work against a REAL live app — not just that they compile — without a full
+/// MCP round trip.
+#[cfg(target_os = "windows")]
+fn run_uia_probe(app: &str, query: Option<&str>) -> Result<()> {
+    let Some((pid, frame)) = nova::tools::window::pid_for_window(app) else {
+        eprintln!("[uia-probe] no on-screen window matching {app:?}");
+        return Ok(());
+    };
+    eprintln!("[uia-probe] {app:?} -> pid {pid} clip={frame:?}");
+    let elements = nova::platform::ui_tree().collect_actionable(pid, 400, Some(frame));
+    eprintln!("[uia-probe] {} actionable elements:", elements.len());
+    for (i, (el, _)) in elements.iter().enumerate() {
+        println!(
+            "[{}] {} {:?} @({:.0},{:.0} {:.0}x{:.0})",
+            i + 1,
+            el.role,
+            el.label,
+            el.x,
+            el.y,
+            el.width,
+            el.height
+        );
+    }
+
+    let target = query
+        .and_then(|q| {
+            let q_lower = q.to_lowercase();
+            elements.iter().find(|(el, _)| {
+                format!("{} {}", el.role, el.label)
+                    .to_lowercase()
+                    .contains(&q_lower)
+            })
+        })
+        .or_else(|| elements.first());
+
+    match target {
+        Some((el, handle)) => {
+            eprintln!("[uia-probe] clicking {} {:?} ...", el.role, el.label);
+            match handle.click() {
+                Ok(action) => eprintln!(
+                    "[uia-probe] SUCCESS: performed {action} on {} {:?}",
+                    el.role, el.label
+                ),
+                Err(e) => eprintln!("[uia-probe] CLICK FAILED: {e}"),
+            }
+        }
+        None => eprintln!(
+            "[uia-probe] no actionable element to click (list was empty, or --uia-probe-query \
+             matched nothing)"
+        ),
+    }
+    Ok(())
+}
+
+/// `--uia-probe` is Windows-only — macOS already has real end-to-end evidence
+/// via `--marks` (discovery) plus the live `click_mark`/`screenshot` MCP tools
+/// exercised in `tests/e2e_safari_google.rs`; this diagnostic exists
+/// specifically to smoke-test the NEW Windows UI Automation path.
+#[cfg(target_os = "macos")]
+fn run_uia_probe(_app: &str, _query: Option<&str>) -> Result<()> {
+    eprintln!(
+        "--uia-probe is Windows-only (a P2 UI Automation discovery+Invoke smoke test); macOS \
+         already proves marks/click_mark via --marks and the live MCP tools."
     );
     Ok(())
 }

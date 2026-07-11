@@ -38,9 +38,10 @@
 //! GDI/PrintWindow capture, EnumWindows, Win32 clipboard — implementing the
 //! SAME traits below, gated the same way, so the tool layer
 //! (`src/tools/*`/`src/server.rs`) never has to know which OS it's running on.
-//! [`UiTree`]/[`OcrEngine`] on Windows are compiling STUBS for now (Accessibility
-//! tree walking via UI Automation and Windows.Media.Ocr are tracked as P2/P3);
-//! every other capability is a real MVP implementation. Any OS beyond these two
+//! [`UiTree`] on Windows is now a real implementation (P2: Microsoft UI
+//! Automation — see `platform::windows::elements`); [`OcrEngine`] remains a
+//! compiling STUB (Windows.Media.Ocr is tracked as P3). Every other capability
+//! is a real MVP implementation. Any OS beyond these two
 //! is a deliberate, immediate compile error rather than a confusing pile of
 //! missing-symbol errors from platform-only crates (see also the dependency
 //! gating in `Cargo.toml`, `[target.'cfg(target_os = "...")'.dependencies]`).
@@ -427,7 +428,8 @@ pub fn input() -> &'static dyn InputInjector {
 #[cfg(target_os = "windows")]
 static WIN_UI_TREE: windows::elements::WinUiTree = windows::elements::WinUiTree;
 
-/// Set-of-Mark element discovery — STUB on Windows (P2: UI Automation).
+/// Set-of-Mark element discovery + query-driven actions (Microsoft UI
+/// Automation on Windows — see `platform::windows::elements`).
 #[cfg(target_os = "windows")]
 pub fn ui_tree() -> &'static dyn UiTree {
     &WIN_UI_TREE

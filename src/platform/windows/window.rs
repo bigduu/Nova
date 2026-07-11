@@ -196,6 +196,43 @@ fn enum_all_windows() -> Result<Vec<RawWindow>, String> {
         .collect())
 }
 
+/// The HWND of `pid`'s on-screen window whose global frame matches `rect`
+/// (the marks capture's clip) within a few px — the Windows analog of macOS's
+/// `tools::window::window_id_for_rect`, used by `platform::windows::elements`
+/// to anchor Set-of-Mark discovery on the EXACT captured window (not a
+/// same-sized sibling), and returning the real `HWND` directly rather than
+/// routing through the neutral `WindowHandle.id: u64` (avoids a lossy u64→u32
+/// round-trip for no benefit — this caller is already Windows-only). `None`
+/// if no on-screen window of `pid` is within tolerance.
+pub(crate) fn hwnd_for_rect(pid: i32, rect: (f64, f64, f64, f64)) -> Option<HWND> {
+    const TOL: f64 = 4.0;
+    let (rx, ry, rw, rh) = rect;
+    enum_all_windows()
+        .ok()?
+        .into_iter()
+        .filter(|w| w.pid == pid)
+        .map(|w| {
+            let d =
+                (w.x - rx).abs() + (w.y - ry).abs() + (w.width - rw).abs() + (w.height - rh).abs();
+            (d, w.hwnd)
+        })
+        .filter(|(d, _)| *d <= TOL)
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, hwnd)| hwnd)
+}
+
+/// The first (frontmost, Z-order) on-screen `HWND` owned by `pid` — used when
+/// `collect_actionable` is called with no clip rect to anchor on (no single
+/// captured window), so discovery falls back to whatever window of `pid` is
+/// currently frontmost.
+pub(crate) fn first_hwnd_for_pid(pid: i32) -> Option<HWND> {
+    enum_all_windows()
+        .ok()?
+        .into_iter()
+        .find(|w| w.pid == pid)
+        .map(|w| w.hwnd)
+}
+
 /// On-screen windows, frontmost first (Z-order, as `EnumWindows` yields them).
 pub fn list_windows() -> Result<Vec<WindowHandle>, String> {
     Ok(enum_all_windows()?
