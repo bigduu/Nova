@@ -5,14 +5,19 @@
 /// replayd clients evict each other's identity in a connect/cancel storm that
 /// wedges stream starts (see `capture::broker`). All ScreenCaptureKit traffic,
 /// including metadata-only enumeration, now goes through the one daemon.
-use crate::capture::broker::{shared_client, WireWindow};
+///
+/// The actual OS call now lives behind `crate::platform::WindowManager`
+/// (`src/platform/mac/window.rs`); the pure business logic below (frontmost
+/// heuristics, largest-area matching, `CGWindowID` disambiguation) stays here
+/// unchanged, just adapted to read `crate::platform::WindowHandle` instead of
+/// the old `WireWindow`.
 use crate::types::WindowInfo;
 
 /// List all on-screen windows across all applications.
 /// Excludes desktop windows (wallpaper) and windows without titles.
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
-    Ok(shared_client()
-        .windows()?
+    Ok(crate::platform::window_manager()
+        .list_windows()?
         .into_iter()
         .filter(|w| !w.title.is_empty())
         .map(|w| WindowInfo {
@@ -33,8 +38,8 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
 /// The frame is used as the off-screen cull clip. Needs Screen Recording.
 pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
     let q = query.to_lowercase();
-    shared_client()
-        .windows()
+    crate::platform::window_manager()
+        .list_windows()
         .ok()?
         .into_iter()
         .filter(|w| {
@@ -63,19 +68,19 @@ pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
 pub fn window_id_for_rect(pid: i32, rect: (f64, f64, f64, f64)) -> Option<u32> {
     const TOL: f64 = 4.0;
     let (rx, ry, rw, rh) = rect;
-    shared_client()
-        .windows()
+    crate::platform::window_manager()
+        .list_windows()
         .ok()?
         .into_iter()
-        .filter(|w| w.pid == pid && w.window_id != 0)
+        .filter(|w| w.pid == pid && w.id != 0)
         .map(|w| {
             let d =
                 (w.x - rx).abs() + (w.y - ry).abs() + (w.width - rw).abs() + (w.height - rh).abs();
-            (d, w.window_id)
+            (d, w.id)
         })
         .filter(|(d, _)| *d <= TOL)
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(_, id)| id)
+        .map(|(_, id)| id as u32)
 }
 
 /// System UI layers to skip when guessing the frontmost user app.
@@ -99,11 +104,11 @@ fn is_system_ui(app: &str) -> bool {
 /// Returns `None` if nothing suitable is found (e.g. no Screen Recording
 /// permission).
 pub fn frontmost_app_pid() -> Option<i32> {
-    shared_client()
-        .windows()
+    crate::platform::window_manager()
+        .list_windows()
         .ok()?
         .into_iter()
-        .find_map(|w: WireWindow| {
+        .find_map(|w: crate::platform::WindowHandle| {
             if w.title.is_empty() || is_system_ui(&w.app_name) {
                 return None;
             }

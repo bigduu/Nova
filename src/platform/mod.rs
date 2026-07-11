@@ -316,3 +316,22 @@ static MAC_OCR: mac::ocr::MacOcrEngine = mac::ocr::MacOcrEngine;
 pub fn ocr() -> &'static dyn OcrEngine {
     &MAC_OCR
 }
+
+#[cfg(target_os = "macos")]
+static MAC_WINDOW_MANAGER: mac::window::MacWindowManager = mac::window::MacWindowManager;
+
+/// Window/application enumeration and launching (shared capture daemon +
+/// `mdfind`/`open` on macOS).
+#[cfg(target_os = "macos")]
+pub fn window_manager() -> &'static dyn WindowManager {
+    &MAC_WINDOW_MANAGER
+}
+
+#[cfg(target_os = "macos")]
+static MAC_CLIPBOARD: mac::clipboard::MacClipboard = mac::clipboard::MacClipboard;
+
+/// The system clipboard (`pbpaste`/`pbcopy` on macOS).
+#[cfg(target_os = "macos")]
+pub fn clipboard() -> &'static dyn Clipboard {
+    &MAC_CLIPBOARD
+}
