@@ -39,9 +39,9 @@
 //! SAME traits below, gated the same way, so the tool layer
 //! (`src/tools/*`/`src/server.rs`) never has to know which OS it's running on.
 //! [`UiTree`] on Windows is now a real implementation (P2: Microsoft UI
-//! Automation — see `platform::windows::elements`); [`OcrEngine`] remains a
-//! compiling STUB (Windows.Media.Ocr is tracked as P3). Every other capability
-//! is a real MVP implementation. Any OS beyond these two
+//! Automation — see `platform::windows::elements`), and [`OcrEngine`] is too
+//! (P3: `Windows.Media.Ocr` — see `platform::windows::ocr`). Every capability
+//! on Windows is now a real implementation. Any OS beyond these two
 //! is a deliberate, immediate compile error rather than a confusing pile of
 //! missing-symbol errors from platform-only crates (see also the dependency
 //! gating in `Cargo.toml`, `[target.'cfg(target_os = "...")'.dependencies]`).
@@ -374,14 +374,14 @@ pub fn ui_tree() -> &'static dyn UiTree {
 // ── Windows accessors (P1 MVP) ──────────────────────────────────────
 //
 // Mirrors the macOS accessors above exactly — same rationale (per-capability
-// functions, not one bundling struct). `ocr()` and `ui_tree()` return
-// compiling stubs (P2/P3 — UI Automation + Windows.Media.Ocr); every other
-// capability below is a real Win32 implementation.
+// functions, not one bundling struct). Every capability below is now a real
+// implementation: `ui_tree()` via UI Automation (P2) and `ocr()` via
+// `Windows.Media.Ocr` (P3); the rest are Win32.
 
 #[cfg(target_os = "windows")]
 static WIN_OCR: windows::ocr::WinOcrEngine = windows::ocr::WinOcrEngine;
 
-/// The OCR engine — STUB on Windows (P2/P3: Windows.Media.Ocr).
+/// The OCR engine (`Windows.Media.Ocr` on Windows — see `platform::windows::ocr`).
 #[cfg(target_os = "windows")]
 pub fn ocr() -> &'static dyn OcrEngine {
     &WIN_OCR

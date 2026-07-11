@@ -24,7 +24,7 @@
 //! data, field-for-field identical to macOS's) — only [`WinUiTree`]'s methods
 //! and [`handle::WinElementHandle`] are new.
 mod actions;
-mod automation;
+pub(crate) mod automation;
 mod discover;
 mod handle;
 

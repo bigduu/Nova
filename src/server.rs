@@ -872,7 +872,8 @@ impl NovaServer {
 
     #[tool(
         name = "ocr",
-        description = "Read on-screen TEXT via the OS text recognizer (Apple Vision). Captures the \
+        description = "Read on-screen TEXT via the platform OCR engine (Apple Vision on macOS, \
+                       Windows.Media.Ocr on Windows). Captures the \
                        display (or window=\"<name>\") and returns the recognized text lines, each \
                        with a clickable center in the same pixel space as a screenshot — so you can \
                        both READ the text and click a line with left_click(x, y). Returns text only \
