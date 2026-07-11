@@ -99,7 +99,14 @@ thread_local! {
 /// Join this thread to the process's Multi-Threaded Apartment. MUST run
 /// before any other call in this module — see the module doc. Cheap after the
 /// first call (a thread-local read).
-pub(super) fn ensure_com_mta() {
+///
+/// `pub(crate)` rather than `pub(super)`: `platform::windows::ocr` (a sibling
+/// of `elements`, not a descendant) also issues WinRT async calls from a
+/// `spawn_blocking` thread and needs the exact same MTA join — see its module
+/// doc for why reusing this one thread-local (rather than duplicating a
+/// second, independent `CoInitializeEx` gate) is harmless either way, since
+/// `CoInitializeEx` itself is idempotent/refcounted per OS thread.
+pub(crate) fn ensure_com_mta() {
     COM_MTA_JOINED.with(|_| {});
 }
 
