@@ -48,7 +48,12 @@ pub struct NovaServer {
     >,
 }
 
-use crate::capture::broker::shared_client as capture_client;
+// The capture daemon's connection-drop backstop (used by `acquire_capture`
+// and `list_windows` below) is an implementation detail of the macOS daemon
+// client, not part of the neutral `ScreenCapture`/`WindowManager` traits (it
+// has no equivalent method there) — called directly, same as the
+// diagnostics-only direct calls in `main.rs`'s `--selftest`.
+use crate::platform::mac::capture::broker::shared_client as capture_client;
 
 /// Outer backstop on any daemon round-trip. The client's recovery ladder is
 /// self-limiting (every honest daemon reply lands within QUEUE_BUDGET +
@@ -145,10 +150,11 @@ impl NovaServer {
 
     /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
     ///
-    /// Phase 1 — the raw pixel capture runs in the SHARED capture daemon (one
-    /// per user, all nova processes; see [`crate::capture::broker`] for why two
-    /// same-binary ScreenCaptureKit clients wedge each other). The client call
-    /// below already contains the whole recovery ladder — daemon watchdog,
+    /// Phase 1 — the raw pixel capture runs behind [`crate::platform::ScreenCapture`]
+    /// (on macOS: the SHARED capture daemon, one per user, all nova processes;
+    /// see [`crate::platform::mac::capture::broker`] for why two same-binary
+    /// ScreenCaptureKit clients wedge each other). The client call below
+    /// already contains the whole recovery ladder — daemon watchdog,
     /// kill+respawn, stray-process sweep, `killall -9 replayd` — so by the time
     /// it returns an error, recovery has genuinely been attempted; the outer
     /// timeout here is only a backstop. Phase 2 — overlays + the Set-of-Mark
@@ -158,26 +164,31 @@ impl NovaServer {
         &self,
         plan: &CapturePlan,
     ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
-        use crate::capture::broker::CaptureRequest;
-        let request = match (plan.region, &plan.window) {
-            (Some(rect), _) => CaptureRequest::Region { rect },
-            (None, Some(query)) => CaptureRequest::Window {
-                query: query.clone(),
-            },
-            (None, None) => CaptureRequest::Display,
-        };
+        let region = plan.region;
+        let window = plan.window.clone();
         let opts = crate::capture::screenshot::CaptureOptions {
             grid: plan.grid,
             marks: plan.marks,
         };
 
-        // Phase 1: capture via the shared daemon. `preflight` in the error
-        // distinguishes a real Screen-Recording denial (fix the responsible
-        // `parent=` process) from a capture-stack failure.
+        // Phase 1: capture via `crate::platform::screen_capture()`. `preflight`
+        // in the error distinguishes a real Screen-Recording denial (fix the
+        // responsible `parent=` process) from a capture-stack failure.
         let diag = crate::display::geometry::permission_diagnostics();
-        tracing::info!(target: "nova::capture", "capture {:?} — {}", request, diag);
-        let req = request.clone();
-        let task = tokio::task::spawn_blocking(move || capture_client().capture(&req));
+        let desc = match (region, &window) {
+            (Some(rect), _) => format!("Region {rect:?}"),
+            (None, Some(query)) => format!("Window {query:?}"),
+            (None, None) => "Display".to_string(),
+        };
+        tracing::info!(target: "nova::capture", "capture {desc} — {diag}");
+        let task = tokio::task::spawn_blocking(move || {
+            let sc = crate::platform::screen_capture();
+            match (region, &window) {
+                (Some(rect), _) => sc.capture_region(rect),
+                (None, Some(query)) => sc.capture_window(query),
+                (None, None) => sc.capture_display(),
+            }
+        });
         let raw = match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
             Ok(Ok(Ok(raw))) => raw,
             Ok(Ok(Err(e))) => {
@@ -189,7 +200,7 @@ impl NovaServer {
             Err(_) => {
                 capture_client().disconnect();
                 return Err(format!(
-                    "capture of {request:?} did not return within {CAPTURE_BACKSTOP:?} — \
+                    "capture of {desc} did not return within {CAPTURE_BACKSTOP:?} — \
                      the recovery ladder itself is stuck (preflight below: \
                      preflight=false ⇒ Screen Recording not granted to the responsible \
                      `parent=` process). [{diag}]"

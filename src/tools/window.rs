@@ -3,9 +3,17 @@
 /// These USED to call `SCShareableContent` directly, which quietly made every
 /// nova server process a long-lived replayd XPC client — and two same-binary
 /// replayd clients evict each other's identity in a connect/cancel storm that
-/// wedges stream starts (see `capture::broker`). All ScreenCaptureKit traffic,
-/// including metadata-only enumeration, now goes through the one daemon.
-use crate::capture::broker::{shared_client, WireWindow};
+/// wedges stream starts (see `platform::mac::capture::broker`). All
+/// ScreenCaptureKit traffic, including metadata-only enumeration, now goes
+/// through the one daemon.
+//
+// NOTE (platform-abstraction move): `capture::broker` relocated to
+// `platform::mac::capture::broker` as part of the `ScreenCapture` move (see
+// PARALLEL_PLAN.md's capture/window overlap note) — only this import path
+// changed, not the logic below. The window agent may still want to route this
+// through `crate::platform::window_manager()` instead of `shared_client()`
+// directly; left as-is here to avoid redesigning another subsystem's move.
+use crate::platform::mac::capture::broker::{shared_client, WireWindow};
 use crate::types::WindowInfo;
 
 /// List all on-screen windows across all applications.

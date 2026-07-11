@@ -391,11 +391,11 @@ pub fn run_daemon() -> ! {
 /// distributed notification land there) and does stream housekeeping (eager
 /// unlock invalidation, idle TTL).
 fn capture_thread(rx: std::sync::mpsc::Receiver<Job>) {
-    let mut capturer = crate::capture::stream::StreamCapturer::new();
+    let mut capturer = super::stream::StreamCapturer::new();
     loop {
         // Pump doubles as the poll sleep — keeps notification delivery and
         // SCStream scheduling serviced while idle.
-        crate::capture::stream::pump_run_loop(0.02);
+        super::stream::pump_run_loop(0.02);
         match rx.try_recv() {
             Ok(job) => {
                 if job.cancelled.load(Ordering::Acquire) {

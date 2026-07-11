@@ -316,3 +316,13 @@ static MAC_OCR: mac::ocr::MacOcrEngine = mac::ocr::MacOcrEngine;
 pub fn ocr() -> &'static dyn OcrEngine {
     &MAC_OCR
 }
+
+#[cfg(target_os = "macos")]
+static MAC_SCREEN_CAPTURE: mac::capture::MacScreenCapture = mac::capture::MacScreenCapture;
+
+/// Screen/window pixel capture (the shared per-user capture daemon on macOS —
+/// see `mac::capture::broker`).
+#[cfg(target_os = "macos")]
+pub fn screen_capture() -> &'static dyn ScreenCapture {
+    &MAC_SCREEN_CAPTURE
+}

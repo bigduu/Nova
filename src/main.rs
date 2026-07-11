@@ -31,7 +31,7 @@ struct Cli {
     /// INTERNAL: run as the shared per-user capture daemon. Owns the ONE
     /// ScreenCaptureKit client all nova processes route captures through (two
     /// same-binary processes holding replayd streams evict each other's XPC
-    /// identity and wedge — see capture::broker). Spawned on demand; elected
+    /// identity and wedge — see platform::mac::capture::broker). Spawned on demand; elected
     /// via a flock. Not for direct use.
     #[arg(long, hide = true)]
     capture_daemon: bool,
@@ -82,17 +82,23 @@ async fn main() -> Result<()> {
     // Bootstrap the CoreGraphics / window-server connection BEFORE any
     // ScreenCaptureKit call. Without this, capture from this subprocess either
     // SIGABRTs (CGS_REQUIRE_INIT) or hangs in replayd-connection churn. See
-    // `nova::capture::init_core_graphics`.
-    nova::capture::init_core_graphics();
+    // `nova::platform::mac::capture::init_core_graphics`.
+    nova::platform::mac::capture::init_core_graphics();
 
     // Shared capture daemon: serve capture requests over the per-user socket.
     // (Bootstrap above already ran, which is exactly what this process needs.)
+    //
+    // These low-level `--capture-daemon`/`--capture-worker`/`--selftest*`
+    // paths are diagnostics/plumbing for the capture daemon ITSELF, not
+    // tool-layer logic — they call `platform::mac::capture` directly,
+    // bypassing the `ScreenCapture` trait, same rationale as the debug CLI's
+    // direct `tools::elements`/`tools::window` calls below.
     if cli.capture_daemon {
-        nova::capture::broker::run_daemon();
+        nova::platform::mac::capture::broker::run_daemon();
     }
     // Legacy worker entry point: proxy the old pipe protocol into the daemon.
     if cli.capture_worker {
-        nova::capture::broker::run_worker_proxy();
+        nova::platform::mac::capture::broker::run_worker_proxy();
     }
 
     tracing::info!(
@@ -121,7 +127,7 @@ async fn main() -> Result<()> {
         }
         let t = std::time::Instant::now();
         let h = tokio::task::spawn_blocking(|| {
-            nova::capture::stream::StreamCapturer::new().capture_display()
+            nova::platform::mac::capture::stream::StreamCapturer::new().capture_display()
         });
         match tokio::time::timeout(std::time::Duration::from_secs(10), h).await {
             Ok(Ok(Ok(raw))) => {
@@ -158,7 +164,7 @@ async fn main() -> Result<()> {
         // keeps a replayd client connection that collides with the daemon's.
         // Only meaningful on a quiet system — with a live capture daemon the
         // probe is GUARANTEED to collide with the daemon's stream, so skip it.
-        if let Some(pid) = nova::capture::broker::any_capture_daemon_pid() {
+        if let Some(pid) = nova::platform::mac::capture::broker::any_capture_daemon_pid() {
             eprintln!(
                 "[SELFTEST] direct stream: skipped (capture daemon pid={pid} is live; \
                  its warm stream would collide with a second same-binary stream)"
@@ -209,8 +215,8 @@ async fn main() -> Result<()> {
         // shared daemon, capture through it, full recovery ladder).
         let t = std::time::Instant::now();
         let h = tokio::task::spawn_blocking(|| {
-            nova::capture::broker::shared_client()
-                .capture(&nova::capture::broker::CaptureRequest::Display)
+            nova::platform::mac::capture::broker::shared_client()
+                .capture(&nova::platform::mac::capture::broker::CaptureRequest::Display)
         });
         match tokio::time::timeout(std::time::Duration::from_secs(60), h).await {
             Ok(Ok(Ok(raw))) => eprintln!(

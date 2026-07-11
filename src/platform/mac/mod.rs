@@ -12,3 +12,4 @@
 //! don't collide on more than the one new line each adds.
 
 pub mod ocr;
+pub mod capture;

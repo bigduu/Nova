@@ -5,7 +5,7 @@
 
 use base64::Engine;
 use nova::capture::screenshot::{finish_capture, CaptureOptions};
-use nova::capture::stream::StreamCapturer;
+use nova::platform::mac::capture::stream::StreamCapturer;
 use nova::tools::screenshot::ScreenshotImage;
 
 mod common;
