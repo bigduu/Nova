@@ -262,6 +262,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.windows-meta.outputs.tag }}
+          # Fail loudly if BOTH build-windows legs failed (this job isn't gated on
+          # build-windows so a total-failure would otherwise attach nothing and
+          # still go green). A partial matrix success still ships the arch that built.
+          fail_on_unmatched_files: true
           files: |
             dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip
             dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip.sha256
