@@ -129,6 +129,31 @@ objc2-vision = { version = "0.3", default-features = false, features = ["VNReque
 #                                      `OcrLine::Words()`, both gated on this
 #                                      feature in the `windows` crate's own
 #                                      generated bindings)
+#   - Graphics_Capture (P4)          — GraphicsCaptureItem/Session/
+#                                      Direct3D11CaptureFramePool (WGC window
+#                                      capture — fixes the GPU-composited
+#                                      black-bitmap bug PrintWindow has on
+#                                      hardware-accelerated browsers/Electron)
+#   - Graphics_DirectX_Direct3D11 (P4) — the WinRT IDirect3DDevice/pixel-format
+#                                      types the frame pool is parameterized on
+#   - Win32_Graphics_Direct3D11 (P4) — D3D11CreateDevice + ID3D11Texture2D
+#                                      staging-texture readback
+#   - Win32_Graphics_Direct3D (P4)   — D3D_DRIVER_TYPE_HARDWARE
+#   - Win32_Graphics_Dxgi (P4)       — IDXGIDevice (D3D11 device -> WinRT device)
+#   - Win32_Graphics_Dxgi_Common (P4) — DXGI_FORMAT/DXGI_SAMPLE_DESC; a
+#                                      transitive requirement `windows` doesn't
+#                                      auto-enable from Win32_Graphics_Direct3D11
+#                                      alone — without it, D3D11_TEXTURE2D_DESC
+#                                      and ID3D11Texture2D::GetDesc/
+#                                      ID3D11Device::CreateTexture2D are
+#                                      `cfg`'d out of existence entirely
+#   - Win32_System_WinRT_Direct3D11 (P4) — CreateDirect3D11DeviceFromDXGIDevice/
+#                                      IDirect3DDxgiInterfaceAccess (WinRT <->
+#                                      Win32 D3D11 interop, both directions)
+#   - Win32_System_WinRT_Graphics_Capture (P4) — IGraphicsCaptureItemInterop
+#                                      (HWND -> GraphicsCaptureItem — the
+#                                      interop factory that gets us a capture
+#                                      item without WinAppSDK/consent prompts)
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -152,4 +177,12 @@ windows = { version = "0.58", features = [
     "Globalization",
     "Foundation",
     "Foundation_Collections",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
 ] }
