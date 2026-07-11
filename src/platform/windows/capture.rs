@@ -1,16 +1,26 @@
 //! Screen/window pixel capture — the Windows `crate::platform::ScreenCapture`
-//! implementation (P1 MVP).
+//! implementation.
 //!
-//! - Display/region capture: GDI `BitBlt` screen-scrape.
-//! - Window capture: `PrintWindow(PW_RENDERFULLCONTENT)` first (correctly
-//!   captures occluded/off-screen-but-open content on apps that support it),
-//!   falling back to a `BitBlt` of the window's on-screen rect if
-//!   `PrintWindow` itself fails (some older/non-DWM-aware apps ignore it) —
-//!   the fallback only sees the unoccluded, on-screen portion, the classic
-//!   screen-scrape limitation.
+//! - Display/region capture: GDI `BitBlt` screen-scrape (unchanged since P1 —
+//!   no black-bitmap bug here; see [`wgc`]'s module doc for why WGC is out of
+//!   scope for these two).
+//! - Window capture (P4): [`wgc`] (Windows.Graphics.Capture) is now the
+//!   PRIMARY path, falling back to the P1 `PrintWindow(PW_RENDERFULLCONTENT)`
+//!   / `BitBlt` ladder ([`print_window_only`] / [`capture_window_pixels`]) on
+//!   ANY WGC failure (old Windows, no DWM session, a protected/DRM surface,
+//!   or WGC simply timing out on its first frame). WGC asks the DWM
+//!   compositor directly for the window's actual composited output, so it
+//!   sees real pixels regardless of how the app renders — see [`wgc`]'s
+//!   module doc for the full pipeline and why this was necessary:
+//!   `PrintWindow` returns `TRUE` (success) yet hands back an all-black
+//!   bitmap for hardware-accelerated browsers/Electron/games, because the
+//!   composited frame never reaches the GDI-visible surface — a failure mode
+//!   this module cannot even detect (a black `PrintWindow` result and a
+//!   legitimately dark window look identical), so P1 could only fall back
+//!   from an `Err`, which this bug never produces.
 //!
 //! Unlike macOS's ScreenCaptureKit (which can be asked to stream an already-
-//! downscaled frame), GDI always hands back native-resolution pixels — so,
+//! downscaled frame), Windows always hands back native-resolution pixels — so,
 //! uniquely among the two platforms, capture here does its own
 //! `image::imageops::resize` down to the model's pixel budget
 //! ([`crate::display::scaling`]'s `*_MAX_DIMENSION` constants) after the grab.
@@ -27,7 +37,8 @@ use crate::display::scaling::{
 use crate::display::view::ViewFrame;
 use crate::platform::WindowHandle;
 use std::ffi::c_void;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -259,17 +270,32 @@ fn capture_screen_rect(x: i32, y: i32, w: i32, h: i32) -> Result<image::RgbImage
     })
 }
 
+/// `PrintWindow(PW_RENDERFULLCONTENT)`-capture `hwnd` ONLY — no `BitBlt`
+/// fallback. Split out of [`capture_window_pixels`] so [`capture_probe`] (the
+/// WGC smoke-test diagnostic) can demonstrate the black-bitmap bug directly:
+/// `PrintWindow` returns `TRUE`/`Ok` for a GPU-composited window (the bug case
+/// below), so [`capture_window_pixels`]'s `Err`-triggered `BitBlt` fallback
+/// never fires for it either — this function's raw result IS what a caller
+/// would see before P4, and reproduces the bug on demand.
+fn print_window_only(hwnd: HWND, w: i32, h: i32) -> Result<image::RgbImage, String> {
+    render_to_rgb(w, h, |mem_dc| unsafe {
+        PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).ok()
+    })
+}
+
 /// `PrintWindow`-capture `hwnd`, falling back to a `BitBlt` screen-scrape of
-/// its on-screen rect `(x, y, w, h)` if `PrintWindow` itself fails.
+/// its on-screen rect `(x, y, w, h)` if `PrintWindow` itself fails. The P1
+/// window-capture path, now the FALLBACK behind [`wgc::capture_window`] (see
+/// this module's doc) — [`crate::platform::windows::capture::capture_window`]
+/// only reaches this when WGC itself failed.
 ///
-/// KNOWN GAP (deferred to P3): some GPU-composited surfaces (hardware-
-/// accelerated browsers/games, certain Electron apps) return `PrintWindow ==
-/// TRUE` yet render a BLACK or partially-blank bitmap — the content never
-/// reaches the GDI DC. We can't distinguish that from a legitimately dark
-/// window here (a black-pixel heuristic has real false positives), so P1 does
-/// NOT try to detect it; the honest fallback is to advise capturing the whole
-/// display for such apps. A robust fix needs the Windows.Graphics.Capture
-/// (WGC) API, tracked alongside the OCR/UIA WinRT work.
+/// KNOWN GAP: some GPU-composited surfaces (hardware-accelerated browsers/
+/// games, certain Electron apps) return `PrintWindow == TRUE` yet render a
+/// BLACK or partially-blank bitmap — the content never reaches the GDI DC. We
+/// can't distinguish that from a legitimately dark window here (a black-pixel
+/// heuristic has real false positives), so this fallback does NOT try to
+/// detect it — which is exactly why P4 made [`wgc::capture_window`] the
+/// PRIMARY path instead of trying to patch this one.
 fn capture_window_pixels(
     hwnd: HWND,
     x: i32,
@@ -277,10 +303,7 @@ fn capture_window_pixels(
     w: i32,
     h: i32,
 ) -> Result<image::RgbImage, String> {
-    let printed = render_to_rgb(w, h, |mem_dc| unsafe {
-        PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).ok()
-    });
-    match printed {
+    match print_window_only(hwnd, w, h) {
         Ok(img) => Ok(img),
         Err(e) => {
             tracing::debug!(
@@ -324,7 +347,44 @@ pub fn capture_display() -> Result<RawCapture, String> {
     })
 }
 
-/// Capture a single on-screen window matching `query`.
+/// The rect the DWM compositor actually draws `hwnd`'s content into —
+/// `DWMWA_EXTENDED_FRAME_BOUNDS`, NOT `GetWindowRect`. On Windows 10/11 a
+/// top-level window carries an invisible resize-border margin (a few px)
+/// that `GetWindowRect` includes but which is never part of the visible,
+/// DWM-composited surface. [`wgc::capture_window`] asks the compositor
+/// directly for that same composited surface, so its pixels cover this
+/// smaller rect, not the `GetWindowRect` one — see `capture_window`'s call
+/// site for why conflating the two misaligns both the downscale aspect ratio
+/// and the `ViewFrame` a caller maps clicks through.
+fn extended_frame_bounds(hwnd: HWND) -> Result<RECT, String> {
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is a live top-level handle (the same one just handed to
+    // WGC); we pass a pointer to our own `RECT` and its exact size, exactly
+    // as `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS, ...)` documents.
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .map_err(|e| format!("DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed: {e}"))?;
+    Ok(rect)
+}
+
+/// Capture a single on-screen window matching `query`. Tries
+/// [`wgc::capture_window`] (Windows.Graphics.Capture) FIRST — see this
+/// module's doc for why that must be the primary path — falling back to the
+/// P1 `PrintWindow`/`BitBlt` ladder ([`capture_window_pixels`]) on any WGC
+/// failure.
+///
+/// The two paths cover DIFFERENT on-screen regions, so `ViewFrame`/`dims` are
+/// built per-path rather than shared: WGC's composited texture covers the
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` rect (see [`extended_frame_bounds`]), which
+/// excludes the invisible resize-border `GetWindowRect` (`win.x/y/w/h`)
+/// includes; `PrintWindow` renders the full `GetWindowRect` area, so the
+/// fallback keeps using `win.*` exactly as before.
 pub fn capture_window(query: &str) -> Result<RawCapture, String> {
     let win = resolve_window(query)?;
     // SAFETY: reconstructs the `HWND` from the id `platform::windows::window
@@ -337,17 +397,76 @@ pub fn capture_window(query: &str) -> Result<RawCapture, String> {
         win.width as i32,
         win.height as i32,
     );
-    let native = capture_window_pixels(hwnd, x, y, w, h)?;
-    let dims = compute_target_dims_capped(w as u32, h as u32, WINDOW_MAX_DIMENSION);
-    Ok(RawCapture {
-        image: downscale(native, dims),
-        view: ViewFrame {
-            origin: (win.x, win.y),
-            region: (win.width, win.height),
-            screenshot: (dims.width as f64, dims.height as f64),
-        },
-        window_pid: Some(win.pid),
-    })
+    match wgc::capture_window(hwnd) {
+        Ok(native) => {
+            // WGC path: dims come from the ACTUAL captured texture
+            // (native.width()/height()), and origin/region from the DWM
+            // extended-frame-bounds rect it corresponds to — NOT win.x/y/w/h,
+            // which is the (larger) GetWindowRect area. Falls back to win.*
+            // only if the DWM query itself fails (best-effort, never a hard
+            // capture failure at this point — we already have real pixels).
+            let (origin, region) = match extended_frame_bounds(hwnd) {
+                Ok(rect) => {
+                    let region_w = (rect.right - rect.left) as f64;
+                    let region_h = (rect.bottom - rect.top) as f64;
+                    // PER_MONITOR_AWARE_V2 means logical == physical == native
+                    // px (see this module's doc), so the WGC texture's real
+                    // size should closely track the extended-frame-bounds
+                    // rect it was composited from. Log if they drift so a
+                    // future regression here (e.g. a DPI-awareness change) is
+                    // visible instead of silently misaligning clicks again.
+                    let (nw, nh) = (native.width() as f64, native.height() as f64);
+                    if (nw - region_w).abs() > 2.0 || (nh - region_h).abs() > 2.0 {
+                        tracing::warn!(
+                            "WGC native size {nw}x{nh} vs DWMWA_EXTENDED_FRAME_BOUNDS \
+                             {region_w}x{region_h} differ by more than 2px — dims reconciliation \
+                             may be off"
+                        );
+                    }
+                    ((rect.left as f64, rect.top as f64), (region_w, region_h))
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed ({e}); \
+                         falling back to GetWindowRect for ViewFrame (may be off by the \
+                         invisible resize-border on the WGC path)"
+                    );
+                    ((win.x, win.y), (win.width, win.height))
+                }
+            };
+            let dims =
+                compute_target_dims_capped(native.width(), native.height(), WINDOW_MAX_DIMENSION);
+            Ok(RawCapture {
+                image: downscale(native, dims),
+                view: ViewFrame {
+                    origin,
+                    region,
+                    screenshot: (dims.width as f64, dims.height as f64),
+                },
+                window_pid: Some(win.pid),
+            })
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Windows.Graphics.Capture failed ({e}); falling back to PrintWindow/BitBlt (may \
+                 return a black bitmap on a GPU-composited surface — see this module's doc)"
+            );
+            let native = capture_window_pixels(hwnd, x, y, w, h)?;
+            // PrintWindow fallback: native IS w×h (PrintWindow renders the
+            // full GetWindowRect area), so origin/region/dims stay win.*
+            // exactly as before P4's WGC reconciliation.
+            let dims = compute_target_dims_capped(w as u32, h as u32, WINDOW_MAX_DIMENSION);
+            Ok(RawCapture {
+                image: downscale(native, dims),
+                view: ViewFrame {
+                    origin: (win.x, win.y),
+                    region: (win.width, win.height),
+                    screenshot: (dims.width as f64, dims.height as f64),
+                },
+                window_pid: Some(win.pid),
+            })
+        }
+    }
 }
 
 /// Capture exactly the rectangle `(x, y, w, h)` in global logical points.
@@ -369,7 +488,7 @@ pub fn capture_region(rect: (f64, f64, f64, f64)) -> Result<RawCapture, String> 
     })
 }
 
-/// The Windows [`crate::platform::ScreenCapture`]: GDI `BitBlt`/`PrintWindow`,
+/// The Windows [`crate::platform::ScreenCapture`]: WGC/`PrintWindow`/`BitBlt`,
 /// via the free functions above.
 pub struct WinScreenCapture;
 
@@ -384,5 +503,559 @@ impl crate::platform::ScreenCapture for WinScreenCapture {
 
     fn capture_region(&self, rect: (f64, f64, f64, f64)) -> Result<RawCapture, String> {
         capture_region(rect)
+    }
+}
+
+// ── `--capture-probe` diagnostic (P4 WGC smoke test) ──────────────────
+//
+// Link ≠ working: the whole point of WGC is that it returns real pixels where
+// `PrintWindow` silently returns a black bitmap, so the only convincing proof
+// is a runtime, non-black-pixel measurement — not just "it compiled" or "it
+// didn't error". `main.rs`'s hidden `--capture-probe <window-title>` flag
+// calls [`capture_probe`] and prints its report; no MCP round trip needed.
+
+/// Per-channel pixel statistics — the evidence a capture path returned real
+/// content (high variance, non-near-zero mean) vs. the `PrintWindow` bug
+/// (uniform black: mean ≈ 0, variance ≈ 0).
+struct PixelStats {
+    mean: (f64, f64, f64),
+    variance: (f64, f64, f64),
+}
+
+impl std::fmt::Display for PixelStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mean=(R{:.2} G{:.2} B{:.2}) variance=(R{:.2} G{:.2} B{:.2}) stddev=(R{:.2} G{:.2} B{:.2})",
+            self.mean.0,
+            self.mean.1,
+            self.mean.2,
+            self.variance.0,
+            self.variance.1,
+            self.variance.2,
+            self.variance.0.sqrt(),
+            self.variance.1.sqrt(),
+            self.variance.2.sqrt(),
+        )
+    }
+}
+
+/// Compute per-channel mean/variance over every pixel in `img` — two full
+/// passes (mean, then sum-of-squared-deviations), which is plenty fast for a
+/// one-shot diagnostic image (not a hot path).
+fn pixel_stats(img: &image::RgbImage) -> PixelStats {
+    let n = (img.width() as f64) * (img.height() as f64);
+    if n <= 0.0 {
+        return PixelStats {
+            mean: (0.0, 0.0, 0.0),
+            variance: (0.0, 0.0, 0.0),
+        };
+    }
+    let mut sum = (0f64, 0f64, 0f64);
+    for px in img.pixels() {
+        sum.0 += px[0] as f64;
+        sum.1 += px[1] as f64;
+        sum.2 += px[2] as f64;
+    }
+    let mean = (sum.0 / n, sum.1 / n, sum.2 / n);
+    let mut sq_dev = (0f64, 0f64, 0f64);
+    for px in img.pixels() {
+        sq_dev.0 += (px[0] as f64 - mean.0).powi(2);
+        sq_dev.1 += (px[1] as f64 - mean.1).powi(2);
+        sq_dev.2 += (px[2] as f64 - mean.2).powi(2);
+    }
+    PixelStats {
+        mean,
+        variance: (sq_dev.0 / n, sq_dev.1 / n, sq_dev.2 / n),
+    }
+}
+
+/// Save `img` as a JPEG next to the system temp dir, returning the path — so
+/// a human can eyeball the probe's output alongside its printed stats.
+fn save_probe_jpeg(img: &image::RgbImage, tag: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!("nova-capture-probe-{tag}.jpg"));
+    let mut buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90)
+        .encode(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| format!("jpeg encode failed: {e}"))?;
+    std::fs::write(&path, &buf).map_err(|e| format!("write {path:?} failed: {e}"))?;
+    Ok(path)
+}
+
+/// `--capture-probe <query>`: resolve `query` to a window, then run BOTH
+/// capture paths against the SAME live window and report pixel stats for
+/// each — the strongest possible evidence for the P4 fix. Two variants,
+/// deliberately NOT sharing an early return, so a failure in one still lets
+/// the other run and report:
+/// - "PrintWindow-only" ([`print_window_only`], no `BitBlt` fallback): the
+///   pre-P4 behavior. On a GPU-composited window this is expected to report
+///   mean≈0 / variance≈0 (uniform black) — `PrintWindow` returns `Ok`, so the
+///   old code's `Err`-triggered fallback never rescues it either.
+/// - "WGC" ([`wgc::capture_window`]): the new primary path. Expected to
+///   report a high-variance, non-near-zero mean on the same window.
+pub fn capture_probe(query: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let win = resolve_window(query)?;
+    // SAFETY: same reconstruction `capture_window` uses — see its comment.
+    let hwnd = HWND(win.id as usize as *mut c_void);
+    let (w, h) = (win.width as i32, win.height as i32);
+
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "[capture-probe] {query:?} -> {:?} @({:.0},{:.0} {:.0}x{:.0}) [GetWindowRect]",
+        win.title, win.x, win.y, win.width, win.height
+    );
+    // Make the P4 dims/ViewFrame reconciliation directly visible: print the
+    // DWM extended-frame-bounds rect (what WGC's ViewFrame/dims now use)
+    // right next to the GetWindowRect one above (what the PrintWindow
+    // fallback still uses) — see `capture_window`'s doc for why they differ.
+    match extended_frame_bounds(hwnd) {
+        Ok(rect) => {
+            let _ = writeln!(
+                report,
+                "  DWMWA_EXTENDED_FRAME_BOUNDS: ({},{}) {}x{} [WGC ViewFrame]",
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(report, "  DWMWA_EXTENDED_FRAME_BOUNDS: FAILED: {e}");
+        }
+    }
+
+    match print_window_only(hwnd, w, h) {
+        Ok(img) => {
+            let stats = pixel_stats(&img);
+            let _ = writeln!(
+                report,
+                "PrintWindow-only: OK {}x{} {stats}",
+                img.width(),
+                img.height()
+            );
+            match save_probe_jpeg(&img, "printwindow") {
+                Ok(path) => {
+                    let _ = writeln!(report, "  saved {}", path.display());
+                }
+                Err(e) => {
+                    let _ = writeln!(report, "  (failed to save jpeg: {e})");
+                }
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(report, "PrintWindow-only: FAILED: {e}");
+        }
+    }
+
+    match wgc::capture_window(hwnd) {
+        Ok(img) => {
+            let stats = pixel_stats(&img);
+            let _ = writeln!(report, "WGC: OK {}x{} {stats}", img.width(), img.height());
+            match save_probe_jpeg(&img, "wgc") {
+                Ok(path) => {
+                    let _ = writeln!(report, "  saved {}", path.display());
+                }
+                Err(e) => {
+                    let _ = writeln!(report, "  (failed to save jpeg: {e})");
+                }
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(report, "WGC: FAILED: {e}");
+        }
+    }
+
+    Ok(report)
+}
+
+// ── Windows.Graphics.Capture (WGC) — P4 primary window-capture path ──────
+mod wgc {
+    //! Windows.Graphics.Capture window capture — see `super`'s (this file's)
+    //! module doc for the "why" (the GPU-composited black-bitmap bug this
+    //! fixes). This module is the "how": HWND -> `GraphicsCaptureItem` ->
+    //! D3D11 device -> free-threaded frame pool/session -> one composited
+    //! frame -> CPU-readable RGB pixels.
+    //!
+    //! # Threading model
+    //!
+    //! [`capture_window`] runs synchronously on whatever thread calls it —
+    //! `server.rs` already runs every `ScreenCapture` entry point inside a
+    //! `tokio::task::spawn_blocking` (see `platform::windows::elements::
+    //! automation`'s module doc for the identical reasoning applied to UI
+    //! Automation), so this function is free to block that thread. What it
+    //! blocks ON is the interesting part: `Direct3D11CaptureFramePool::
+    //! CreateFreeThreaded` (NOT `Create`, which needs a `DispatcherQueue`/
+    //! message loop this thread doesn't run) raises its `FrameArrived` event
+    //! on an INTERNAL WinRT threadpool thread, not ours. So the calling
+    //! thread starts the session, then blocks on a bounded
+    //! `std::sync::mpsc::sync_channel(1)` that the `FrameArrived` handler (on
+    //! that other thread) delivers the decoded frame — or an error — into.
+    //! This is deliberately NOT a naked `TryGetNextFrame()` poll loop (races
+    //! the compositor, wastes CPU) and NOT routed through a `DispatcherQueue`
+    //! (this process runs no per-thread UI message pump for one to dispatch
+    //! on) — the free-threaded pool + event + channel combination is the one
+    //! that needs neither.
+    //!
+    //! # COM apartment
+    //!
+    //! WinRT activation (`factory::<GraphicsCaptureItem, _>()`,
+    //! `CreateForWindow`, `CreateDirect3D11DeviceFromDXGIDevice`) needs this
+    //! thread joined to the process's Multi-Threaded Apartment, exactly like
+    //! UI Automation — this module reuses `platform::windows::elements::
+    //! automation::ensure_com_mta` (`pub(crate)`) rather than keeping its own
+    //! duplicate join: same idempotent-per-thread `CoInitializeEx
+    //! (MULTITHREADED)`, and `CoInitializeEx` itself is refcounted per OS
+    //! thread, so sharing the one thread-local join across both modules is
+    //! harmless.
+    //!
+    //! # The RowPitch gotcha (read before touching [`frame_to_rgb`])
+    //!
+    //! The staging texture's mapped row stride (`D3D11_MAPPED_SUBRESOURCE::
+    //! RowPitch`) is USUALLY NOT `width * 4` — the driver pads each row to its
+    //! own alignment. Indexing the mapped buffer as one contiguous
+    //! `width * 4 * height` block (instead of `row * RowPitch` per row) reads
+    //! garbage/shifted pixels past the first row on most GPUs. This is widely
+    //! considered THE #1 WGC integration bug; [`frame_to_rgb`] below indexes
+    //! every row by `RowPitch` and only reads the first `width * 4` bytes of
+    //! each.
+    //!
+    //! # Border / DRM (deliberately NOT handled)
+    //!
+    //! WGC draws a thin yellow capture-indicator border around the captured
+    //! window by default. Suppressing it (`IGraphicsCaptureSession3::
+    //! SetIsBorderRequired(false)`) requires an MSIX packaging identity plus a
+    //! user consent prompt that an unpackaged nova.exe cannot provide, so this
+    //! module never calls it — the border is a cosmetic system overlay drawn
+    //! OUTSIDE the captured content; it does not appear in the captured
+    //! pixels/coordinates. A DRM/protected window going black under WGC is
+    //! likewise an OS-level content-protection limit, not a bug here — it
+    //! just means this function returns non-representative pixels, same as
+    //! `PrintWindow` would; a real screenshot of a real window is still
+    //! produced.
+    use crate::platform::windows::elements::automation::ensure_com_mta;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use windows::core::Interface;
+    use windows::Foundation::TypedEventHandler;
+    use windows::Graphics::Capture::{
+        Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+        GraphicsCaptureSession,
+    };
+    use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+    use windows::Graphics::DirectX::DirectXPixelFormat;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::Win32::System::WinRT::Direct3D11::{
+        CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+    };
+    use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+
+    /// How long to wait for WGC's first composited frame before giving up and
+    /// letting the caller fall back to `PrintWindow`/`BitBlt`. Cold start
+    /// (device/pool/session stand-up, DWM handing over the first composited
+    /// frame) can take a few compositor vsyncs on a loaded system; 3s is
+    /// generous headroom without hanging a `screenshot` call for long.
+    const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// The D3D11 device/context this module creates once per capture, plus
+    /// the WinRT-wrapped handle to the SAME device the frame pool needs.
+    struct D3d11Device {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        winrt_device: IDirect3DDevice,
+    }
+
+    /// `D3D11CreateDevice(D3D_DRIVER_TYPE_HARDWARE, BGRA_SUPPORT)` -> QI
+    /// `IDXGIDevice` -> `CreateDirect3D11DeviceFromDXGIDevice` -> cast to the
+    /// WinRT `IDirect3DDevice` the frame pool is parameterized on.
+    /// `D3D11_CREATE_DEVICE_BGRA_SUPPORT` is mandatory — the frame pool's
+    /// `B8G8R8A8UIntNormalized` pixel format requires a BGRA-capable device.
+    fn create_d3d_device() -> Result<D3d11Device, String> {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        // SAFETY: `None`/`None` (adapter/software module) select the default
+        // hardware adapter; no feature-level array requests the driver's
+        // best-supported level; the two `Some(&mut _)` out-params are valid,
+        // freshly-declared locals.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .map_err(|e| format!("D3D11CreateDevice failed: {e}"))?;
+        let device = device.ok_or("D3D11CreateDevice returned a null device")?;
+        let context = context.ok_or("D3D11CreateDevice returned a null immediate context")?;
+
+        let dxgi_device: IDXGIDevice = device
+            .cast()
+            .map_err(|e| format!("QI ID3D11Device -> IDXGIDevice failed: {e}"))?;
+        // SAFETY: `dxgi_device` is the live device just created above.
+        let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
+            .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice failed: {e}"))?;
+        let winrt_device: IDirect3DDevice = inspectable
+            .cast()
+            .map_err(|e| format!("cast IInspectable -> IDirect3DDevice failed: {e}"))?;
+
+        Ok(D3d11Device {
+            device,
+            context,
+            winrt_device,
+        })
+    }
+
+    /// HWND -> `GraphicsCaptureItem` via the Win32 interop factory —
+    /// deliberately NOT `GraphicsCaptureItem::TryCreateFromWindowId`, which is
+    /// a WinAppSDK API that additionally needs interactive user consent nova
+    /// (an unpackaged .exe) cannot provide.
+    fn create_capture_item(hwnd: HWND) -> Result<GraphicsCaptureItem, String> {
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .map_err(|e| format!("activating IGraphicsCaptureItemInterop failed: {e}"))?;
+        // SAFETY: `hwnd` is a live top-level window handle resolved by
+        // `capture::resolve_window` just before this call.
+        unsafe { interop.CreateForWindow(hwnd) }
+            .map_err(|e| format!("IGraphicsCaptureItemInterop::CreateForWindow failed: {e}"))
+    }
+
+    /// Read `frame`'s composited surface back to CPU-side RGB pixels:
+    /// `Surface()` -> QI `IDirect3DDxgiInterfaceAccess` -> `GetInterface::
+    /// <ID3D11Texture2D>()` (the live GPU texture) -> copy into a STAGING
+    /// texture (the live one is typically render-target-only, no CPU access)
+    /// -> `Map`/read/`Unmap`. See this module's doc for the RowPitch gotcha
+    /// this function's row loop exists specifically to avoid.
+    fn frame_to_rgb(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        frame: &Direct3D11CaptureFrame,
+    ) -> Result<image::RgbImage, String> {
+        let surface = frame
+            .Surface()
+            .map_err(|e| format!("Direct3D11CaptureFrame::Surface failed: {e}"))?;
+        let access: IDirect3DDxgiInterfaceAccess = surface
+            .cast()
+            .map_err(|e| format!("cast IDirect3DSurface -> IDirect3DDxgiInterfaceAccess: {e}"))?;
+        // SAFETY: `access` was just obtained from a live frame surface;
+        // `GetInterface::<ID3D11Texture2D>` is the documented WinRT<->DXGI
+        // interop call to reach the surface's backing D3D11 texture.
+        let src_tex: ID3D11Texture2D = unsafe { access.GetInterface() }
+            .map_err(|e| format!("GetInterface<ID3D11Texture2D> failed: {e}"))?;
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `src_tex` is the valid, live texture just obtained above.
+        unsafe { src_tex.GetDesc(&mut desc) };
+        let (w, h) = (desc.Width, desc.Height);
+        if w == 0 || h == 0 {
+            return Err(format!("WGC frame has a non-positive size ({w}x{h})"));
+        }
+
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        // SAFETY: `device` is the SAME device that created `src_tex`
+        // (both trace back to this module's one `create_d3d_device` call);
+        // `staging_desc` describes a same-size, same-format, CPU-readable
+        // staging copy — the standard "copy then map" GPU readback pattern.
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
+            .map_err(|e| format!("CreateTexture2D(staging) failed: {e}"))?;
+        let staging = staging.ok_or("CreateTexture2D(staging) returned a null texture")?;
+
+        // SAFETY: `staging`/`src_tex` are both live, same-device, same-size,
+        // same-format textures — a valid `CopyResource` pair.
+        unsafe { context.CopyResource(&staging, &src_tex) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `staging` was created with `USAGE_STAGING` +
+        // `CPU_ACCESS_READ` above, making it valid to `Map` for reading;
+        // `context` is the immediate context paired with `device`.
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .map_err(|e| format!("Map(staging) failed: {e}"))?;
+
+        // THE ROW-PITCH GOTCHA: `mapped.RowPitch` is the GPU/driver-padded
+        // stride, almost always > `w * 4` — index each row by `RowPitch`, and
+        // read only the first `w * 4` bytes of it. Treating the buffer as one
+        // contiguous `w * 4 * h` block (ignoring `RowPitch`) is THE most
+        // common WGC integration bug and would shift/corrupt every row past
+        // the first on most GPUs.
+        let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        // SAFETY: `mapped.pData` is valid for `mapped.RowPitch * h` bytes
+        // (the successful `Map` above guarantees at least that much, padded
+        // per row); this loop only ever reads the first `w * 4` bytes of each
+        // `RowPitch`-strided row, staying within that bound.
+        unsafe {
+            let base = mapped.pData as *const u8;
+            for row in 0..h as usize {
+                let row_ptr = base.add(row * mapped.RowPitch as usize);
+                let row_slice = std::slice::from_raw_parts(row_ptr, w as usize * 4);
+                for px in row_slice.chunks_exact(4) {
+                    // B8G8R8A8UIntNormalized -> RGB (same BGRA byte order as
+                    // GDI's 32bpp DIB — see `read_bitmap_rgb` in this file).
+                    rgb.push(px[2]);
+                    rgb.push(px[1]);
+                    rgb.push(px[0]);
+                }
+            }
+        }
+
+        // SAFETY: unmaps exactly the subresource just `Map`ped above.
+        unsafe { context.Unmap(&staging, 0) };
+
+        image::RgbImage::from_raw(w, h, rgb)
+            .ok_or_else(|| "failed to build an RgbImage from the WGC frame".to_string())
+    }
+
+    /// The full WGC pipeline for one window: HWND -> item -> device -> pool +
+    /// session -> ONE composited frame -> RGB pixels. Returns `Err` for the
+    /// caller ([`super::capture_window`]) to fall back to `PrintWindow`/
+    /// `BitBlt` on: an unsupported OS, any WinRT/D3D11 activation failure, or
+    /// a 3s timeout waiting for the first frame (cold start budget — see
+    /// [`FIRST_FRAME_TIMEOUT`]).
+    pub(super) fn capture_window(hwnd: HWND) -> Result<image::RgbImage, String> {
+        ensure_com_mta();
+
+        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+            return Err(
+                "GraphicsCaptureSession::IsSupported() = false (needs Windows 10 1903+)"
+                    .to_string(),
+            );
+        }
+
+        let item = create_capture_item(hwnd)?;
+        let size = item
+            .Size()
+            .map_err(|e| format!("GraphicsCaptureItem::Size failed: {e}"))?;
+        if size.Width <= 0 || size.Height <= 0 {
+            return Err(format!(
+                "GraphicsCaptureItem::Size is non-positive ({}x{})",
+                size.Width, size.Height
+            ));
+        }
+
+        let d3d = create_d3d_device()?;
+
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &d3d.winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        )
+        .map_err(|e| format!("Direct3D11CaptureFramePool::CreateFreeThreaded failed: {e}"))?;
+
+        let session = pool
+            .CreateCaptureSession(&item)
+            .map_err(|e| format!("CreateCaptureSession failed: {e}"))?;
+        // Deliberately NOT calling `session.SetIsBorderRequired(false)` — see
+        // this module's doc ("Border / DRM") for why: it needs MSIX packaging
+        // identity + a consent prompt nova can't provide, and the border is
+        // purely a cosmetic overlay outside the captured pixels anyway.
+
+        let (tx, rx) = mpsc::sync_channel::<Result<image::RgbImage, String>>(1);
+        let device_for_handler = d3d.device.clone();
+        let context_for_handler = d3d.context.clone();
+        // Guards the race between a timed-out main thread tearing down the
+        // session/pool (`RemoveFrameArrived`/`Close` below) and a
+        // `FrameArrived` callback already mid-flight in the GPU copy/map —
+        // low-probability but crash-class (more likely on a virtualized GPU).
+        // `RemoveFrameArrived` only stops FUTURE events; it doesn't wait out
+        // one already running. Checked at the top of the handler and set
+        // right after a successful `try_send`, so once the first frame is
+        // delivered every subsequent invocation (the 2-buffer pool keeps
+        // firing) returns immediately instead of redoing the GPU copy/map —
+        // which also shrinks the teardown race to near-zero, since no
+        // further handler invocation touches the D3D device/context after
+        // delivery.
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_for_handler = Arc::clone(&delivered);
+        let token = pool
+            .FrameArrived(&TypedEventHandler::<
+                Direct3D11CaptureFramePool,
+                windows::core::IInspectable,
+            >::new(move |sender, _args| {
+                if delivered_for_handler.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let result = (|| -> Result<image::RgbImage, String> {
+                    let sender = sender
+                        .as_ref()
+                        .ok_or_else(|| "FrameArrived: null sender".to_string())?;
+                    let frame = sender
+                        .TryGetNextFrame()
+                        .map_err(|e| format!("TryGetNextFrame failed: {e}"))?;
+                    let rgb = frame_to_rgb(&device_for_handler, &context_for_handler, &frame);
+                    // Explicitly release the frame back to the pool's buffer
+                    // slot right after pulling its pixels, rather than
+                    // waiting on `frame`'s ordinary `Drop` — this module only
+                    // ever grabs ONE frame per call; a window/pool resize
+                    // mid-capture is out of scope (one-shot single-frame
+                    // grab).
+                    let _ = frame.Close();
+                    rgb
+                })();
+                // Bounded (1) channel: if a frame somehow already delivered
+                // (a second FrameArrived firing before we unsubscribe below),
+                // `try_send` just drops this one — we only need the first.
+                if tx.try_send(result).is_ok() {
+                    delivered_for_handler.store(true, Ordering::Release);
+                }
+                Ok(())
+            }))
+            .map_err(|e| format!("FrameArrived subscribe failed: {e}"))?;
+
+        session
+            .StartCapture()
+            .map_err(|e| format!("GraphicsCaptureSession::StartCapture failed: {e}"))?;
+
+        let outcome = rx.recv_timeout(FIRST_FRAME_TIMEOUT);
+
+        // Teardown, on EITHER outcome — unsubscribe first so no further
+        // `FrameArrived` fires while we're closing the session/pool under it.
+        let _ = pool.RemoveFrameArrived(token);
+        let _ = session.Close();
+        let _ = pool.Close();
+
+        match outcome {
+            Ok(Ok(img)) => Ok(img),
+            Ok(Err(e)) => Err(format!("WGC frame processing failed: {e}")),
+            Err(_) => Err(format!(
+                "WGC timed out after {FIRST_FRAME_TIMEOUT:?} waiting for the first composited \
+                 frame"
+            )),
+        }
     }
 }
