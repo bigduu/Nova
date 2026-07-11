@@ -31,7 +31,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
-    SRCCOPY,
+    HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::PW_RENDERFULLCONTENT;
@@ -78,56 +78,118 @@ fn render_to_rgb(
     if w <= 0 || h <= 0 {
         return Err(format!("capture size is non-positive ({w}x{h})"));
     }
-    // SAFETY: `None` requests the whole-desktop DC, a documented valid arg.
-    let screen_dc = unsafe { GetDC(None) };
-    if screen_dc.is_invalid() {
-        return Err("GetDC(desktop) returned an invalid DC".to_string());
+    // Each GDI resource is held in an RAII guard so cleanup happens in exactly
+    // reverse acquisition order (Rust drops locals last-declared-first):
+    // selection restore → bitmap delete → mem-DC delete → screen-DC release.
+    // That ordering matters — `bmp` must be de-selected from `mem_dc` before
+    // either is freed — and RAII guarantees it even on the early-return
+    // (`?`) paths, without the nested try/finally closures clippy flags.
+    let screen_dc = ScreenDc::get()?;
+    let mem_dc = MemDc::create_compatible(screen_dc.0)?;
+    // SAFETY: `screen_dc` is valid; `w`/`h` were validated positive above.
+    let bmp = MemBitmap::create_compatible(screen_dc.0, w, h)?;
+    // SAFETY: `mem_dc`/`bmp` are both valid; the guard restores `mem_dc`'s
+    // previous (stock) bitmap on drop, before `bmp`/`mem_dc` are freed.
+    let _selection = SelectGuard::select(mem_dc.0, bmp.0);
+    draw(mem_dc.0)
+        .map_err(|e| format!("{e}"))
+        .and_then(|()| read_bitmap_rgb(mem_dc.0, bmp.0, w, h))
+}
+
+// ── GDI RAII guards ─────────────────────────────────────────────────
+//
+// One-field newtypes whose Drop frees the wrapped handle, so `render_to_rgb`
+// reads as a flat acquire-then-use sequence with `?` early-returns instead of
+// a nested create/select/cleanup ladder.
+
+/// The whole-desktop device context (`GetDC(None)` / `ReleaseDC`).
+struct ScreenDc(HDC);
+impl ScreenDc {
+    fn get() -> Result<Self, String> {
+        // SAFETY: `None` requests the whole-desktop DC, a documented valid arg.
+        let dc = unsafe { GetDC(None) };
+        if dc.is_invalid() {
+            return Err("GetDC(desktop) returned an invalid DC".to_string());
+        }
+        Ok(Self(dc))
     }
-    let result = (|| -> Result<image::RgbImage, String> {
-        // SAFETY: `screen_dc` was just validated non-invalid above.
-        let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
-        if mem_dc.is_invalid() {
+}
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        // SAFETY: releases exactly the DC this guard obtained, same (desktop) target.
+        unsafe {
+            let _ = ReleaseDC(None, self.0);
+        }
+    }
+}
+
+/// An in-memory device context (`CreateCompatibleDC` / `DeleteDC`).
+struct MemDc(HDC);
+impl MemDc {
+    fn create_compatible(screen_dc: HDC) -> Result<Self, String> {
+        // SAFETY: `screen_dc` is a valid DC from `ScreenDc::get`.
+        let dc = unsafe { CreateCompatibleDC(screen_dc) };
+        if dc.is_invalid() {
             return Err("CreateCompatibleDC failed".to_string());
         }
-        let out = (|| -> Result<image::RgbImage, String> {
-            // SAFETY: `screen_dc` is valid; `w`/`h` were validated positive above.
-            let bmp = unsafe { CreateCompatibleBitmap(screen_dc, w, h) };
-            if bmp.is_invalid() {
-                return Err("CreateCompatibleBitmap failed".to_string());
-            }
-            let out = (|| -> Result<image::RgbImage, String> {
-                // SAFETY: `mem_dc`/`bmp` are both valid and freshly created
-                // above; `SelectObject` returns the DC's previous (stock)
-                // bitmap, restored below before either handle is deleted.
-                let old = unsafe { SelectObject(mem_dc, bmp) };
-                let pixels = draw(mem_dc)
-                    .map_err(|e| format!("{e}"))
-                    .and_then(|_| read_bitmap_rgb(mem_dc, bmp, w, h));
-                // SAFETY: restores `mem_dc`'s original bitmap before `bmp`/
-                // `mem_dc` are deleted, so neither delete call touches a DC
-                // that still references the other's handle.
-                unsafe {
-                    let _ = SelectObject(mem_dc, old);
-                }
-                pixels
-            })();
-            // SAFETY: `bmp` is no longer selected into any DC (restored above).
-            unsafe {
-                let _ = DeleteObject(bmp);
-            }
-            out
-        })();
-        // SAFETY: `mem_dc` has no bitmap selected into it at this point.
-        unsafe {
-            let _ = DeleteDC(mem_dc);
-        }
-        out
-    })();
-    // SAFETY: releases exactly the DC obtained above, for the same (desktop) target.
-    unsafe {
-        let _ = ReleaseDC(None, screen_dc);
+        Ok(Self(dc))
     }
-    result
+}
+impl Drop for MemDc {
+    fn drop(&mut self) {
+        // SAFETY: dropped AFTER the SelectGuard restored the DC's stock bitmap,
+        // so no caller-owned bitmap is selected into it at deletion.
+        unsafe {
+            let _ = DeleteDC(self.0);
+        }
+    }
+}
+
+/// A memory bitmap (`CreateCompatibleBitmap` / `DeleteObject`).
+struct MemBitmap(HBITMAP);
+impl MemBitmap {
+    fn create_compatible(screen_dc: HDC, w: i32, h: i32) -> Result<Self, String> {
+        // SAFETY: `screen_dc` is valid; `w`/`h` were validated positive by the caller.
+        let bmp = unsafe { CreateCompatibleBitmap(screen_dc, w, h) };
+        if bmp.is_invalid() {
+            return Err("CreateCompatibleBitmap failed".to_string());
+        }
+        Ok(Self(bmp))
+    }
+}
+impl Drop for MemBitmap {
+    fn drop(&mut self) {
+        // SAFETY: dropped AFTER the SelectGuard de-selected this bitmap from
+        // the mem DC, so it is not selected into any DC at deletion.
+        unsafe {
+            let _ = DeleteObject(self.0);
+        }
+    }
+}
+
+/// Selects `obj` into `dc` and restores the DC's previous object on drop.
+struct SelectGuard {
+    dc: HDC,
+    old: HGDIOBJ,
+}
+impl SelectGuard {
+    fn select(dc: HDC, bmp: HBITMAP) -> Self {
+        // SAFETY: `dc`/`bmp` are valid, freshly created; `SelectObject` returns
+        // the DC's previous (stock) object, which `drop` restores. `HBITMAP`
+        // satisfies `SelectObject`'s `Param<HGDIOBJ>` bound directly (it
+        // `CanInto<HGDIOBJ>`), so no explicit conversion is needed.
+        let old = unsafe { SelectObject(dc, bmp) };
+        Self { dc, old }
+    }
+}
+impl Drop for SelectGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the DC's original object before the bitmap/DC guards
+        // (which drop after this one) free their handles.
+        unsafe {
+            let _ = SelectObject(self.dc, self.old);
+        }
+    }
 }
 
 /// Read a `w`x`h` 32bpp top-down DIB out of `bmp` (selected into `dc`) as RGB
@@ -177,20 +239,37 @@ fn read_bitmap_rgb(dc: HDC, bmp: HBITMAP, w: i32, h: i32) -> Result<image::RgbIm
 
 /// `BitBlt`-capture the screen rectangle at global `(x, y)`, size `w`x`h`.
 fn capture_screen_rect(x: i32, y: i32, w: i32, h: i32) -> Result<image::RgbImage, String> {
-    render_to_rgb(w, h, |mem_dc| unsafe {
-        // A second desktop DC as the BitBlt source. Independent of
+    render_to_rgb(w, h, |mem_dc| {
+        // A second desktop DC as the BitBlt source, null-checked before use
+        // (like every other handle in this file). Independent of
         // `render_to_rgb`'s own screen DC (each GetDC/ReleaseDC pair is
-        // self-contained), which keeps this closure's signature identical to
-        // the PrintWindow path's below (`HDC` in, `Result<()>` out).
-        let src_dc = GetDC(None);
-        let r = BitBlt(mem_dc, 0, 0, w, h, src_dc, x, y, SRCCOPY);
-        let _ = ReleaseDC(None, src_dc);
+        // self-contained), which keeps this closure's `HDC -> Result<()>`
+        // shape identical to the PrintWindow path below.
+        // SAFETY: `None` requests the whole-desktop DC; `ReleaseDC` below
+        // releases exactly it, and `BitBlt` reads from a validated source DC.
+        let src_dc = unsafe { GetDC(None) };
+        if src_dc.is_invalid() {
+            return Err(windows::core::Error::from_win32());
+        }
+        let r = unsafe { BitBlt(mem_dc, 0, 0, w, h, src_dc, x, y, SRCCOPY) };
+        unsafe {
+            let _ = ReleaseDC(None, src_dc);
+        }
         r
     })
 }
 
 /// `PrintWindow`-capture `hwnd`, falling back to a `BitBlt` screen-scrape of
 /// its on-screen rect `(x, y, w, h)` if `PrintWindow` itself fails.
+///
+/// KNOWN GAP (deferred to P3): some GPU-composited surfaces (hardware-
+/// accelerated browsers/games, certain Electron apps) return `PrintWindow ==
+/// TRUE` yet render a BLACK or partially-blank bitmap — the content never
+/// reaches the GDI DC. We can't distinguish that from a legitimately dark
+/// window here (a black-pixel heuristic has real false positives), so P1 does
+/// NOT try to detect it; the honest fallback is to advise capturing the whole
+/// display for such apps. A robust fix needs the Windows.Graphics.Capture
+/// (WGC) API, tracked alongside the OCR/UIA WinRT work.
 fn capture_window_pixels(
     hwnd: HWND,
     x: i32,
