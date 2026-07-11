@@ -326,3 +326,22 @@ static MAC_SCREEN_CAPTURE: mac::capture::MacScreenCapture = mac::capture::MacScr
 pub fn screen_capture() -> &'static dyn ScreenCapture {
     &MAC_SCREEN_CAPTURE
 }
+
+#[cfg(target_os = "macos")]
+static MAC_WINDOW_MANAGER: mac::window::MacWindowManager = mac::window::MacWindowManager;
+
+/// Window/application enumeration and launching (shared capture daemon +
+/// `mdfind`/`open` on macOS).
+#[cfg(target_os = "macos")]
+pub fn window_manager() -> &'static dyn WindowManager {
+    &MAC_WINDOW_MANAGER
+}
+
+#[cfg(target_os = "macos")]
+static MAC_CLIPBOARD: mac::clipboard::MacClipboard = mac::clipboard::MacClipboard;
+
+/// The system clipboard (`pbpaste`/`pbcopy` on macOS).
+#[cfg(target_os = "macos")]
+pub fn clipboard() -> &'static dyn Clipboard {
+    &MAC_CLIPBOARD
+}
