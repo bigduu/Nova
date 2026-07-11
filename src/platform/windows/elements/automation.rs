@@ -194,8 +194,12 @@ const ACTIONABLE_CONTROL_TYPES: &[UIA_CONTROLTYPE_ID] = &[
     UIA_DataItemControlTypeId,
 ];
 
-/// The four click-ish pattern-availability properties, in the SAME preference
-/// order `handle.rs::pattern_for` tries them.
+/// The four click-ish pattern-availability properties. This is an
+/// order-INDEPENDENT availability SET — it only ever gets OR'd together into a
+/// `FindAll` condition (see [`build_actionable_condition`]), where element
+/// order is irrelevant. The actual click-PREFERENCE order (Invoke, then
+/// Toggle, then SelectionItem, then ExpandCollapse) lives solely in
+/// `handle.rs::pattern_for` and is deliberately NOT mirrored here.
 const PATTERN_AVAILABLE_PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_IsInvokePatternAvailablePropertyId,
     UIA_IsTogglePatternAvailablePropertyId,

@@ -43,7 +43,16 @@ impl Clone for WinElementHandle {
     fn clone(&self) -> Self {
         WinElementHandle {
             // Cloning a windows-rs interface wrapper is an `AddRef`, not a
-            // raw-pointer copy — always sound, any thread.
+            // raw-pointer copy — always sound, any thread. Its mirror, the
+            // implicit `Drop` (a COM `Release`), is likewise apartment-
+            // agnostic: `AddRef`/`Release` just adjust a refcount and never
+            // marshal across an apartment boundary, so dropping a handle on a
+            // thread that never joined the MTA is sound — which matters
+            // because `server.rs`'s `set_marks`/`cache.clear()` releases
+            // cached handles from a plain async worker that never calls
+            // `ensure_com_mta()`. (Only the actual UIA METHOD calls —
+            // click/is_alive/current_center — require the MTA join, and each
+            // does it itself.)
             element: self.element.clone(),
             role: self.role.clone(),
             label: self.label.clone(),

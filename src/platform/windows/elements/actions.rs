@@ -28,6 +28,15 @@ use windows::Win32::UI::Accessibility::{IUIAutomationElement, TreeScope_Descenda
 /// "actionable or focusable" candidates (see
 /// `automation::build_queryable_condition`).
 fn find_matching(pid: i32, query: &str) -> Result<IUIAutomationElement, String> {
+    // Every `WinUiTree` entry point establishes DPI awareness (see
+    // `platform::windows`'s doc), so a caller reaching one before `main()`'s
+    // init still gets unscaled coordinates. These query actions never return a
+    // `BoundingRectangle` (they act by pattern/focus, not position), so it has
+    // no coordinate impact TODAY — but keeping the guard here makes the "every
+    // entry point calls it" invariant literally true, so a future `window.rs`
+    // refactor that starts reading rects can't silently break it. Idempotent +
+    // cheap (a `Once` load after the first call).
+    super::super::ensure_dpi_awareness();
     let query_lower = query.to_lowercase();
     let Some(hwnd) = crate::platform::windows::window::first_hwnd_for_pid(pid) else {
         return Err(format!("no on-screen window found for pid {pid}"));
