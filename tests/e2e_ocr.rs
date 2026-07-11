@@ -2,6 +2,10 @@
 //!
 //! Needs Screen Recording permission, so it is `#[ignore]`d by default. Run:
 //!   cargo test --test e2e_ocr -- --ignored --nocapture
+//!
+//! macOS only (Apple Vision via `platform::mac::ocr`; the Windows OCR path is
+//! a P2/P3 stub, see `platform::windows::ocr`).
+#![cfg(target_os = "macos")]
 
 use base64::Engine;
 use nova::capture::screenshot::{finish_capture, CaptureOptions};

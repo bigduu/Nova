@@ -10,6 +10,10 @@
 //! Where a test can verify the system actually observed the event (mouse
 //! position), it asserts; where it cannot without a controlled target app, it is
 //! a smoke test that proves the posting path returns `Ok` and restores state.
+//!
+//! macOS only (drives `platform::mac::input`'s `CGEvent` free functions
+//! directly; the Windows `SendInput` equivalent is `platform::windows::input`).
+#![cfg(target_os = "macos")]
 
 use nova::platform::mac::input::{
     cursor_position, double_click_at, key_combo, left_click_at, mouse_move, right_click_at,

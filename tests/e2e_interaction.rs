@@ -5,6 +5,10 @@
 //! - clipboard uses pbcopy/pbpaste
 //!
 //! Run with: `cargo test --test e2e_interaction`
+//!
+//! macOS only (exercises `platform::mac::geometry`'s `CGDisplay`-backed
+//! coordinate mapping directly; Windows' analog is `platform::windows::geometry`).
+#![cfg(target_os = "macos")]
 
 use nova::platform::mac::geometry::{primary_display, screen_to_logical_coords};
 
