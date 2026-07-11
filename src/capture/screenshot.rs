@@ -175,7 +175,7 @@ fn build_marks(
     // Clip element discovery to the captured view's global-logical rectangle so
     // the walk skips off-screen subtrees (background tabs, scrolled-off rows).
     let clip = (view.origin.0, view.origin.1, view.region.0, view.region.1);
-    for (el, handle) in crate::tools::elements::collect_actionable(pid, 400, Some(clip)) {
+    for (el, handle) in crate::platform::ui_tree().collect_actionable(pid, 400, Some(clip)) {
         let (cx, cy) = el.center();
         let (px, py) = view.to_screenshot(cx, cy);
         // Keep only elements whose center is inside the captured image.
