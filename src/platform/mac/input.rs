@@ -13,7 +13,7 @@
 //!   may ignore it, so it is best-effort for those.
 //!
 //! This is a MOVE from the old `src/tools/input.rs` (part of the
-//! platform-abstraction split — see PARALLEL_PLAN.md): the mechanics below are
+//! platform-abstraction split — see the platform-abstraction move plan): the mechanics below are
 //! unchanged in substance (every timing constant, quirk, and comment
 //! preserved); only the delivery target enum ([`InputTarget`]) stayed behind in
 //! `crate::tools::input`, since `src/tools/batch.rs` and `src/server.rs` name

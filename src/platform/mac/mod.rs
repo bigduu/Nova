@@ -9,6 +9,7 @@
 pub mod capture;
 pub mod clipboard;
 pub mod elements;
+pub mod geometry;
 pub mod input;
 pub mod ocr;
 pub mod window;

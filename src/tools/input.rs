@@ -4,7 +4,7 @@
 //! The actual OS-level input mechanics (CoreGraphics `CGEvent` posting on
 //! macOS) moved to `crate::platform::mac::input` behind
 //! `crate::platform::input()` as part of the platform-abstraction split (see
-//! PARALLEL_PLAN.md at the repo root) — this file only keeps the enum itself,
+//! `crate::platform`) — this file only keeps the enum itself,
 //! since `src/server.rs` and `src/tools/batch.rs` need to name a delivery
 //! target without depending on anything platform-specific.
 

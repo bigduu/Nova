@@ -6,7 +6,7 @@
 //!
 //! Run with: `cargo test --test e2e_interaction`
 
-use nova::display::geometry::{primary_display, screen_to_logical_coords};
+use nova::platform::mac::geometry::{primary_display, screen_to_logical_coords};
 
 /// The center of the screenshot must map to the center of the logical display,
 /// and a screenshot-space corner must map to the display corner. This is the

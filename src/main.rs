@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         // closes the replayd XPC connection these open — leaving it open in the
         // main selftest process would wedge the daemon probe that follows.
         let probe =
-            tokio::task::spawn_blocking(nova::display::geometry::screen_recording_available);
+            tokio::task::spawn_blocking(nova::platform::mac::geometry::screen_recording_available);
         match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
             Ok(Ok(ok)) => eprintln!(
                 "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {ok}"
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
     if cli.selftest {
         // Probe the actual *capture* authorization (CoreGraphics TCC lookup —
         // does NOT touch replayd, so it can't contaminate the daemon probe).
-        let preflight = nova::display::geometry::preflight_screen_capture();
+        let preflight = nova::platform::mac::geometry::preflight_screen_capture();
         eprintln!("[SELFTEST] CGPreflightScreenCaptureAccess() = {preflight}");
 
         // Direct-path probes (SCShareableContent + a private StreamCapturer) in
@@ -301,7 +301,7 @@ async fn main() -> Result<()> {
     // Request Screen Recording access from THIS (server) process before serving —
     // it surfaces the first-run system prompt and is a no-op once granted. Done
     // here, not in the headless capture worker (which can't show a prompt).
-    let screen_ok = nova::display::geometry::request_screen_recording_access();
+    let screen_ok = nova::platform::mac::geometry::request_screen_recording_access();
     tracing::info!(
         "Screen Recording access: {}",
         if screen_ok {
@@ -317,7 +317,7 @@ async fn main() -> Result<()> {
     // across rebuilds and `preflight=false` here even though nova is signed.
     tracing::info!(
         "permission diagnostics: {}",
-        nova::display::geometry::permission_diagnostics()
+        nova::platform::mac::geometry::permission_diagnostics()
     );
 
     if cli.http {

@@ -23,7 +23,7 @@
 //!
 //! This module moved here (from `src/tools/elements/`) unchanged in substance —
 //! every quirk/comment preserved, only its home and its trait wiring changed;
-//! see PARALLEL_PLAN.md. [`MacUiTree`] and [`MacElementHandle`] at the bottom of
+//! see the platform-abstraction move plan. [`MacUiTree`] and [`MacElementHandle`] at the bottom of
 //! this file are the new pieces: thin forwarders onto the moved free
 //! functions/methods, exactly like `MacOcrEngine` in `platform/mac/ocr.rs`.
 //! `UiElement`/`CachedElement` stay reachable at the stable
@@ -51,7 +51,7 @@ pub mod debug;
 pub(crate) mod webclick;
 
 // Public surface carried over unchanged from the old `tools/elements/mod.rs`
-// (see PARALLEL_PLAN.md) — every real call site now goes through
+// — every real call site now goes through
 // `crate::platform::ui_tree()` / the `crate::tools::elements` re-export shim
 // below instead of these paths directly, but the re-exports stay so
 // `actionable_elements`/`TreeWarmer::target` etc. (which have no in-crate
@@ -139,7 +139,7 @@ impl ElementHandle for MacElementHandle {
     }
 
     /// Relocated from `server.rs::click_cached_mark`'s inline web-click branch
-    /// (see PARALLEL_PLAN.md) — behavior is unchanged, just encapsulated behind
+    /// — behavior is unchanged, just encapsulated behind
     /// the trait so the caller no longer needs to know this is web content in a
     /// scriptable browser. Gated on BOTH the element living under an
     /// `AXWebArea` (`model::web_click_point` returns `None` otherwise) AND the

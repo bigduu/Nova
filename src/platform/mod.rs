@@ -298,7 +298,7 @@ pub trait OcrEngine: Send + Sync {
 //      at the end of this file, plus one `pub mod <name>;` line appended in
 //      `platform/mac/mod.rs`. Both are pure line-additions at a stable
 //      position, which is the cheapest possible shape for independent
-//      branches to land without textual conflicts (see PARALLEL_PLAN.md).
+//      branches to land without textual conflicts.
 //      A shared `Platform { ocr: .., capture: .., .. }` struct would instead
 //      make every agent edit the SAME struct literal and the SAME
 //      constructor — guaranteed conflicts every time two land close
@@ -306,7 +306,7 @@ pub trait OcrEngine: Send + Sync {
 //
 // Only OCR has a real implementation so far (the exemplar move); the other
 // capabilities' accessor functions are added by the agent that moves that
-// subsystem (see PARALLEL_PLAN.md).
+// subsystem.
 
 #[cfg(target_os = "macos")]
 static MAC_OCR: mac::ocr::MacOcrEngine = mac::ocr::MacOcrEngine;

@@ -2,7 +2,7 @@
 //!
 //! The Accessibility (AX) machinery that used to live in this directory moved
 //! to `crate::platform::mac::elements` behind the `UiTree`/`ElementHandle`
-//! traits (see PARALLEL_PLAN.md) — real call sites now go through
+//! traits — real call sites now go through
 //! `crate::platform::ui_tree()`. [`UiElement`] and [`CachedElement`] stay
 //! reachable at THIS stable path rather than moving with the rest of the
 //! mac-specific code: `crate::platform::mod.rs`'s `UiTree` trait references

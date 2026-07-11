@@ -80,7 +80,7 @@ impl NovaServer {
         self.view
             .lock()
             .expect("view mutex")
-            .unwrap_or_else(crate::display::geometry::display_view_frame)
+            .unwrap_or_else(crate::platform::mac::geometry::display_view_frame)
     }
 
     /// Convert screenshot-space coordinates (what the LLM sees) into the global
@@ -174,7 +174,7 @@ impl NovaServer {
         // Phase 1: capture via `crate::platform::screen_capture()`. `preflight`
         // in the error distinguishes a real Screen-Recording denial (fix the
         // responsible `parent=` process) from a capture-stack failure.
-        let diag = crate::display::geometry::permission_diagnostics();
+        let diag = crate::platform::mac::geometry::permission_diagnostics();
         let desc = match (region, &window) {
             (Some(rect), _) => format!("Region {rect:?}"),
             (None, Some(query)) => format!("Window {query:?}"),

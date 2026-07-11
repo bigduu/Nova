@@ -8,7 +8,7 @@
 //! and `src/capture/overlay.rs` deliberately STAY at the crate root: they are
 //! the OS-neutral "finish a raw capture" layer (overlays, Set-of-Mark, JPEG
 //! encode) that CONSUMES a [`crate::capture::screenshot::RawCapture`], not
-//! part of the capture CAPABILITY itself. See PARALLEL_PLAN.md for the pattern
+//! part of the capture CAPABILITY itself. See the platform-abstraction move plan for the pattern
 //! the other subsystems follow.
 //!
 //! Window enumeration (`broker::CaptureRequest::Windows` / `WireWindow`) also

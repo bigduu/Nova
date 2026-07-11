@@ -91,8 +91,8 @@ fn e2e_capture_display_returns_valid_jpeg() {
 #[test]
 #[ignore = "requires Screen Recording permission in System Settings"]
 fn e2e_capture_dims_match_target_dims_contract() {
-    use nova::display::geometry::primary_display;
     use nova::display::scaling::compute_target_dims;
+    use nova::platform::mac::geometry::primary_display;
 
     let display = primary_display();
     let expected = compute_target_dims(display.width, display.height);

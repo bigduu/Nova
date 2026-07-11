@@ -4,6 +4,6 @@
 // implementation of `crate::platform::ScreenCapture`. `screenshot` and
 // `overlay` stay here: they are the OS-neutral "finish a raw capture" layer
 // (overlays, Set-of-Mark, JPEG encode) that CONSUMES a capture, not part of
-// the capability itself. See PARALLEL_PLAN.md.
+// the capability itself.
 pub mod overlay;
 pub mod screenshot;

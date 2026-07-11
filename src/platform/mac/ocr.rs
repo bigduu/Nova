@@ -14,7 +14,7 @@
 //! unchanged from the old `src/ocr.rs` (same objc2 FFI quirks — `initWithData`,
 //! the `boundingBox` unsafe/feature gating, the normalized-box Y-flip, safe to
 //! call from a `spawn_blocking` thread); only its home and its trait wiring
-//! moved. See PARALLEL_PLAN.md for the pattern the remaining subsystems follow.
+//! moved. See the platform-abstraction move plan for the pattern the remaining subsystems follow.
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::AnyObject;
 use objc2::AnyThread;

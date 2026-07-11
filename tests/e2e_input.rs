@@ -50,7 +50,7 @@ fn mouse_move_roundtrips_through_cursor_position() {
 #[test]
 #[ignore = "posts real click events on the desktop"]
 fn click_events_post_without_error() {
-    let display = nova::display::geometry::primary_display();
+    let display = nova::platform::mac::geometry::primary_display();
     let original = cursor_position().unwrap_or((0.0, 0.0));
     let (x, y) = (display.width as f64 - 2.0, display.height as f64 - 2.0);
 

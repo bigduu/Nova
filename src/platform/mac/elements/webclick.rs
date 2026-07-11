@@ -38,7 +38,7 @@ impl Browser {
 /// anything we cannot drive via JS-exec AppleScript (non-browsers AND Electron
 /// browsers-in-disguise, which expose no such command).
 pub(crate) fn browser_for_pid(pid: i32) -> Option<Browser> {
-    let exe = crate::display::geometry::proc_path(pid)?;
+    let exe = crate::platform::mac::geometry::proc_path(pid)?;
     // …/Arc.app/Contents/MacOS/Arc → the ".app" path component is the bundle.
     let app = exe.split('/').rfind(|c| c.ends_with(".app"))?;
     let (name, webkit) = match app {
