@@ -175,9 +175,13 @@ impl NovaServer {
         // in the error distinguishes a real Screen-Recording denial (fix the
         // responsible `parent=` process) from a capture-stack failure.
         let diag = crate::platform::mac::geometry::permission_diagnostics();
+        // Matches the old derived-Debug rendering of the broker's
+        // `CaptureRequest` (`Region { rect: (…) }` / `Window { query: "…" }`)
+        // so log lines and the backstop-timeout error stay byte-identical
+        // across the platform-abstraction move.
         let desc = match (region, &window) {
-            (Some(rect), _) => format!("Region {rect:?}"),
-            (None, Some(query)) => format!("Window {query:?}"),
+            (Some(rect), _) => format!("Region {{ rect: {rect:?} }}"),
+            (None, Some(query)) => format!("Window {{ query: {query:?} }}"),
             (None, None) => "Display".to_string(),
         };
         tracing::info!(target: "nova::capture", "capture {desc} — {diag}");
