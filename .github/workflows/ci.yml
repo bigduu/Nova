@@ -60,8 +60,12 @@ jobs:
   # link, so no MSVC/Windows runner is needed (rustup ships the target's
   # precompiled std). ~15s once cached. This catches Windows-only breakage the
   # macOS `test` job above cannot see (the windows-crate FFI is entirely behind
-  # `[target.'cfg(target_os = "windows")']` gating). Full native link/run
-  # verification is done out-of-band on a real ARM64 Windows 11 VM.
+  # `[target.'cfg(target_os = "windows")']` gating), on every push/PR. Full
+  # native link (and now packaging) happens on every version tag in
+  # release.yml's `build-windows` job (real windows-latest/windows-11-arm
+  # runners); ad-hoc runtime/behavior verification beyond that (actually
+  # exercising screenshot/UIA/OCR against a live desktop) is still done
+  # out-of-band on a real ARM64 Windows 11 VM.
   windows-cross-check:
     runs-on: ubuntu-latest
     steps:

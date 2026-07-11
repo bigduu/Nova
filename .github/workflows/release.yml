@@ -4,7 +4,11 @@ name: Release
 # binary (arm64 + x86_64), ad-hoc signed, attached to a GitHub Release; then
 # (optionally, when the corresponding secrets exist) updates the Homebrew tap
 # and publishes the npm wrapper so people can install Nova as an MCP server
-# without building from source.
+# without building from source. In parallel, it also builds real (linked, not
+# just checked) Windows exes for x86_64 + aarch64 and attaches those to the
+# same Release as .zip + .sha256 — see the `build-windows`/`release-windows`
+# jobs below. Windows has no Homebrew/npm equivalent here; it is
+# release-artifact-only (consumed by URL+checksum, e.g. by a plugin manifest).
 #
 # Trigger:  git tag v0.1.0 && git push origin v0.1.0
 # Manual:   Actions → Release → Run workflow (provide the tag)
@@ -113,6 +117,158 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.asset }}
             ${{ steps.pkg.outputs.asset }}.sha256
+
+  # ── Resolve version/tag for the Windows jobs below ────────────────────
+  # The mac `build` job above computes the identical thing inline (kept
+  # untouched); duplicated here as its own tiny job — rather than threading
+  # it through `build`'s outputs — so the Windows path has zero coupling to
+  # the mac job and can genuinely run in parallel with it.
+  windows-meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: meta
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+          # Same guard as the mac job: never publish a Windows asset labeled
+          # with a version that doesn't match what's actually built.
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $REF (=$VERSION) != Cargo.toml version $CARGO_VERSION — bump Cargo.toml or fix the tag"
+            exit 1
+          fi
+
+  # ── Build real Windows exes (LINKED, not the CI cross-check) ──────────
+  # `ci.yml`'s `windows-cross-check` job only `cargo check`/`clippy`'s the
+  # aarch64 target from an Ubuntu runner — it never links. This job builds
+  # on REAL Windows runners so the release actually ships a runnable .exe.
+  # Runs independently of the mac `build` job (no `needs: build`) so the two
+  # builds happen in parallel; only the asset-upload job below waits on mac.
+  #
+  # Target matrix:
+  #   x86_64-pc-windows-msvc  on windows-latest — standard hosted x64 runner.
+  #   aarch64-pc-windows-msvc on windows-11-arm — hosted Windows-on-Arm
+  #     runner, GA for public repos (free/unlimited, same as the x64 runner;
+  #     see github.blog/changelog/2025-04-14-windows-arm64-hosted-runners-
+  #     now-available-in-public-preview). This gives a NATIVE arm64 build —
+  #     no brittle cross-linking of aarch64-pc-windows-msvc off an x64 host.
+  #     Real-link confidence: `cargo build --release --target
+  #     aarch64-pc-windows-msvc` was verified end-to-end on a real ARM64
+  #     Windows 11 machine (rustc/cargo + MSVC) while landing this workflow —
+  #     it linked in ~2 minutes and the resulting nova.exe ran `--version`/
+  #     `--help` correctly. `fail-fast: false` so a hiccup on the newer arm64
+  #     runner can't take down the x64 artifact.
+  build-windows:
+    needs: windows-meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test (confirms the exe actually links + runs, not just compiles)
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/nova.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "nova --version exited $LASTEXITCODE" }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "nova --help exited $LASTEXITCODE" }
+
+      # No code-signing here: there is no Authenticode cert / HSM for Nova
+      # yet (only the mac job's ad-hoc codesign exists, which is a different,
+      # cert-free mechanism unique to macOS). An unsigned .exe means Windows
+      # SmartScreen will show an "unrecognized publisher" warning ("Windows
+      # protected your PC") on first run — expected until a cert is obtained;
+      # tracked as a follow-up, not a defect in this job.
+      - name: Package zip + sha256
+        id: pkg
+        shell: pwsh
+        run: |
+          $version = "${{ needs.windows-meta.outputs.version }}"
+          $target  = "${{ matrix.target }}"
+          $asset   = "nova-v$version-$target.zip"
+          Copy-Item "target/$target/release/nova.exe" -Destination "nova.exe"
+          Compress-Archive -Path "nova.exe" -DestinationPath $asset -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          "$hash  $asset" | Set-Content -Encoding ascii "$asset.sha256"
+          echo "asset=$asset" >> $env:GITHUB_OUTPUT
+          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Host "Built $asset — sha256 $hash"
+
+      - name: Upload build artifact (attached to the Release by release-windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  # ── Attach the Windows archives to the SAME GitHub Release the mac
+  # `build` job creates ─────────────────────────────────────────────────
+  # Deliberately waits on `build` (mac) even though the compiles above don't:
+  # two concurrent `action-gh-release` calls racing to create-or-update the
+  # SAME brand-new tag is a real TOCTOU hazard, so this job only runs once
+  # the mac job has already created the Release, then just attaches assets
+  # to it. Still tolerant of a partial `build-windows` matrix (see the `if:`
+  # below): if only one arch's leg succeeded, whichever .zip/.sha256 exist
+  # get uploaded — matches the "ship x86_64 for sure" fallback.
+  release-windows:
+    runs-on: ubuntu-latest
+    needs: [build, build-windows, windows-meta]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.windows-meta.result == 'success' }}
+    steps:
+      - name: Download Windows build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: dist
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          # Fail loudly if BOTH build-windows legs failed (this job isn't gated on
+          # build-windows so a total-failure would otherwise attach nothing and
+          # still go green). A partial matrix success still ships the arch that built.
+          fail_on_unmatched_files: true
+          files: |
+            dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip
+            dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip.sha256
 
   # ── Which optional publish steps can run (presence of their secrets) ──
   gate:
