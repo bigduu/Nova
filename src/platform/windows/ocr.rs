@@ -38,8 +38,11 @@
 //! `IAsyncOperation<T>` from an MTA thread (no message pump) is the
 //! documented, supported way to wait on a WinRT async call synchronously — we
 //! deliberately do NOT pull in an async executor for this, since `recognize`
-//! is always invoked from a `tokio::spawn_blocking` thread (see
-//! `server.rs`'s `ocr` tool handler).
+//! is always invoked from a blocking context: the `ocr` MCP tool runs it on a
+//! `tokio::spawn_blocking` thread (see `server.rs`'s `ocr` tool handler), and
+//! the one-shot `--ocr-probe` CLI diagnostic (see `main.rs`) calls it directly
+//! on a process that exits right after — neither drives an async runtime that
+//! the blocking `.get()` could stall.
 //!
 //! # Confidence
 //!
@@ -50,7 +53,9 @@
 //! should not assume the two OSes' values carry the same meaning.
 use windows::core::HSTRING;
 use windows::Globalization::Language;
-use windows::Graphics::Imaging::{BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
+use windows::Graphics::Imaging::{
+    BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap,
+};
 use windows::Media::Ocr::OcrEngine as WinRtOcrEngine;
 use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
@@ -130,8 +135,23 @@ fn decode_to_bgra8(image: &[u8]) -> Result<SoftwareBitmap, String> {
     // a JPEG screenshot typically decodes straight to Bgra8 already, so this
     // is then a cheap no-op copy; a PNG with an alpha channel is the case that
     // actually needs it.
-    SoftwareBitmap::Convert(&bitmap, BitmapPixelFormat::Bgra8)
-        .map_err(|e| format!("SoftwareBitmap::Convert(Bgra8) failed: {e}"))
+    //
+    // `ConvertWithAlpha(_, _, Premultiplied)`, NOT the 2-arg `Convert`: MS
+    // guidance/samples force PREMULTIPLIED alpha before `RecognizeAsync`, and a
+    // Straight-alpha Bgra8 bitmap makes `RecognizeAsync` throw "value does not
+    // fall within the expected range". Today's inputs are always alpha-less
+    // JPEG screenshots (so the 2-arg `Convert`'s default would be fine), but
+    // the alpha branch this comment reasons about — a PNG with a real alpha
+    // channel, which the trait contract's "JPEG/PNG bytes" explicitly allows —
+    // must actually be correct, so pin Premultiplied unconditionally.
+    // (In windows-rs the 3-arg WinRT overload is projected as the distinct
+    // name `ConvertWithAlpha`, not `Convert` with a third argument.)
+    SoftwareBitmap::ConvertWithAlpha(
+        &bitmap,
+        BitmapPixelFormat::Bgra8,
+        BitmapAlphaMode::Premultiplied,
+    )
+    .map_err(|e| format!("SoftwareBitmap::ConvertWithAlpha(Bgra8, Premultiplied) failed: {e}"))
 }
 
 /// Recognize text in `image` (`img_w` × `img_h` pixels) using `languages`
@@ -160,7 +180,15 @@ pub fn recognize(image: &[u8], languages: &[&str]) -> Result<Vec<OcrLine>, Strin
         if text.trim().is_empty() {
             continue;
         }
-        let Ok(words) = line.Words() else { continue };
+        let words = match line.Words() {
+            Ok(words) => words,
+            Err(e) => {
+                // Drop the line rather than fabricate a (0,0) center, but leave
+                // a trail so a "fewer lines than expected" symptom is traceable.
+                tracing::debug!("dropping recognized line {text:?}: Words() failed: {e}");
+                continue;
+            }
+        };
         // Union every word's bounding rect into one line-level box — Windows
         // exposes no single per-line rect (only per-word), unlike Vision's
         // single `boundingBox` per observation.
@@ -176,6 +204,9 @@ pub fn recognize(image: &[u8], languages: &[&str]) -> Result<Vec<OcrLine>, Strin
             });
         }
         let Some((left, top, right, bottom)) = union else {
+            // Every word's BoundingRect failed (or the line had no words) — no
+            // box to place a clickable center at. Same drop-with-a-trail policy.
+            tracing::debug!("dropping recognized line {text:?}: no usable word bounding rect");
             continue;
         };
         lines.push(OcrLine {
