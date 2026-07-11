@@ -742,7 +742,8 @@ mod wgc {
     //! just means this function returns non-representative pixels, same as
     //! `PrintWindow` would; a real screenshot of a real window is still
     //! produced.
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
     use windows::core::Interface;
     use windows::Foundation::TypedEventHandler;
@@ -1015,11 +1016,28 @@ mod wgc {
         let (tx, rx) = mpsc::sync_channel::<Result<image::RgbImage, String>>(1);
         let device_for_handler = d3d.device.clone();
         let context_for_handler = d3d.context.clone();
+        // Guards the race between a timed-out main thread tearing down the
+        // session/pool (`RemoveFrameArrived`/`Close` below) and a
+        // `FrameArrived` callback already mid-flight in the GPU copy/map —
+        // low-probability but crash-class (more likely on a virtualized GPU).
+        // `RemoveFrameArrived` only stops FUTURE events; it doesn't wait out
+        // one already running. Checked at the top of the handler and set
+        // right after a successful `try_send`, so once the first frame is
+        // delivered every subsequent invocation (the 2-buffer pool keeps
+        // firing) returns immediately instead of redoing the GPU copy/map —
+        // which also shrinks the teardown race to near-zero, since no
+        // further handler invocation touches the D3D device/context after
+        // delivery.
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_for_handler = Arc::clone(&delivered);
         let token = pool
             .FrameArrived(&TypedEventHandler::<
                 Direct3D11CaptureFramePool,
                 windows::core::IInspectable,
             >::new(move |sender, _args| {
+                if delivered_for_handler.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let result = (|| -> Result<image::RgbImage, String> {
                     let sender = sender
                         .as_ref()
@@ -1027,12 +1045,22 @@ mod wgc {
                     let frame = sender
                         .TryGetNextFrame()
                         .map_err(|e| format!("TryGetNextFrame failed: {e}"))?;
-                    frame_to_rgb(&device_for_handler, &context_for_handler, &frame)
+                    let rgb = frame_to_rgb(&device_for_handler, &context_for_handler, &frame);
+                    // Explicitly release the frame back to the pool's buffer
+                    // slot right after pulling its pixels, rather than
+                    // waiting on `frame`'s ordinary `Drop` — this module only
+                    // ever grabs ONE frame per call; a window/pool resize
+                    // mid-capture is out of scope (one-shot single-frame
+                    // grab).
+                    let _ = frame.Close();
+                    rgb
                 })();
                 // Bounded (1) channel: if a frame somehow already delivered
                 // (a second FrameArrived firing before we unsubscribe below),
                 // `try_send` just drops this one — we only need the first.
-                let _ = tx.try_send(result);
+                if tx.try_send(result).is_ok() {
+                    delivered_for_handler.store(true, Ordering::Release);
+                }
                 Ok(())
             }))
             .map_err(|e| format!("FrameArrived subscribe failed: {e}"))?;
