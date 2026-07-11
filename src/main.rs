@@ -83,6 +83,14 @@ struct Cli {
     /// the first actionable element found.
     #[arg(long, value_name = "SUBSTR")]
     uia_probe_query: Option<String>,
+
+    /// DEBUG: list every on-screen window (title, owning app, frame,
+    /// visibility) nova's `WindowManager`/`list_windows` sees, then exit. No
+    /// MCP needed. Useful to sanity-check window enumeration/attribution
+    /// directly (e.g. a UWP app's `ApplicationFrameHost` pid quirk) without
+    /// guessing from a screenshot.
+    #[arg(long)]
+    list_windows: bool,
 }
 
 #[tokio::main]
@@ -172,6 +180,21 @@ async fn main() -> Result<()> {
     }
     if let Some(app) = cli.uia_probe.as_deref() {
         return run_uia_probe(app, cli.uia_probe_query.as_deref());
+    }
+    if cli.list_windows {
+        match nova::tools::window::list_windows() {
+            Ok(windows) => {
+                eprintln!("[list-windows] {} on-screen windows:", windows.len());
+                for w in windows {
+                    println!(
+                        "{:?} app={:?} @({:.0},{:.0} {:.0}x{:.0}) visible={}",
+                        w.title, w.app_name, w.x, w.y, w.width, w.height, w.is_visible
+                    );
+                }
+            }
+            Err(e) => eprintln!("[list-windows] failed: {e}"),
+        }
+        return Ok(());
     }
 
     // Per-OS permission/capability diagnostics, logged once before serving.
