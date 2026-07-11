@@ -13,3 +13,9 @@
 //! ElementHandle>` underneath.
 #[cfg(target_os = "macos")]
 pub use crate::platform::mac::elements::{CachedElement, UiElement};
+
+/// Same re-export, from the Windows sibling (`platform::windows::elements`) —
+/// field-for-field identical types (see that module's doc for why they exist
+/// even though `collect_actionable` never constructs one there yet).
+#[cfg(target_os = "windows")]
+pub use crate::platform::windows::elements::{CachedElement, UiElement};
