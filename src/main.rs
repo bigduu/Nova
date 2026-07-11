@@ -84,6 +84,17 @@ struct Cli {
     #[arg(long, value_name = "SUBSTR")]
     uia_probe_query: Option<String>,
 
+    /// DEBUG: Windows-only WGC smoke test (P4). Resolves the window/app
+    /// matching this substring, then captures it via BOTH the raw
+    /// `PrintWindow`-only path (the pre-P4 behavior — expected mean≈0/
+    /// variance≈0, i.e. black, on a GPU-composited window) and the new
+    /// `Windows.Graphics.Capture` path (expected high-variance, non-black),
+    /// printing per-channel pixel mean/variance for each and saving a JPEG of
+    /// each to the temp dir. Proves the black-bitmap fix against a REAL live
+    /// window, not just that it compiles. No MCP needed.
+    #[arg(long, value_name = "APP")]
+    capture_probe: Option<String>,
+
     /// DEBUG: list every on-screen window (title, owning app, frame,
     /// visibility) nova's `WindowManager`/`list_windows` sees, then exit. No
     /// MCP needed. Useful to sanity-check window enumeration/attribution
@@ -200,6 +211,9 @@ async fn main() -> Result<()> {
     }
     if let Some(app) = cli.uia_probe.as_deref() {
         return run_uia_probe(app, cli.uia_probe_query.as_deref());
+    }
+    if let Some(app) = cli.capture_probe.as_deref() {
+        return run_capture_probe(app);
     }
     if cli.list_windows {
         match nova::tools::window::list_windows() {
@@ -688,6 +702,36 @@ fn run_ocr_probe(_app: &str) -> Result<()> {
     eprintln!(
         "--ocr-probe is Windows-only (an end-to-end Windows.Media.Ocr capture+recognize smoke \
          test); macOS's Apple Vision OCR path is already exercised live by the `ocr` MCP tool."
+    );
+    Ok(())
+}
+
+// ── --capture-probe (Windows WGC P4 smoke test) ───────────────────────
+
+/// Run BOTH window-capture paths (raw `PrintWindow`-only, then WGC) against
+/// the same live window matching `app` and print pixel-statistics evidence
+/// for each — see `platform::windows::capture::capture_probe`'s doc for what
+/// "evidence" means here (mean/variance contrast) and why the two paths are
+/// run independently rather than short-circuiting on the first success.
+#[cfg(target_os = "windows")]
+fn run_capture_probe(app: &str) -> Result<()> {
+    match nova::platform::windows::capture::capture_probe(app) {
+        Ok(report) => print!("{report}"),
+        Err(e) => eprintln!("[capture-probe] {app:?} -> failed: {e}"),
+    }
+    Ok(())
+}
+
+/// `--capture-probe` is Windows-only — it exists specifically to smoke-test
+/// the new Windows.Graphics.Capture path (P4) against the `PrintWindow`
+/// black-bitmap bug, which has no macOS analog (ScreenCaptureKit never had
+/// this failure mode).
+#[cfg(target_os = "macos")]
+fn run_capture_probe(_app: &str) -> Result<()> {
+    eprintln!(
+        "--capture-probe is Windows-only (a P4 Windows.Graphics.Capture vs. PrintWindow \
+         pixel-stats smoke test); macOS's ScreenCaptureKit capture has no black-bitmap bug to \
+         demonstrate a fix for."
     );
     Ok(())
 }
