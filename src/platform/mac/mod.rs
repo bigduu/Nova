@@ -11,9 +11,9 @@
 //! this list rather than reordering, so parallel branches touching this file
 //! don't collide on more than the one new line each adds.
 
-pub mod ocr;
 pub mod capture;
-pub mod window;
 pub mod clipboard;
-pub mod input;
 pub mod elements;
+pub mod input;
+pub mod ocr;
+pub mod window;
