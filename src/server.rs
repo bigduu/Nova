@@ -1195,13 +1195,15 @@ impl NovaServer {
 
     #[tool(
         name = "ax_click",
-        description = "Press a UI control directly through the macOS Accessibility tree — no \
-                       coordinates, no cursor movement, works in the background (the app need not \
-                       be frontmost). `query` is a case-insensitive substring of the element's \
-                       accessibility role or label/title (e.g. \"Send\", \"Search\"). Targets the \
-                       last window-captured app (or the frontmost app). Only works for apps that \
-                       expose an accessibility tree; if it returns \"no element matching\", fall \
-                       back to screenshot + left_click."
+        description = "Press a UI control directly through the OS accessibility tree (macOS \
+                       Accessibility; Windows UI Automation is not yet implemented and returns a \
+                       clear error) — no coordinates, no cursor movement, works in the background \
+                       (the app need not be frontmost). `query` is a case-insensitive substring of \
+                       the element's accessibility role or label/title (e.g. \"Send\", \"Search\"). \
+                       Targets the last window-captured app (or the frontmost app). Only works for \
+                       apps that expose an accessibility tree; if it returns \"no element \
+                       matching\" (or the not-implemented error), fall back to screenshot + \
+                       left_click."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_click(
@@ -1219,10 +1221,12 @@ impl NovaServer {
 
     #[tool(
         name = "ax_set_value",
-        description = "Set a control's value directly through the Accessibility tree — e.g. fill a \
-                       text field without focusing or typing. Background, no cursor. `query` \
-                       matches the element's role/label; `value` is the text to set. Targets the \
-                       last window-captured app (or frontmost). Native-app accessibility only."
+        description = "Set a control's value directly through the OS accessibility tree (macOS \
+                       Accessibility; not yet implemented on Windows, where it returns a clear \
+                       error) — e.g. fill a text field without focusing or typing. Background, no \
+                       cursor. `query` matches the element's role/label; `value` is the text to \
+                       set. Targets the last window-captured app (or frontmost). Native-app \
+                       accessibility only."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_set_value(
@@ -1240,9 +1244,11 @@ impl NovaServer {
 
     #[tool(
         name = "ax_focus",
-        description = "Move keyboard focus to a control through the Accessibility tree (background, \
-                       no cursor). `query` matches the element's role/label. Targets the last \
-                       window-captured app (or frontmost). Native-app accessibility only."
+        description = "Move keyboard focus to a control through the OS accessibility tree (macOS \
+                       Accessibility; not yet implemented on Windows, where it returns a clear \
+                       error). Background, no cursor. `query` matches the element's role/label. \
+                       Targets the last window-captured app (or frontmost). Native-app \
+                       accessibility only."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_focus(
