@@ -54,3 +54,36 @@ jobs:
       # run them locally with `cargo test -- --include-ignored`.
       - name: Test
         run: cargo test --verbose
+
+  # Windows port (src/platform/windows) gate. CROSS-COMPILES to
+  # aarch64-pc-windows-msvc from an ubuntu runner — `cargo check`/`clippy` never
+  # link, so no MSVC/Windows runner is needed (rustup ships the target's
+  # precompiled std). ~15s once cached. This catches Windows-only breakage the
+  # macOS `test` job above cannot see (the windows-crate FFI is entirely behind
+  # `[target.'cfg(target_os = "windows")']` gating). Full native link/run
+  # verification is done out-of-band on a real ARM64 Windows 11 VM.
+  windows-cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (+ Windows target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-winxcheck-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check (Windows target)
+        run: cargo check --target aarch64-pc-windows-msvc --all-targets
+
+      - name: Clippy (Windows target)
+        run: cargo clippy --target aarch64-pc-windows-msvc --all-targets -- -D warnings
