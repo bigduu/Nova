@@ -108,6 +108,27 @@ objc2-vision = { version = "0.3", default-features = false, features = ["VNReque
 #                                      also a transitive requirement of
 #                                      UI_Accessibility's SAFEARRAY-bearing
 #                                      methods)
+#   - Media_Ocr (P3)                 — `Windows::Media::Ocr::OcrEngine` &c.,
+#                                      the WinRT analog of macOS's Apple
+#                                      Vision OCR (`platform::windows::ocr`)
+#   - Graphics_Imaging (P3)          — `SoftwareBitmap`/`BitmapDecoder` (decode
+#                                      the same JPEG/PNG bytes a `screenshot`
+#                                      produces into the pixel buffer OCR
+#                                      needs)
+#   - Storage_Streams (P3)           — `InMemoryRandomAccessStream`/`DataWriter`
+#                                      (wrap the encoded image bytes in a WinRT
+#                                      stream `BitmapDecoder` can read)
+#   - Globalization (P3)             — `Language`/`OcrEngine::TryCreateFromLanguage`
+#                                      (BCP-47 -> WinRT `Language`, and the
+#                                      per-language OCR-pack lookup)
+#   - Foundation / Foundation_Collections (P3) — `IAsyncOperation<T>::get()`
+#                                      (blocking wait -- no async executor
+#                                      needed, see `platform::windows::ocr`'s
+#                                      module doc) and `IVectorView<T>`
+#                                      iteration (`OcrResult::Lines()`/
+#                                      `OcrLine::Words()`, both gated on this
+#                                      feature in the `windows` crate's own
+#                                      generated bindings)
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -125,4 +146,10 @@ windows = { version = "0.58", features = [
     "Win32_Storage_Xps",
     "Win32_UI_Accessibility",
     "Win32_System_Com",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Globalization",
+    "Foundation",
+    "Foundation_Collections",
 ] }
