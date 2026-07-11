@@ -709,14 +709,12 @@ mod wgc {
     //! WinRT activation (`factory::<GraphicsCaptureItem, _>()`,
     //! `CreateForWindow`, `CreateDirect3D11DeviceFromDXGIDevice`) needs this
     //! thread joined to the process's Multi-Threaded Apartment, exactly like
-    //! UI Automation (`platform::windows::elements::automation::
-    //! ensure_com_mta`, which an in-flight, concurrently-developed PR is
-    //! promoting to `pub(crate)` on this same file tree). To avoid a merge
-    //! race with that PR, THIS module keeps its own temporary, private
-    //! `CoInitializeEx(MULTITHREADED)` join below rather than depending on
-    //! that helper's new visibility before it lands — it is a deliberate,
-    //! reviewed duplicate, not an oversight, and is expected to be collapsed
-    //! into the shared helper in a follow-up once both PRs are merged.
+    //! UI Automation — this module reuses `platform::windows::elements::
+    //! automation::ensure_com_mta` (`pub(crate)`) rather than keeping its own
+    //! duplicate join: same idempotent-per-thread `CoInitializeEx
+    //! (MULTITHREADED)`, and `CoInitializeEx` itself is refcounted per OS
+    //! thread, so sharing the one thread-local join across both modules is
+    //! harmless.
     //!
     //! # The RowPitch gotcha (read before touching [`frame_to_rgb`])
     //!
@@ -742,6 +740,7 @@ mod wgc {
     //! just means this function returns non-representative pixels, same as
     //! `PrintWindow` would; a real screenshot of a real window is still
     //! produced.
+    use crate::platform::windows::elements::automation::ensure_com_mta;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
@@ -773,33 +772,6 @@ mod wgc {
     /// frame) can take a few compositor vsyncs on a loaded system; 3s is
     /// generous headroom without hanging a `screenshot` call for long.
     const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
-
-    thread_local! {
-        /// TEMPORARY duplicate of `platform::windows::elements::automation`'s
-        /// `COM_MTA_JOINED` — see this module's doc for why it isn't reused
-        /// as-is yet. Same idempotent-per-thread, never-`CoUninitialize`d
-        /// design: join is a per-thread refcount bump, and these are
-        /// long-lived tokio blocking-pool threads, so leaking the join until
-        /// thread exit (OS/CRT-cleaned) is simpler and sound.
-        static COM_MTA_JOINED: () = {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-            // SAFETY: `None`/`COINIT_MULTITHREADED` are documented, pointer-free
-            // arguments; safe to call from any thread, any number of times.
-            let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            if hr.is_err() {
-                tracing::warn!(
-                    "CoInitializeEx(COINIT_MULTITHREADED) returned {hr:?} on this thread — WGC \
-                     calls here may fail (see platform::windows::capture::wgc's module doc)"
-                );
-            }
-        };
-    }
-
-    /// Join this thread to the process's Multi-Threaded Apartment. MUST run
-    /// before any WinRT/D3D11 activation below.
-    fn ensure_com_mta() {
-        COM_MTA_JOINED.with(|_| {});
-    }
 
     /// The D3D11 device/context this module creates once per capture, plus
     /// the WinRT-wrapped handle to the SAME device the frame pool needs.
