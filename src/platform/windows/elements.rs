@@ -96,8 +96,10 @@ impl UiTree for WinUiTree {
         // coordinate-click fallback (server.rs::click_cached_mark) still has
         // SOMETHING to call even though marks are never produced on Windows
         // today (this only ever runs if a future caller manually constructs a
-        // CachedElement) — cheap to wire up now, and free of new surface.
-        crate::platform::windows::window::raise_pid(pid);
+        // CachedElement) — cheap to wire up now, and free of new surface. The
+        // bool (whether a window was actually raised) is irrelevant to a
+        // best-effort pre-click raise, so it is intentionally discarded.
+        let _ = crate::platform::windows::window::raise_pid(pid);
     }
 
     fn dump_tree(&self, _pid: i32, _max_nodes: usize) -> String {
