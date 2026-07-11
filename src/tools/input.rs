@@ -28,7 +28,11 @@ impl InputTarget {
     /// `pub(crate)` rather than private: the macOS `InputInjector`
     /// implementation (`crate::platform::mac::input`) is a different module
     /// post-move and reads this to decide whether to glide the real cursor
-    /// before posting a click/scroll.
+    /// before posting a click/scroll. Windows' `InputInjector`
+    /// (`platform::windows::input`) always delivers via the global `SendInput`
+    /// queue regardless of `InputTarget` (see that module's doc), so it never
+    /// reads this — legitimately unused, not dead code, on a non-macOS build.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn is_global(self) -> bool {
         matches!(self, InputTarget::Global)
     }

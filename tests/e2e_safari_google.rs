@@ -15,6 +15,10 @@
 //! Note: navigation uses the MOUSE to focus the address bar (this machine's ⌘L is
 //! remapped), located through the Accessibility tree rather than a hard-coded
 //! pixel, with a geometric top-of-window fallback.
+//!
+//! macOS only — drives Safari specifically through `platform::mac::*` free
+//! functions directly (capture stream, CGEvent input, Vision OCR).
+#![cfg(target_os = "macos")]
 
 use std::time::{Duration, Instant};
 

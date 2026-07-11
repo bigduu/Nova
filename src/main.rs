@@ -4,7 +4,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Nova — Computer Use MCP Server
 ///
-/// A macOS desktop control MCP server that gives LLMs the ability to
+/// A macOS + Windows desktop control MCP server that gives LLMs the ability to
 /// capture screenshots, control mouse/keyboard, manage windows, and introspect apps.
 #[derive(Parser, Debug)]
 #[command(name = "nova", version, about)]
@@ -18,13 +18,14 @@ struct Cli {
     addr: String,
 
     /// Self-test: do a direct capture (no MCP server) and print timing, then exit.
+    /// macOS only — see `run_selftest`'s Windows arm.
     #[arg(long)]
     selftest: bool,
 
     /// INTERNAL: the SCK-touching half of --selftest, run in a SACRIFICIAL
     /// subprocess. Any process that touches ScreenCaptureKit becomes a replayd
     /// client that collides with the daemon (same-binary identity), so the
-    /// direct-stream probe must die before the daemon probe runs.
+    /// direct-stream probe must die before the daemon probe runs. macOS only.
     #[arg(long, hide = true)]
     selftest_direct: bool,
 
@@ -32,14 +33,15 @@ struct Cli {
     /// ScreenCaptureKit client all nova processes route captures through (two
     /// same-binary processes holding replayd streams evict each other's XPC
     /// identity and wedge — see platform::mac::capture::broker). Spawned on demand; elected
-    /// via a flock. Not for direct use.
+    /// via a flock. Not for direct use. macOS only — Windows' PrintWindow/
+    /// BitBlt capture is synchronous and needs no daemon.
     #[arg(long, hide = true)]
     capture_daemon: bool,
 
     /// INTERNAL (legacy): old pipe-protocol capture worker, kept as a thin
     /// proxy that forwards to the capture daemon — still-running nova servers
     /// from pre-daemon builds spawn this from the binary on disk. Not for
-    /// direct use.
+    /// direct use. macOS only.
     #[arg(long, hide = true)]
     capture_worker: bool,
 
@@ -56,13 +58,13 @@ struct Cli {
     /// DEBUG: hit-test a grid over the content area of the app matching this
     /// substring and print, per distinct element, its role/actions and whether
     /// the actionable-ancestor climb accepts it. Shows WHY visible rows aren't
-    /// marked. No MCP needed.
+    /// marked. No MCP needed. macOS only (Accessibility-specific diagnostic).
     #[arg(long, value_name = "APP")]
     hit_dump: Option<String>,
 
     /// DEBUG: in ONE process, enable web-AX then probe the app repeatedly over
     /// several rounds — tests whether a long-lived process stabilizes Chromium's
-    /// full semantic tree (the "Homerow way"). No MCP needed.
+    /// full semantic tree (the "Homerow way"). No MCP needed. macOS only.
     #[arg(long, value_name = "APP")]
     ax_warm: Option<String>,
 }
@@ -79,27 +81,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Bootstrap the CoreGraphics / window-server connection BEFORE any
-    // ScreenCaptureKit call. Without this, capture from this subprocess either
-    // SIGABRTs (CGS_REQUIRE_INIT) or hangs in replayd-connection churn. See
-    // `nova::platform::mac::capture::init_core_graphics`.
-    nova::platform::mac::capture::init_core_graphics();
+    // Per-OS one-time process bootstrap that must run before any capture/
+    // window/input call: macOS needs the CoreGraphics window-server connection
+    // forced up front (see the macOS arm below); Windows needs Per-Monitor-
+    // DPI-v2 declared before any coordinate query (see
+    // `platform::windows::init_dpi_awareness`'s doc for why).
+    platform_startup_bootstrap();
 
-    // Shared capture daemon: serve capture requests over the per-user socket.
-    // (Bootstrap above already ran, which is exactly what this process needs.)
-    //
-    // These low-level `--capture-daemon`/`--capture-worker`/`--selftest*`
-    // paths are diagnostics/plumbing for the capture daemon ITSELF, not
-    // tool-layer logic — they call `platform::mac::capture` directly,
-    // bypassing the `ScreenCapture` trait, same rationale as the debug CLI's
-    // direct `tools::elements`/`tools::window` calls below.
-    if cli.capture_daemon {
-        nova::platform::mac::capture::broker::run_daemon();
-    }
-    // Legacy worker entry point: proxy the old pipe protocol into the daemon.
-    if cli.capture_worker {
-        nova::platform::mac::capture::broker::run_worker_proxy();
-    }
+    // Shared capture daemon: serve capture requests over the per-user socket
+    // (macOS only — see `maybe_run_capture_daemon`'s doc).
+    maybe_run_capture_daemon(&cli);
 
     tracing::info!(
         "Nova Computer Use MCP Server v{}",
@@ -111,131 +102,20 @@ async fn main() -> Result<()> {
     );
 
     if cli.selftest_direct {
-        // SCK-touching probes, isolated in this short-lived process. Our exit
-        // closes the replayd XPC connection these open — leaving it open in the
-        // main selftest process would wedge the daemon probe that follows.
-        let probe =
-            tokio::task::spawn_blocking(nova::platform::mac::geometry::screen_recording_available);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
-            Ok(Ok(ok)) => eprintln!(
-                "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {ok}"
-            ),
-            _ => eprintln!(
-                "[SELFTEST] screen_recording_available() TIMED OUT after 5s — \
-                 SCShareableContent itself is wedged"
-            ),
-        }
-        let t = std::time::Instant::now();
-        let h = tokio::task::spawn_blocking(|| {
-            nova::platform::mac::capture::stream::StreamCapturer::new().capture_display()
-        });
-        match tokio::time::timeout(std::time::Duration::from_secs(10), h).await {
-            Ok(Ok(Ok(raw))) => {
-                eprintln!(
-                    "[SELFTEST] direct stream: OK {}x{} in {:.0} ms",
-                    raw.image.width(),
-                    raw.image.height(),
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            Ok(Ok(Err(e))) => eprintln!("[SELFTEST] direct stream: capture error: {e}"),
-            Ok(Err(e)) => eprintln!("[SELFTEST] direct stream: join error: {e}"),
-            Err(_) => eprintln!(
-                "[SELFTEST] direct stream: TIMED OUT after 10s — another process is \
-                 holding a ScreenCaptureKit stream (a live capture daemon is normal \
-                 here; a wedge is not)"
-            ),
-        }
-        // NOTE: process::exit, not return — Runtime::drop would WAIT for a
-        // wedged spawn_blocking thread (uncancellable SCK condvar) and this
-        // child would never exit; and only process death closes the replayd
-        // connection the probes opened.
-        std::process::exit(0);
+        run_selftest_direct().await;
     }
 
     if cli.selftest {
-        // Probe the actual *capture* authorization (CoreGraphics TCC lookup —
-        // does NOT touch replayd, so it can't contaminate the daemon probe).
-        let preflight = nova::platform::mac::geometry::preflight_screen_capture();
-        eprintln!("[SELFTEST] CGPreflightScreenCaptureAccess() = {preflight}");
-
-        // Direct-path probes (SCShareableContent + a private StreamCapturer) in
-        // a sacrificial subprocess: a process that has touched ScreenCaptureKit
-        // keeps a replayd client connection that collides with the daemon's.
-        // Only meaningful on a quiet system — with a live capture daemon the
-        // probe is GUARANTEED to collide with the daemon's stream, so skip it.
-        if let Some(pid) = nova::platform::mac::capture::broker::any_capture_daemon_pid() {
-            eprintln!(
-                "[SELFTEST] direct stream: skipped (capture daemon pid={pid} is live; \
-                 its warm stream would collide with a second same-binary stream)"
-            );
-        } else {
-            // Bounded wait + SIGKILL: even though the child exits via
-            // process::exit after its own timeouts, the parent must never
-            // hang on it (--selftest is the tool that diagnoses hangs).
-            let exe = std::env::current_exe()?;
-            match std::process::Command::new(&exe)
-                .arg("--selftest-direct")
-                .stdin(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-                    loop {
-                        match child.try_wait() {
-                            Ok(Some(s)) if !s.success() => {
-                                eprintln!("[SELFTEST] direct probe exited: {s}");
-                                break;
-                            }
-                            Ok(Some(_)) => break,
-                            Ok(None) if std::time::Instant::now() >= deadline => {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                eprintln!(
-                                    "[SELFTEST] direct probe KILLED after 25s — it hung \
-                                     past its own internal timeouts"
-                                );
-                                break;
-                            }
-                            Ok(None) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await
-                            }
-                            Err(e) => {
-                                eprintln!("[SELFTEST] direct probe wait failed: {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => eprintln!("[SELFTEST] direct probe failed to run: {e}"),
-            }
-        }
-
-        // Daemon path: the one production actually uses (connect-or-spawn the
-        // shared daemon, capture through it, full recovery ladder).
-        let t = std::time::Instant::now();
-        let h = tokio::task::spawn_blocking(|| {
-            nova::platform::mac::capture::broker::shared_client()
-                .capture(&nova::platform::mac::capture::broker::CaptureRequest::Display)
-        });
-        match tokio::time::timeout(std::time::Duration::from_secs(60), h).await {
-            Ok(Ok(Ok(raw))) => eprintln!(
-                "[SELFTEST] capture daemon: OK {}x{} in {:.0} ms",
-                raw.image.width(),
-                raw.image.height(),
-                t.elapsed().as_secs_f64() * 1000.0
-            ),
-            Ok(Ok(Err(e))) => eprintln!("[SELFTEST] capture daemon: error: {e}"),
-            Ok(Err(e)) => eprintln!("[SELFTEST] capture daemon: join error: {e}"),
-            Err(_) => eprintln!(
-                "[SELFTEST] capture daemon: TIMED OUT after 60s — even the recovery \
-                 ladder is stuck"
-            ),
-        }
-        return Ok(());
+        return run_selftest().await;
     }
 
     // ── DEBUG CLI subcommands (no MCP) ──────────────────────────────
+    //
+    // `dump_ax`/`marks` below go entirely through the neutral
+    // `crate::platform::ui_tree()`/`tools::window` facade, so they need no
+    // per-OS gating — on Windows they just report the `UiTree` stub's "not yet
+    // implemented" error (see `platform::windows::elements`), same as any
+    // other tool hitting that capability today.
     if let Some(app) = cli.dump_ax.as_deref() {
         match nova::tools::window::pid_for_window(app) {
             Some((pid, _frame)) => {
@@ -270,37 +150,309 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(app) = cli.hit_dump.as_deref() {
-        match nova::tools::window::pid_for_window(app) {
-            Some((pid, frame)) => {
-                eprintln!("[hit-dump] {app:?} -> pid {pid} clip={frame:?}");
-                // Skip the left ~280px (native sidebar) so we probe just the
-                // web/content region whose rows aren't getting marked.
-                print!(
-                    "{}",
-                    nova::platform::mac::elements::debug::hit_dump(pid, frame, 24.0, 280.0)
-                );
-            }
-            None => eprintln!("[hit-dump] no on-screen window matching {app:?}"),
-        }
-        return Ok(());
+        return run_hit_dump(app);
     }
     if let Some(app) = cli.ax_warm.as_deref() {
-        match nova::tools::window::pid_for_window(app) {
-            Some((pid, frame)) => {
-                eprintln!("[ax-warm] {app:?} -> pid {pid} clip={frame:?}");
-                print!(
-                    "{}",
-                    nova::platform::mac::elements::debug::ax_warm_probe(pid, frame, 12)
-                );
-            }
-            None => eprintln!("[ax-warm] no on-screen window matching {app:?}"),
-        }
-        return Ok(());
+        return run_ax_warm(app);
     }
 
-    // Request Screen Recording access from THIS (server) process before serving —
-    // it surfaces the first-run system prompt and is a no-op once granted. Done
-    // here, not in the headless capture worker (which can't show a prompt).
+    // Per-OS permission/capability diagnostics, logged once before serving.
+    log_platform_permissions();
+
+    if cli.http {
+        nova::server::run_http(&cli.addr).await
+    } else {
+        nova::server::run_stdio().await
+    }
+}
+
+// ── Per-OS startup bootstrap ─────────────────────────────────────────
+
+/// Bootstrap the CoreGraphics / window-server connection BEFORE any
+/// ScreenCaptureKit call. Without this, capture from this subprocess either
+/// SIGABRTs (CGS_REQUIRE_INIT) or hangs in replayd-connection churn. See
+/// `nova::platform::mac::capture::init_core_graphics`.
+#[cfg(target_os = "macos")]
+fn platform_startup_bootstrap() {
+    nova::platform::mac::capture::init_core_graphics();
+}
+
+/// Declare Per-Monitor-DPI-v2 awareness before any `GetWindowRect`/
+/// `GetSystemMetrics`/`SendInput` call — see
+/// `nova::platform::windows::init_dpi_awareness`'s doc for why coordinate
+/// correctness depends on this running first.
+#[cfg(target_os = "windows")]
+fn platform_startup_bootstrap() {
+    nova::platform::windows::init_dpi_awareness();
+}
+
+/// Serve the shared macOS ScreenCaptureKit capture daemon / legacy pipe-proxy
+/// if requested via the hidden `--capture-daemon`/`--capture-worker` flags
+/// (both diverge — see `platform::mac::capture::broker::{run_daemon,
+/// run_worker_proxy}` — so this never returns if either fires). These
+/// low-level paths are diagnostics/plumbing for the capture daemon ITSELF,
+/// not tool-layer logic — they call `platform::mac::capture` directly,
+/// bypassing the `ScreenCapture` trait, same rationale as the debug CLI's
+/// direct `platform::mac::elements::debug` calls in `run_hit_dump`/
+/// `run_ax_warm` below.
+#[cfg(target_os = "macos")]
+fn maybe_run_capture_daemon(cli: &Cli) {
+    if cli.capture_daemon {
+        nova::platform::mac::capture::broker::run_daemon();
+    }
+    // Legacy worker entry point: proxy the old pipe protocol into the daemon.
+    if cli.capture_worker {
+        nova::platform::mac::capture::broker::run_worker_proxy();
+    }
+}
+
+/// Windows' PrintWindow/BitBlt capture is synchronous and needs no daemon
+/// process at all (see `platform::windows::capture`'s module doc), so these
+/// flags have no Windows analog — reported cleanly rather than silently
+/// ignored, in case a stale launch script carries them over from a macOS
+/// deployment.
+#[cfg(target_os = "windows")]
+fn maybe_run_capture_daemon(cli: &Cli) {
+    if cli.capture_daemon || cli.capture_worker {
+        eprintln!(
+            "--capture-daemon/--capture-worker are macOS-only plumbing for the shared \
+             ScreenCaptureKit daemon (see platform::mac::capture::broker) — Windows' \
+             PrintWindow/BitBlt capture is synchronous and needs no daemon, so these flags \
+             are no-ops here."
+        );
+    }
+}
+
+// ── --selftest / --selftest-direct ───────────────────────────────────
+
+/// SCK-touching probes, isolated in this short-lived process. Our exit closes
+/// the replayd XPC connection these open — leaving it open in the main
+/// selftest process would wedge the daemon probe that follows. Always exits
+/// the process (diverges); see the call site in `main`.
+#[cfg(target_os = "macos")]
+async fn run_selftest_direct() -> ! {
+    let probe =
+        tokio::task::spawn_blocking(nova::platform::mac::geometry::screen_recording_available);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
+        Ok(Ok(ok)) => eprintln!(
+            "[SELFTEST] screen_recording_available() (via SCShareableContent::get) = {ok}"
+        ),
+        _ => eprintln!(
+            "[SELFTEST] screen_recording_available() TIMED OUT after 5s — \
+             SCShareableContent itself is wedged"
+        ),
+    }
+    let t = std::time::Instant::now();
+    let h = tokio::task::spawn_blocking(|| {
+        nova::platform::mac::capture::stream::StreamCapturer::new().capture_display()
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(10), h).await {
+        Ok(Ok(Ok(raw))) => {
+            eprintln!(
+                "[SELFTEST] direct stream: OK {}x{} in {:.0} ms",
+                raw.image.width(),
+                raw.image.height(),
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(Ok(Err(e))) => eprintln!("[SELFTEST] direct stream: capture error: {e}"),
+        Ok(Err(e)) => eprintln!("[SELFTEST] direct stream: join error: {e}"),
+        Err(_) => eprintln!(
+            "[SELFTEST] direct stream: TIMED OUT after 10s — another process is \
+             holding a ScreenCaptureKit stream (a live capture daemon is normal \
+             here; a wedge is not)"
+        ),
+    }
+    // NOTE: process::exit, not return — Runtime::drop would WAIT for a
+    // wedged spawn_blocking thread (uncancellable SCK condvar) and this
+    // child would never exit; and only process death closes the replayd
+    // connection the probes opened.
+    std::process::exit(0);
+}
+
+/// Windows has no ScreenCaptureKit/replayd-style wedge to isolate — GDI/
+/// PrintWindow capture is synchronous in-process — so there is nothing for a
+/// sacrificial subprocess to probe. Not reachable directly (the hidden
+/// `--selftest-direct` flag has no public entry point on Windows either), but
+/// kept as a clean divergent stub so the crate links if it ever is.
+#[cfg(target_os = "windows")]
+async fn run_selftest_direct() -> ! {
+    eprintln!(
+        "--selftest-direct is macOS-only (ScreenCaptureKit capture-daemon diagnostics); \
+         not applicable on Windows."
+    );
+    std::process::exit(0);
+}
+
+/// Direct-path + capture-daemon probes, with timing. See the call site in
+/// `main` — returns `Ok(())` on the daemon-path timeout/error paths too
+/// (`--selftest`'s job is to REPORT a hang, not to fail the process).
+#[cfg(target_os = "macos")]
+async fn run_selftest() -> Result<()> {
+    // Probe the actual *capture* authorization (CoreGraphics TCC lookup —
+    // does NOT touch replayd, so it can't contaminate the daemon probe).
+    let preflight = nova::platform::mac::geometry::preflight_screen_capture();
+    eprintln!("[SELFTEST] CGPreflightScreenCaptureAccess() = {preflight}");
+
+    // Direct-path probes (SCShareableContent + a private StreamCapturer) in
+    // a sacrificial subprocess: a process that has touched ScreenCaptureKit
+    // keeps a replayd client connection that collides with the daemon's.
+    // Only meaningful on a quiet system — with a live capture daemon the
+    // probe is GUARANTEED to collide with the daemon's stream, so skip it.
+    if let Some(pid) = nova::platform::mac::capture::broker::any_capture_daemon_pid() {
+        eprintln!(
+            "[SELFTEST] direct stream: skipped (capture daemon pid={pid} is live; \
+             its warm stream would collide with a second same-binary stream)"
+        );
+    } else {
+        // Bounded wait + SIGKILL: even though the child exits via
+        // process::exit after its own timeouts, the parent must never
+        // hang on it (--selftest is the tool that diagnoses hangs).
+        let exe = std::env::current_exe()?;
+        match std::process::Command::new(&exe)
+            .arg("--selftest-direct")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(s)) if !s.success() => {
+                            eprintln!("[SELFTEST] direct probe exited: {s}");
+                            break;
+                        }
+                        Ok(Some(_)) => break,
+                        Ok(None) if std::time::Instant::now() >= deadline => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            eprintln!(
+                                "[SELFTEST] direct probe KILLED after 25s — it hung \
+                                 past its own internal timeouts"
+                            );
+                            break;
+                        }
+                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                        Err(e) => {
+                            eprintln!("[SELFTEST] direct probe wait failed: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("[SELFTEST] direct probe failed to run: {e}"),
+        }
+    }
+
+    // Daemon path: the one production actually uses (connect-or-spawn the
+    // shared daemon, capture through it, full recovery ladder).
+    let t = std::time::Instant::now();
+    let h = tokio::task::spawn_blocking(|| {
+        nova::platform::mac::capture::broker::shared_client()
+            .capture(&nova::platform::mac::capture::broker::CaptureRequest::Display)
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(60), h).await {
+        Ok(Ok(Ok(raw))) => eprintln!(
+            "[SELFTEST] capture daemon: OK {}x{} in {:.0} ms",
+            raw.image.width(),
+            raw.image.height(),
+            t.elapsed().as_secs_f64() * 1000.0
+        ),
+        Ok(Ok(Err(e))) => eprintln!("[SELFTEST] capture daemon: error: {e}"),
+        Ok(Err(e)) => eprintln!("[SELFTEST] capture daemon: join error: {e}"),
+        Err(_) => eprintln!(
+            "[SELFTEST] capture daemon: TIMED OUT after 60s — even the recovery \
+             ladder is stuck"
+        ),
+    }
+    Ok(())
+}
+
+/// Windows has no capture daemon to probe (see `run_selftest_direct`'s
+/// Windows arm) — point at the equivalent, always-available sanity check
+/// instead of pretending to run a diagnostic that doesn't apply.
+#[cfg(target_os = "windows")]
+async fn run_selftest() -> Result<()> {
+    eprintln!(
+        "--selftest is macOS-only (ScreenCaptureKit + capture-daemon diagnostics); not \
+         applicable on Windows, which has no capture daemon to probe (GDI/PrintWindow capture \
+         is synchronous and in-process — see platform::windows::capture). Use the `screenshot` \
+         or `list_windows` MCP tools directly to sanity-check capture on this OS."
+    );
+    Ok(())
+}
+
+// ── --hit-dump / --ax-warm (macOS Accessibility diagnostics) ─────────
+
+#[cfg(target_os = "macos")]
+fn run_hit_dump(app: &str) -> Result<()> {
+    match nova::tools::window::pid_for_window(app) {
+        Some((pid, frame)) => {
+            eprintln!("[hit-dump] {app:?} -> pid {pid} clip={frame:?}");
+            // Skip the left ~280px (native sidebar) so we probe just the
+            // web/content region whose rows aren't getting marked.
+            print!(
+                "{}",
+                nova::platform::mac::elements::debug::hit_dump(pid, frame, 24.0, 280.0)
+            );
+        }
+        None => eprintln!("[hit-dump] no on-screen window matching {app:?}"),
+    }
+    Ok(())
+}
+
+/// `--hit-dump` is an Accessibility (AX) hit-testing diagnostic with no
+/// Windows analog yet — the equivalent UI Automation-based tree walk is
+/// tracked as later-phase work alongside `platform::windows::elements`'s
+/// `UiTree` stub.
+#[cfg(target_os = "windows")]
+fn run_hit_dump(_app: &str) -> Result<()> {
+    eprintln!(
+        "--hit-dump is macOS-only (Accessibility hit-testing diagnostics); UI Automation-based \
+         diagnostics are tracked for a later phase on Windows."
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_ax_warm(app: &str) -> Result<()> {
+    match nova::tools::window::pid_for_window(app) {
+        Some((pid, frame)) => {
+            eprintln!("[ax-warm] {app:?} -> pid {pid} clip={frame:?}");
+            print!(
+                "{}",
+                nova::platform::mac::elements::debug::ax_warm_probe(pid, frame, 12)
+            );
+        }
+        None => eprintln!("[ax-warm] no on-screen window matching {app:?}"),
+    }
+    Ok(())
+}
+
+/// `--ax-warm` probes macOS's Accessibility "keep the Chromium tree warm"
+/// behavior specifically — no Windows analog (UI Automation trees don't have
+/// the same cold-tree-reaping quirk); tracked alongside `run_hit_dump`.
+#[cfg(target_os = "windows")]
+fn run_ax_warm(_app: &str) -> Result<()> {
+    eprintln!(
+        "--ax-warm is macOS-only (probes Accessibility's Chromium warm-tree behavior); no \
+         Windows analog (tracked for a later phase alongside UI Automation support)."
+    );
+    Ok(())
+}
+
+// ── Per-OS permission/capability diagnostics ──────────────────────────
+
+/// Request Screen Recording access from THIS (server) process before serving —
+/// it surfaces the first-run system prompt and is a no-op once granted. Done
+/// here, not in the headless capture worker (which can't show a prompt). Also
+/// logs the TCC attribution picture once at startup: when nova is a child of
+/// another app, `responsible/parent=` shows whose Screen Recording grant the
+/// OS actually checks — if that parent is ad-hoc-signed, its grant won't
+/// persist across rebuilds and `preflight=false` here even though nova is
+/// signed.
+#[cfg(target_os = "macos")]
+fn log_platform_permissions() {
     let screen_ok = nova::platform::mac::geometry::request_screen_recording_access();
     tracing::info!(
         "Screen Recording access: {}",
@@ -311,18 +463,21 @@ async fn main() -> Result<()> {
              Settings → Privacy & Security → Screen Recording"
         }
     );
-    // Log the TCC attribution picture once at startup. When nova is a child of
-    // another app, `responsible/parent=` shows whose Screen Recording grant the OS
-    // actually checks — if that parent is ad-hoc-signed, its grant won't persist
-    // across rebuilds and `preflight=false` here even though nova is signed.
     tracing::info!(
         "permission diagnostics: {}",
         nova::platform::mac::geometry::permission_diagnostics()
     );
+}
 
-    if cli.http {
-        nova::server::run_http(&cli.addr).await
-    } else {
-        nova::server::run_stdio().await
-    }
+/// Windows' GDI `BitBlt`/`PrintWindow` capture needs no OS-level screen-
+/// recording grant (unlike macOS's TCC) — logged once so this asymmetry is
+/// obvious from the startup log rather than a silent difference.
+#[cfg(target_os = "windows")]
+fn log_platform_permissions() {
+    tracing::info!(
+        "Windows: PrintWindow/BitBlt capture needs no OS-level screen-recording permission \
+         (unlike macOS's Screen Recording TCC grant). If a specific app's window capture comes \
+         back blank, that app itself may not support PrintWindow's PW_RENDERFULLCONTENT (rare) \
+         rather than a permission issue — see platform::windows::capture."
+    );
 }

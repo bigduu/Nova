@@ -229,7 +229,12 @@ fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
-/// Convert RGBA raw bytes to RGB (dropping alpha channel).
+/// Convert RGBA raw bytes to RGB (dropping alpha channel). Only macOS's
+/// ScreenCaptureKit path (`platform::mac::capture::stream`) hands back RGBA
+/// frames; Windows' GDI path (`platform::windows::capture`) reads BGRA DIBs
+/// and does its own inline channel reorder, so this is legitimately unused —
+/// not dead code — on a non-macOS build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn rgba_to_rgb(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let pixel_count = width * height;
     let mut rgb = Vec::with_capacity(pixel_count * 3);

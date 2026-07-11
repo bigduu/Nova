@@ -4,6 +4,12 @@
 //! wire contract (JSON request line in, JSON header + raw RGB out) must keep
 //! working. `#[ignore]`d by default. Run:
 //!   cargo test --test e2e_worker -- --ignored --nocapture
+//!
+//! macOS only (the legacy pipe protocol, the shared capture daemon it proxies
+//! into, and the `libc::kill`/`SIGKILL` process control below are all
+//! macOS-specific; Windows' GDI/PrintWindow capture is synchronous and has no
+//! daemon or legacy worker, see `platform::windows::capture`).
+#![cfg(target_os = "macos")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

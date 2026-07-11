@@ -74,3 +74,43 @@ core-foundation = "0.10"            # CFString/CFType — must match accessibili
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSData", "NSDictionary", "NSError"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "VNError", "objc2-core-foundation"] }
+
+# ── Platform-specific (Windows) ───────────────────────────────────────
+# The Windows P1 sibling of `platform::mac` — `src/platform/windows/*` — built
+# entirely on the official `windows` crate (Win32 metadata bindings), gated the
+# same way as the macOS deps above so a macOS/Linux `cargo build` never fetches
+# them. Only the feature modules the Windows capability impls actually use are
+# enabled (see each `src/platform/windows/*.rs` module doc for which trait it
+# backs):
+#   - Foundation                    — HWND/POINT/RECT/BOOL and friends
+#   - Graphics_Gdi                  — BitBlt/PrintWindow-adjacent GDI capture
+#   - UI_WindowsAndMessaging        — EnumWindows/PrintWindow/SendInput consts,
+#                                      GetSystemMetrics (incl. virtual-desktop),
+#                                      SetForegroundWindow, ShowWindow
+#   - UI_Input_KeyboardAndMouse     — SendInput/INPUT/MOUSEINPUT/KEYBDINPUT
+#   - UI_HiDpi                      — SetProcessDpiAwarenessContext (Per-Monitor-v2)
+#   - UI_Shell                      — ShellExecuteW (open_application)
+#   - System_DataExchange           — OpenClipboard/GetClipboardData/SetClipboardData
+#   - System_Memory                 — GlobalAlloc/GlobalLock (clipboard buffer)
+#   - System_Threading               — OpenProcess/QueryFullProcessImageNameW (app name)
+#   - System_ProcessStatus           — GetModuleBaseNameW fallback for app name
+#   - System_Ole                     — CF_UNICODETEXT (clipboard format id)
+#   - Storage_Xps                    — PrintWindow (window capture)
+#   - Graphics_Dwm                   — DwmGetWindowAttribute DWMWA_CLOAKED (hide
+#                                      DWM-cloaked windows, e.g. background UWP)
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Ole",
+    "Win32_Storage_Xps",
+] }

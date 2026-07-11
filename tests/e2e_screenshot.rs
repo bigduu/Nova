@@ -3,6 +3,10 @@
 //! Requires Screen Recording permission to be granted.
 //! Run with: `cargo test --test e2e_screenshot -- --ignored`
 //! or `cargo test --test e2e_screenshot -- --include-ignored`
+//!
+//! macOS only (drives `platform::mac::capture::stream::StreamCapturer`
+//! directly; the Windows capture path is `platform::windows::capture`).
+#![cfg(target_os = "macos")]
 
 use base64::Engine;
 use nova::capture::screenshot::{finish_capture, CaptureOptions};

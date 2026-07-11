@@ -4,6 +4,11 @@
 //! Needs Screen Recording permission, so `#[ignore]`d by default. Run
 //! SINGLE-THREADED (the tests share one daemon/socket):
 //!   cargo test --test e2e_capture_worker -- --ignored --test-threads=1
+//!
+//! macOS only (the shared capture daemon + `libc::kill`/`SIGKILL` process
+//! control below are both macOS-specific; Windows' GDI/PrintWindow capture is
+//! synchronous and has no daemon, see `platform::windows::capture`).
+#![cfg(target_os = "macos")]
 
 use std::sync::Arc;
 

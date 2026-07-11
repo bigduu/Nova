@@ -53,7 +53,50 @@ pub struct NovaServer {
 // client, not part of the neutral `ScreenCapture`/`WindowManager` traits (it
 // has no equivalent method there) — called directly, same as the
 // diagnostics-only direct calls in `main.rs`'s `--selftest`.
+#[cfg(target_os = "macos")]
 use crate::platform::mac::capture::broker::shared_client as capture_client;
+
+/// Best-effort recovery hook for a capture/`list_windows` call that blew
+/// through the outer timeout backstop below. On macOS this drops the shared
+/// capture daemon's connection (see `platform::mac::capture::broker`) so a
+/// wedged ScreenCaptureKit stream doesn't poison every subsequent call. GDI/
+/// `PrintWindow` capture on Windows is synchronous with no persistent daemon
+/// connection to reset — there is nothing analogous to drop, so this is a
+/// no-op there (a Windows timeout here means the synchronous GDI call itself
+/// hung, which no connection-reset can fix; it just surfaces as an error to
+/// the model like any other capture failure).
+#[cfg(target_os = "macos")]
+fn reset_capture_connection() {
+    capture_client().disconnect();
+}
+#[cfg(target_os = "windows")]
+fn reset_capture_connection() {}
+
+/// The coordinate frame of a full-display capture before any screenshot has
+/// been taken yet — macOS's `CGDisplay`-derived frame, or Windows'
+/// `GetSystemMetrics`-derived one.
+#[cfg(target_os = "macos")]
+fn default_view_frame() -> crate::display::view::ViewFrame {
+    crate::platform::mac::geometry::display_view_frame()
+}
+#[cfg(target_os = "windows")]
+fn default_view_frame() -> crate::display::view::ViewFrame {
+    crate::platform::windows::geometry::display_view_frame()
+}
+
+/// One-line diagnostic logged alongside every capture, distinguishing a real
+/// permission denial from a capture-stack failure. macOS has a real TCC grant
+/// to report (`platform::mac::geometry::permission_diagnostics`); Windows'
+/// GDI/`PrintWindow` capture needs no such grant (see
+/// `platform::windows::capture`'s module doc), so there is nothing to check.
+#[cfg(target_os = "macos")]
+fn capture_permission_diag() -> String {
+    crate::platform::mac::geometry::permission_diagnostics()
+}
+#[cfg(target_os = "windows")]
+fn capture_permission_diag() -> String {
+    "windows: no screen-recording permission concept (GDI/PrintWindow capture)".to_string()
+}
 
 /// Outer backstop on any daemon round-trip. The client's recovery ladder is
 /// self-limiting (every honest daemon reply lands within QUEUE_BUDGET +
@@ -80,7 +123,7 @@ impl NovaServer {
         self.view
             .lock()
             .expect("view mutex")
-            .unwrap_or_else(crate::platform::mac::geometry::display_view_frame)
+            .unwrap_or_else(default_view_frame)
     }
 
     /// Convert screenshot-space coordinates (what the LLM sees) into the global
@@ -174,7 +217,7 @@ impl NovaServer {
         // Phase 1: capture via `crate::platform::screen_capture()`. `preflight`
         // in the error distinguishes a real Screen-Recording denial (fix the
         // responsible `parent=` process) from a capture-stack failure.
-        let diag = crate::platform::mac::geometry::permission_diagnostics();
+        let diag = capture_permission_diag();
         // Matches the old derived-Debug rendering of the broker's
         // `CaptureRequest` (`Region { rect: (…) }` / `Window { query: "…" }`)
         // so log lines and the backstop-timeout error stay byte-identical
@@ -202,7 +245,7 @@ impl NovaServer {
                 return Err(format!("capture task failed: {join_err} [{diag}]"));
             }
             Err(_) => {
-                capture_client().disconnect();
+                reset_capture_connection();
                 return Err(format!(
                     "capture of {desc} did not return within {CAPTURE_BACKSTOP:?} — \
                      the recovery ladder itself is stuck (preflight below: \
@@ -1054,7 +1097,7 @@ impl NovaServer {
             Ok(Ok(Err(e))) => err_result(&e),
             Ok(Err(join_err)) => err_result(&format!("list_windows task failed: {join_err}")),
             Err(_) => {
-                capture_client().disconnect();
+                reset_capture_connection();
                 err_result(&format!(
                     "window listing did not return within {CAPTURE_BACKSTOP:?}"
                 ))
@@ -1152,13 +1195,15 @@ impl NovaServer {
 
     #[tool(
         name = "ax_click",
-        description = "Press a UI control directly through the macOS Accessibility tree — no \
-                       coordinates, no cursor movement, works in the background (the app need not \
-                       be frontmost). `query` is a case-insensitive substring of the element's \
-                       accessibility role or label/title (e.g. \"Send\", \"Search\"). Targets the \
-                       last window-captured app (or the frontmost app). Only works for apps that \
-                       expose an accessibility tree; if it returns \"no element matching\", fall \
-                       back to screenshot + left_click."
+        description = "Press a UI control directly through the OS accessibility tree (macOS \
+                       Accessibility; Windows UI Automation is not yet implemented and returns a \
+                       clear error) — no coordinates, no cursor movement, works in the background \
+                       (the app need not be frontmost). `query` is a case-insensitive substring of \
+                       the element's accessibility role or label/title (e.g. \"Send\", \"Search\"). \
+                       Targets the last window-captured app (or the frontmost app). Only works for \
+                       apps that expose an accessibility tree; if it returns \"no element \
+                       matching\" (or the not-implemented error), fall back to screenshot + \
+                       left_click."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_click(
@@ -1176,10 +1221,12 @@ impl NovaServer {
 
     #[tool(
         name = "ax_set_value",
-        description = "Set a control's value directly through the Accessibility tree — e.g. fill a \
-                       text field without focusing or typing. Background, no cursor. `query` \
-                       matches the element's role/label; `value` is the text to set. Targets the \
-                       last window-captured app (or frontmost). Native-app accessibility only."
+        description = "Set a control's value directly through the OS accessibility tree (macOS \
+                       Accessibility; not yet implemented on Windows, where it returns a clear \
+                       error) — e.g. fill a text field without focusing or typing. Background, no \
+                       cursor. `query` matches the element's role/label; `value` is the text to \
+                       set. Targets the last window-captured app (or frontmost). Native-app \
+                       accessibility only."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_set_value(
@@ -1197,9 +1244,11 @@ impl NovaServer {
 
     #[tool(
         name = "ax_focus",
-        description = "Move keyboard focus to a control through the Accessibility tree (background, \
-                       no cursor). `query` matches the element's role/label. Targets the last \
-                       window-captured app (or frontmost). Native-app accessibility only."
+        description = "Move keyboard focus to a control through the OS accessibility tree (macOS \
+                       Accessibility; not yet implemented on Windows, where it returns a clear \
+                       error). Background, no cursor. `query` matches the element's role/label. \
+                       Targets the last window-captured app (or frontmost). Native-app \
+                       accessibility only."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_focus(
