@@ -31,21 +31,27 @@
 //!   Retina display). Only [`ScreenCapture`] implementations deal with this,
 //!   when deciding how many pixels to actually capture.
 //!
-//! # macOS only, for now
+//! # macOS + Windows (P1 MVP)
 //!
-//! Nova is a macOS-only crate today (ScreenCaptureKit, CoreGraphics,
-//! Accessibility). The `mac` submodule holds every concrete implementation;
-//! a Windows (or other) port adds a sibling submodule (`platform::windows`)
-//! implementing the SAME traits, gated the same way, without the tool layer
-//! changing at all. Until such a port lands, building for any other OS is a
-//! deliberate, immediate compile error rather than a confusing pile of
-//! missing-symbol errors from Apple-only crates (see also the dependency
-//! gating in `Cargo.toml`, `[target.'cfg(target_os = "macos")'.dependencies]`).
+//! The `mac` submodule holds the full macOS implementation (ScreenCaptureKit,
+//! CoreGraphics, Accessibility). `windows` is its P1-MVP sibling — SendInput,
+//! GDI/PrintWindow capture, EnumWindows, Win32 clipboard — implementing the
+//! SAME traits below, gated the same way, so the tool layer
+//! (`src/tools/*`/`src/server.rs`) never has to know which OS it's running on.
+//! [`UiTree`]/[`OcrEngine`] on Windows are compiling STUBS for now (Accessibility
+//! tree walking via UI Automation and Windows.Media.Ocr are tracked as P2/P3);
+//! every other capability is a real MVP implementation. Any OS beyond these two
+//! is a deliberate, immediate compile error rather than a confusing pile of
+//! missing-symbol errors from platform-only crates (see also the dependency
+//! gating in `Cargo.toml`, `[target.'cfg(target_os = "...")'.dependencies]`).
 #[cfg(target_os = "macos")]
 pub mod mac;
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("nova currently supports macOS only; Windows port tracked separately");
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+compile_error!("nova currently supports macOS and Windows only; see src/platform/mod.rs");
 
 // ── Shared neutral types ─────────────────────────────────────────────
 //
@@ -362,4 +368,67 @@ static MAC_UI_TREE: mac::elements::MacUiTree = mac::elements::MacUiTree;
 #[cfg(target_os = "macos")]
 pub fn ui_tree() -> &'static dyn UiTree {
     &MAC_UI_TREE
+}
+
+// ── Windows accessors (P1 MVP) ──────────────────────────────────────
+//
+// Mirrors the macOS accessors above exactly — same rationale (per-capability
+// functions, not one bundling struct). `ocr()` and `ui_tree()` return
+// compiling stubs (P2/P3 — UI Automation + Windows.Media.Ocr); every other
+// capability below is a real Win32 implementation.
+
+#[cfg(target_os = "windows")]
+static WIN_OCR: windows::ocr::WinOcrEngine = windows::ocr::WinOcrEngine;
+
+/// The OCR engine — STUB on Windows (P2/P3: Windows.Media.Ocr).
+#[cfg(target_os = "windows")]
+pub fn ocr() -> &'static dyn OcrEngine {
+    &WIN_OCR
+}
+
+#[cfg(target_os = "windows")]
+static WIN_SCREEN_CAPTURE: windows::capture::WinScreenCapture = windows::capture::WinScreenCapture;
+
+/// Screen/window pixel capture (GDI `BitBlt`, `PrintWindow` for a single window
+/// on Windows — see `platform::windows::capture`).
+#[cfg(target_os = "windows")]
+pub fn screen_capture() -> &'static dyn ScreenCapture {
+    &WIN_SCREEN_CAPTURE
+}
+
+#[cfg(target_os = "windows")]
+static WIN_WINDOW_MANAGER: windows::window::WinWindowManager = windows::window::WinWindowManager;
+
+/// Window/application enumeration and launching (`EnumWindows` + `ShellExecuteW`
+/// on Windows).
+#[cfg(target_os = "windows")]
+pub fn window_manager() -> &'static dyn WindowManager {
+    &WIN_WINDOW_MANAGER
+}
+
+#[cfg(target_os = "windows")]
+static WIN_CLIPBOARD: windows::clipboard::WinClipboard = windows::clipboard::WinClipboard;
+
+/// The system clipboard (Win32 `OpenClipboard`/`CF_UNICODETEXT` on Windows).
+#[cfg(target_os = "windows")]
+pub fn clipboard() -> &'static dyn Clipboard {
+    &WIN_CLIPBOARD
+}
+
+#[cfg(target_os = "windows")]
+static WIN_INPUT: windows::input::WinInputInjector = windows::input::WinInputInjector;
+
+/// The input injector (`SendInput` on Windows).
+#[cfg(target_os = "windows")]
+pub fn input() -> &'static dyn InputInjector {
+    &WIN_INPUT
+}
+
+#[cfg(target_os = "windows")]
+static WIN_UI_TREE: windows::elements::WinUiTree = windows::elements::WinUiTree;
+
+/// Set-of-Mark element discovery — STUB on Windows (P2: UI Automation).
+#[cfg(target_os = "windows")]
+pub fn ui_tree() -> &'static dyn UiTree {
+    &WIN_UI_TREE
 }
