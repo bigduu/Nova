@@ -11,10 +11,11 @@
 //! position), it asserts; where it cannot without a controlled target app, it is
 //! a smoke test that proves the posting path returns `Ok` and restores state.
 
-use nova::tools::input::{
+use nova::platform::mac::input::{
     cursor_position, double_click_at, key_combo, left_click_at, mouse_move, right_click_at,
-    scroll_at, type_text, InputTarget,
+    scroll_at, type_text,
 };
+use nova::tools::input::InputTarget;
 use std::thread::sleep;
 use std::time::Duration;
 

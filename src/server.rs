@@ -274,7 +274,7 @@ fn click_cached_mark(
     el: crate::tools::elements::CachedElement,
     target: crate::tools::input::InputTarget,
 ) -> Result<String, String> {
-    use crate::tools::input::{cursor_position, left_click_at, mouse_move};
+    let input = crate::platform::input();
 
     // A page refresh / navigation destroys and rebuilds the app's AX tree, so a
     // handle cached from an earlier marks shot can dangle. Detect that up front
@@ -332,14 +332,14 @@ fn click_cached_mark(
     // Coordinate fallback. Remember the cursor so we can put it back, and raise
     // the target app so the click registers on its content rather than just
     // activating the window.
-    let saved = cursor_position().ok();
+    let saved = input.cursor_position().ok();
     crate::tools::elements::raise_app(el.pid);
     std::thread::sleep(std::time::Duration::from_millis(120));
 
     let (cx, cy) = el.center;
-    let click = left_click_at(cx, cy, target);
+    let click = input.left_click_at(cx, cy, target);
     if let Some((sx, sy)) = saved {
-        let _ = mouse_move(sx, sy); // restore the user's pointer
+        let _ = input.mouse_move(sx, sy); // restore the user's pointer
     }
     click.map_err(|e| {
         format!(
@@ -920,7 +920,7 @@ impl NovaServer {
         Parameters(p): Parameters<MouseMoveParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::mouse_move(lx, ly) {
+        match crate::platform::input().mouse_move(lx, ly) {
             Ok(()) => ok_text(format!("mouse moved to ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -939,7 +939,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::left_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().left_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -955,7 +955,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::right_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().right_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -971,7 +971,7 @@ impl NovaServer {
         Parameters(p): Parameters<ClickParams>,
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::double_click_at(lx, ly, self.current_target(p.background)) {
+        match crate::platform::input().double_click_at(lx, ly, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -986,7 +986,8 @@ impl NovaServer {
         // scroll_at positions the scroll at (lx, ly): it moves the cursor there
         // for global delivery, or sets the event location for a process target.
         let (lx, ly) = self.to_logical(p.x, p.y);
-        match crate::tools::input::scroll_at(lx, ly, p.lines, self.current_target(p.background)) {
+        match crate::platform::input().scroll_at(lx, ly, p.lines, self.current_target(p.background))
+        {
             Ok(()) => ok_text(format!("scrolled {} lines at ({}, {})", p.lines, p.x, p.y)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -998,7 +999,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, fields(key = %p.key), level = "info")]
     async fn key_combo(&self, Parameters(p): Parameters<KeyParams>) -> rmcp::model::CallToolResult {
-        match crate::tools::input::key_combo(&p.key, self.current_target(p.background)) {
+        match crate::platform::input().key_combo(&p.key, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("pressed {}", p.key)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -1013,7 +1014,7 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::input::type_text(&p.text, self.current_target(p.background)) {
+        match crate::platform::input().type_text(&p.text, self.current_target(p.background)) {
             Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
             Err(e) => err_result(&e.to_string()),
         }
@@ -1025,7 +1026,7 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn cursor_position(&self) -> rmcp::model::CallToolResult {
-        match crate::tools::input::cursor_position() {
+        match crate::platform::input().cursor_position() {
             Ok((x, y)) => ok_text(format!("cursor at ({:.0}, {:.0})", x, y)),
             Err(e) => err_result(&e.to_string()),
         }

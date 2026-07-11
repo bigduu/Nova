@@ -316,3 +316,12 @@ static MAC_OCR: mac::ocr::MacOcrEngine = mac::ocr::MacOcrEngine;
 pub fn ocr() -> &'static dyn OcrEngine {
     &MAC_OCR
 }
+
+#[cfg(target_os = "macos")]
+static MAC_INPUT: mac::input::MacInputInjector = mac::input::MacInputInjector;
+
+/// The input injector (CoreGraphics `CGEvent` posting on macOS).
+#[cfg(target_os = "macos")]
+pub fn input() -> &'static dyn InputInjector {
+    &MAC_INPUT
+}
