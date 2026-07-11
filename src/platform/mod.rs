@@ -345,3 +345,12 @@ static MAC_CLIPBOARD: mac::clipboard::MacClipboard = mac::clipboard::MacClipboar
 pub fn clipboard() -> &'static dyn Clipboard {
     &MAC_CLIPBOARD
 }
+
+#[cfg(target_os = "macos")]
+static MAC_INPUT: mac::input::MacInputInjector = mac::input::MacInputInjector;
+
+/// The input injector (CoreGraphics `CGEvent` posting on macOS).
+#[cfg(target_os = "macos")]
+pub fn input() -> &'static dyn InputInjector {
+    &MAC_INPUT
+}
