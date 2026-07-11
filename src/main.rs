@@ -91,6 +91,26 @@ struct Cli {
     /// guessing from a screenshot.
     #[arg(long)]
     list_windows: bool,
+
+    /// DEBUG: list the BCP-47 language tags this machine has an installed OCR
+    /// pack for (`Windows.Media.Ocr.OcrEngine.AvailableRecognizerLanguages`),
+    /// then exit. No MCP needed. Windows only — run this FIRST when `ocr`
+    /// comes back empty/erroring, to tell "no pack installed" apart from a
+    /// real bug. macOS's Apple Vision OCR ships fully self-contained (no
+    /// separate language-pack install step), so there is nothing to list
+    /// there.
+    #[arg(long)]
+    ocr_langs: bool,
+
+    /// DEBUG: OCR smoke test — capture the window whose title/owning-app
+    /// matches this substring via the SAME capture path the `ocr` MCP tool
+    /// uses, run the platform OCR engine against it, and print each
+    /// recognized line's text + clickable center. Proves real end-to-end
+    /// recognition (decode + language-pack selection + result mapping), not
+    /// just that the platform OCR code compiles/links. Windows only — macOS
+    /// already has live coverage via the `ocr` MCP tool itself.
+    #[arg(long, value_name = "APP")]
+    ocr_probe: Option<String>,
 }
 
 #[tokio::main]
@@ -195,6 +215,12 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("[list-windows] failed: {e}"),
         }
         return Ok(());
+    }
+    if cli.ocr_langs {
+        return run_ocr_langs();
+    }
+    if let Some(app) = cli.ocr_probe.as_deref() {
+        return run_ocr_probe(app);
     }
 
     // Per-OS permission/capability diagnostics, logged once before serving.
@@ -552,6 +578,116 @@ fn run_uia_probe(_app: &str, _query: Option<&str>) -> Result<()> {
     eprintln!(
         "--uia-probe is Windows-only (a P2 UI Automation discovery+Invoke smoke test); macOS \
          already proves marks/click_mark via --marks and the live MCP tools."
+    );
+    Ok(())
+}
+
+// ── --ocr-langs / --ocr-probe (Windows Windows.Media.Ocr P3 smoke test) ──
+
+/// List the BCP-47 language tags this machine has an OCR pack installed for.
+/// Run this BEFORE assuming an `ocr`/`--ocr-probe` failure is a code bug: an
+/// empty list means the VM/machine has no `Windows.Media.Ocr` language pack
+/// at all, which no amount of `platform::windows::ocr` code can work around.
+#[cfg(target_os = "windows")]
+fn run_ocr_langs() -> Result<()> {
+    match nova::platform::windows::ocr::available_languages() {
+        Ok(tags) if tags.is_empty() => eprintln!(
+            "[ocr-langs] AvailableRecognizerLanguages() returned 0 languages — no Windows OCR \
+             language pack is installed on this machine (install one via Settings > Time & \
+             Language > Language & region > Add a language > Options > Add \"Optical character \
+             recognition\")"
+        ),
+        Ok(tags) => {
+            eprintln!("[ocr-langs] {} OCR language pack(s) available:", tags.len());
+            for tag in tags {
+                println!("{tag}");
+            }
+        }
+        Err(e) => eprintln!("[ocr-langs] AvailableRecognizerLanguages() failed: {e}"),
+    }
+    Ok(())
+}
+
+/// `--ocr-langs` is Windows-only — Apple Vision OCR ships fully self-contained
+/// on macOS, with no separate per-language pack to install or list.
+#[cfg(target_os = "macos")]
+fn run_ocr_langs() -> Result<()> {
+    eprintln!(
+        "--ocr-langs is Windows-only (lists installed Windows.Media.Ocr language packs); \
+         macOS's Apple Vision OCR needs no separate language-pack install."
+    );
+    Ok(())
+}
+
+/// Capture the window matching `app` via the SAME path the `ocr` MCP tool
+/// uses (`ScreenCapture::capture_window` → `finish_capture` → JPEG bytes),
+/// then run `platform::ocr().recognize` against it and print every recognized
+/// line's text and clickable center. This is the mandatory end-to-end smoke
+/// for P3: link success alone doesn't prove `Windows.Media.Ocr` actually
+/// recognizes text, only that the code compiles.
+#[cfg(target_os = "windows")]
+fn run_ocr_probe(app: &str) -> Result<()> {
+    use base64::Engine;
+
+    let raw = match nova::platform::screen_capture().capture_window(app) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("[ocr-probe] capture_window({app:?}) failed: {e}");
+            return Ok(());
+        }
+    };
+    let capture = match nova::capture::screenshot::finish_capture(
+        raw,
+        nova::capture::screenshot::CaptureOptions::default(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ocr-probe] finish_capture failed: {e}");
+            return Ok(());
+        }
+    };
+    let jpeg = match base64::engine::general_purpose::STANDARD.decode(&capture.result.base64_image)
+    {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[ocr-probe] base64 decode of the captured JPEG failed: {e}");
+            return Ok(());
+        }
+    };
+    let (w, h) = (capture.result.width, capture.result.height);
+    eprintln!("[ocr-probe] {app:?} captured {w}x{h} px; running OCR ...");
+    // Same default language priority the `ocr` MCP tool uses when the caller
+    // doesn't override `languages`.
+    let languages = ["zh-Hans", "en-US"];
+    match nova::platform::ocr().recognize(&jpeg, w, h, &languages) {
+        Ok(lines) => {
+            eprintln!("[ocr-probe] {} line(s) recognized:", lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                println!(
+                    "[{}] {:?} conf={:.2} center=({:.0},{:.0})",
+                    i + 1,
+                    line.text,
+                    line.confidence,
+                    line.center.0,
+                    line.center.1
+                );
+            }
+        }
+        Err(e) => eprintln!("[ocr-probe] recognize() failed: {e}"),
+    }
+    Ok(())
+}
+
+/// `--ocr-probe` is Windows-only — macOS's Apple Vision OCR path is already
+/// exercised live by the `ocr` MCP tool itself; this diagnostic exists
+/// specifically to smoke-test the NEW `Windows.Media.Ocr` path end-to-end
+/// (capture → decode → recognize → mapped centers) without a full MCP round
+/// trip.
+#[cfg(target_os = "macos")]
+fn run_ocr_probe(_app: &str) -> Result<()> {
+    eprintln!(
+        "--ocr-probe is Windows-only (an end-to-end Windows.Media.Ocr capture+recognize smoke \
+         test); macOS's Apple Vision OCR path is already exercised live by the `ocr` MCP tool."
     );
     Ok(())
 }
