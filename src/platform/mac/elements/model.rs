@@ -214,10 +214,16 @@ impl AxHandle {
 /// A marked actionable element kept for index-based clicking. Pairs the mark
 /// NUMBER with the live AX handle and the element's global-logical center (the
 /// coordinate-click fallback target).
+///
+/// `handle` is the object-safe `crate::platform::ElementHandle` (not the
+/// concrete `AxHandle`) so this type stays reachable from platform-neutral
+/// code (`crate::tools::elements::CachedElement` is a thin re-export of it) —
+/// callers cache/click by mark number without knowing it's an Accessibility
+/// handle underneath.
 #[derive(Debug, Clone)]
 pub struct CachedElement {
     pub number: u32,
-    pub handle: AxHandle,
+    pub handle: Box<dyn crate::platform::ElementHandle>,
     /// Global logical center — the fallback click point if the AX action fails.
     pub center: (f64, f64),
     pub role: String,

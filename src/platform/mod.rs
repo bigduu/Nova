@@ -316,3 +316,12 @@ static MAC_OCR: mac::ocr::MacOcrEngine = mac::ocr::MacOcrEngine;
 pub fn ocr() -> &'static dyn OcrEngine {
     &MAC_OCR
 }
+
+#[cfg(target_os = "macos")]
+static MAC_UI_TREE: mac::elements::MacUiTree = mac::elements::MacUiTree;
+
+/// Set-of-Mark element discovery + AX actions (the macOS Accessibility API).
+#[cfg(target_os = "macos")]
+pub fn ui_tree() -> &'static dyn UiTree {
+    &MAC_UI_TREE
+}
