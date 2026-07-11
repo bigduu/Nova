@@ -870,7 +870,7 @@ impl NovaServer {
         // hard timeout so a stuck recognizer can't starve the server.
         let task = tokio::task::spawn_blocking(move || {
             let lang_refs: Vec<&str> = languages.iter().map(String::as_str).collect();
-            crate::ocr::recognize(&jpeg, w, h, &lang_refs)
+            crate::platform::ocr().recognize(&jpeg, w, h, &lang_refs)
         });
         let lines = match tokio::time::timeout(std::time::Duration::from_secs(20), task).await {
             Ok(Ok(Ok(lines))) => lines,

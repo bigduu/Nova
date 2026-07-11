@@ -9,6 +9,12 @@
 //! Chinese + Latin + many other scripts out of the box. This is the OCR member
 //! of the same Apple-framework family nova already builds on (ScreenCaptureKit,
 //! CoreGraphics, Accessibility).
+//!
+//! This is the platform-abstraction EXEMPLAR move: the implementation below is
+//! unchanged from the old `src/ocr.rs` (same objc2 FFI quirks — `initWithData`,
+//! the `boundingBox` unsafe/feature gating, the normalized-box Y-flip, safe to
+//! call from a `spawn_blocking` thread); only its home and its trait wiring
+//! moved. See PARALLEL_PLAN.md for the pattern the remaining subsystems follow.
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::AnyObject;
 use objc2::AnyThread;
@@ -18,17 +24,7 @@ use objc2_vision::{
     VNRequestTextRecognitionLevel,
 };
 
-/// One recognized line of text and where it sits in the image.
-#[derive(Debug, Clone)]
-pub struct OcrLine {
-    /// The recognized text (Vision's top candidate for this line).
-    pub text: String,
-    /// Recognition confidence in `[0, 1]`.
-    pub confidence: f32,
-    /// Center of the text's bounding box, in image pixel space (origin
-    /// top-left) — directly usable as a click coordinate.
-    pub center: (f64, f64),
-}
+use crate::platform::OcrLine;
 
 /// Recognize text in `image` (an encoded JPEG/PNG of `img_w` × `img_h` pixels)
 /// using the given BCP-47 language hints (e.g. `["zh-Hans", "en-US"]`). Returns
@@ -93,4 +89,19 @@ pub fn recognize(
         }
         Ok(lines)
     })
+}
+
+/// The macOS [`crate::platform::OcrEngine`]: Apple Vision, via [`recognize`].
+pub struct MacOcrEngine;
+
+impl crate::platform::OcrEngine for MacOcrEngine {
+    fn recognize(
+        &self,
+        image: &[u8],
+        img_w: u32,
+        img_h: u32,
+        languages: &[&str],
+    ) -> Result<Vec<OcrLine>, String> {
+        recognize(image, img_w, img_h, languages)
+    }
 }
