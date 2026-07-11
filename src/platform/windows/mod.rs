@@ -6,16 +6,15 @@
 //! implements one `crate::platform` trait for one subsystem, mirroring
 //! `platform::mac`'s layout:
 //!
-//! - [`input`]     — `InputInjector` via `SendInput`
-//! - [`capture`]   — `ScreenCapture` via GDI `BitBlt` / `PrintWindow`
-//! - [`window`]    — `WindowManager` via `EnumWindows` / `ShellExecuteW`
+//! - [`input`] — `InputInjector` via `SendInput`
+//! - [`capture`] — `ScreenCapture` via GDI `BitBlt` / `PrintWindow`
+//! - [`window`] — `WindowManager` via `EnumWindows` / `ShellExecuteW`
 //! - [`clipboard`] — `Clipboard` via `OpenClipboard`/`CF_UNICODETEXT`
-//! - [`elements`]  — `UiTree` STUB (P2: UI Automation) + the `UiElement`/
-//!                   `CachedElement` value types `crate::tools::elements`
-//!                   re-exports on Windows
-//! - [`ocr`]       — `OcrEngine` STUB (P3: Windows.Media.Ocr)
-//! - [`geometry`]  — shared display/virtual-desktop geometry helpers used by
-//!                   `input`/`capture`/`server.rs`'s default view frame
+//! - [`elements`] — `UiTree` STUB (P2: UI Automation) + the `UiElement`/`CachedElement`
+//!   value types `crate::tools::elements` re-exports on Windows
+//! - [`ocr`] — `OcrEngine` STUB (P3: Windows.Media.Ocr)
+//! - [`geometry`] — shared display/virtual-desktop geometry helpers used by
+//!   `input`/`capture`/`server.rs`'s default view frame
 //!
 //! # DPI awareness (read before touching coordinates)
 //!
@@ -42,24 +41,46 @@ pub mod input;
 pub mod ocr;
 pub mod window;
 
+use std::sync::Once;
+
+static DPI_INIT: Once = Once::new();
+
 /// Opt this process into Per-Monitor-DPI-v2 awareness. Must run before any
-/// `GetWindowRect`/`GetSystemMetrics`/`SendInput` call — see the module doc.
-/// Idempotent; a failure (e.g. already set by a manifest) is logged, not fatal.
+/// `GetWindowRect`/`GetSystemMetrics`/`SendInput`/`GetCursorPos` call — see the
+/// module doc. `main()` calls this at startup; the geometry/input/window entry
+/// points ALSO call [`ensure_dpi_awareness`] (which delegates here) so a caller
+/// reaching a platform free function directly — e.g. a Windows e2e test that
+/// exercises `platform::windows::input` the way `tests/e2e_input.rs` does on
+/// macOS — still gets correct, unscaled coordinates without relying on `main()`
+/// having run. Idempotent (guarded by a `Once`); a failure (e.g. the awareness
+/// was already fixed by an app manifest) is logged, not fatal.
 pub fn init_dpi_awareness() {
-    use windows::Win32::UI::HiDpi::{
-        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    };
-    // SAFETY: takes a well-known constant context handle, no pointers of ours
-    // involved; safe to call any number of times from any thread (Microsoft
-    // recommends calling it once, as early as possible, before any UI/DPI
-    // query — exactly what `main()` does).
-    let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    if let Err(e) = ok {
-        tracing::warn!(
-            "SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed: {e} — coordinates may be \
-             scaled if the display isn't at 100%; this is expected if the executable's manifest \
-             already declares a DPI awareness (the manifest wins and this call then no-ops with an \
-             error, which is fine)"
-        );
-    }
+    DPI_INIT.call_once(|| {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // SAFETY: takes a well-known constant context handle, no pointers of
+        // ours involved; safe to call once from any thread (Microsoft
+        // recommends calling it once, as early as possible, before any
+        // UI/DPI query).
+        let ok =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if let Err(e) = ok {
+            tracing::warn!(
+                "SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed: {e} — coordinates \
+                 may be scaled if the display isn't at 100%; this is expected if the executable's \
+                 manifest already declares a DPI awareness (the manifest wins and this call then \
+                 no-ops with an error, which is fine)"
+            );
+        }
+    });
+}
+
+/// Idempotent, cheap ensure-DPI hook the coordinate-bearing entry points
+/// (`geometry`/`input`/`window`) call at their top, so DPI awareness is
+/// established even when a caller bypasses `main()` (a directly-invoked
+/// platform free function / e2e test). After the first call it is a single
+/// atomic load in `Once` — safe and negligible to call on every operation.
+pub fn ensure_dpi_awareness() {
+    init_dpi_awareness();
 }

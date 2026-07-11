@@ -17,6 +17,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Logical (== physical, PMv2-aware) size of the PRIMARY monitor — what
 /// `screenshot`'s full-display capture and `zoom_region`'s default frame use.
 pub fn primary_display_size() -> (f64, f64) {
+    // Ensure DPI awareness even if reached without main() (direct call / e2e
+    // test) — otherwise GetSystemMetrics returns scaled dims on a non-100%
+    // display. Idempotent + cheap after the first call (a Once load).
+    super::ensure_dpi_awareness();
     // SAFETY: GetSystemMetrics is an argless-per-call, side-effect-free Win32
     // query; safe from any thread.
     let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -31,6 +35,11 @@ pub fn primary_display_size() -> (f64, f64) {
 /// rect, so mouse moves/clicks must normalize through it — see
 /// `platform::windows::input`.
 pub fn virtual_desktop_bounds() -> (i32, i32, i32, i32) {
+    // Ensure DPI awareness even if reached without main() — see
+    // `primary_display_size`. SendInput's absolute mapping (in
+    // `platform::windows::input`) normalizes through these bounds, so a scaled
+    // read here would misplace every click.
+    super::ensure_dpi_awareness();
     // SAFETY: same as above — argless Win32 metrics queries.
     unsafe {
         (

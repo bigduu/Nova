@@ -142,6 +142,9 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
 }
 
 pub fn cursor_position() -> Result<(f64, f64)> {
+    // GetCursorPos reads coordinates directly (not via geometry), so ensure DPI
+    // awareness here too — otherwise a non-100% display returns scaled points.
+    super::ensure_dpi_awareness();
     let mut pt = POINT::default();
     // SAFETY: `pt` is a local we own; `GetCursorPos` only writes through it.
     unsafe { GetCursorPos(&mut pt) }
