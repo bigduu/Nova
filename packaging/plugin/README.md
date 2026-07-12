@@ -59,6 +59,10 @@ hook to request this today, so:
    fallback: it lives at `bin/macos/nova` inside this plugin's install
    directory (`~/.bamboo/plugins/nova/bin/macos/nova`) once installed —
    add that path the same way.
+4. The grant is keyed to Bamboo's **code-signing identity**, not just "the
+   app." If Bamboo is rebuilt/re-signed (dev builds, ad-hoc/unsigned) the
+   grant can silently stop persisting — if permissions mysteriously stop
+   working after updating Bamboo, re-grant it.
 
 Windows currently ships no Nova-side automation permission model equivalent
 to macOS TCC; the Windows binary is otherwise unsigned (no Authenticode
