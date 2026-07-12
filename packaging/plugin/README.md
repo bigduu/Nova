@@ -30,11 +30,19 @@ checksums of that release's archives by
 
 ## Installing
 
+A URL install is verified against the bundle's checksum by default — grab the
+`.sha256` published next to the bundle on the release page and pass it:
+
 ```sh
-bamboo plugin install https://github.com/bigduu/Nova/releases/download/v<version>/nova-plugin-v<version>.tar.gz
+# The .sha256 sidecar's hex is on the release page next to the bundle.
+bamboo plugin install \
+  https://github.com/bigduu/Nova/releases/download/v<version>/nova-plugin-v<version>.tar.gz \
+  --sha256 <hex-from-nova-plugin-v<version>.tar.gz.sha256>
 ```
 
-(Once the CLI/HTTP install flow supports it — see bamboo's `PLUGIN_PLAN.md`.)
+Installing from a URL **without** a checksum is refused (so a tampered or
+wrong-URL `.tar.gz` can't be silently trusted); pass `--allow-unverified` only
+if you knowingly accept that risk.
 
 ## macOS permissions (read this before first use)
 
