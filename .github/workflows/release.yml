@@ -9,6 +9,10 @@ name: Release
 # same Release as .zip + .sha256 — see the `build-windows`/`release-windows`
 # jobs below. Windows has no Homebrew/npm equivalent here; it is
 # release-artifact-only (consumed by URL+checksum, e.g. by a plugin manifest).
+# Finally, `plugin-manifest` fills in the committed `packaging/plugin/plugin.json`
+# template with this release's real version + archive checksums and publishes
+# it (bare, and as a `nova-plugin-v<ver>.tar.gz` bundle with the `skills/`
+# content) so `bamboo plugin install <url>` can pull Nova in as a plugin.
 #
 # Trigger:  git tag v0.1.0 && git push origin v0.1.0
 # Manual:   Actions → Release → Run workflow (provide the tag)
@@ -269,6 +273,83 @@ jobs:
           files: |
             dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip
             dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip.sha256
+
+  # ── Generate + publish the nova bamboo-plugin bundle ──────────────────
+  # `packaging/plugin/plugin.json` is committed as a TEMPLATE (a valid-shaped
+  # placeholder version + sha256, so it validates on its own, but not the
+  # real release values). This job fills it in for real: the tag's version,
+  # and the real sha256 of the mac + Windows archives the jobs above already
+  # built — reusing the `.sha256` sidecars they compute (never re-hashing).
+  # It then packages `plugin.json` + `skills/` + `README.md` (content only —
+  # no binary; `plugin.json`'s `artifacts` point at the platform archives
+  # published above) into `nova-plugin-v<ver>.tar.gz`, the bundle a user
+  # points `bamboo plugin install <url>` at, and also publishes the bare
+  # `nova-plugin-v<ver>.json` for quick inspection.
+  #
+  # Windows-arch decision: bamboo's plugin schema gates `artifacts` by OS
+  # only (macos/windows/linux, no per-arch key), so exactly one Windows
+  # build must be chosen. `generate-manifest.sh` picks x86_64-pc-windows-msvc
+  # for broad compatibility (runs natively on x64 and, via Windows' built-in
+  # emulation, on ARM64 too) — same "ship x86_64 for sure" precedent as
+  # `release-windows` above. See `packaging/plugin/README.md` for the
+  # follow-up (a per-arch platform key) this punts on.
+  #
+  # Runs after `release-windows` (not just alongside it) purely to avoid two
+  # concurrent `action-gh-release` calls touching the same just-created
+  # release at once — same TOCTOU concern `release-windows`'s own comment
+  # documents for its ordering after `build`.
+  plugin-manifest:
+    runs-on: ubuntu-latest
+    needs: [build, build-windows, windows-meta, release-windows]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.windows-meta.result == 'success' && needs.release-windows.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows build artifacts (for the .sha256 sidecar)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve checksums + generate plugin.json
+        id: manifest
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          MACOS_SHA="${{ needs.build.outputs.sha256 }}"
+          WIN_ASSET="nova-v${VERSION}-x86_64-pc-windows-msvc.zip"
+          WIN_SHA_FILE="dist/${WIN_ASSET}.sha256"
+          if [ ! -f "$WIN_SHA_FILE" ]; then
+            echo "::error::missing $WIN_SHA_FILE — the x86_64-pc-windows-msvc leg did not produce a checksum, cannot publish the plugin manifest"
+            exit 1
+          fi
+          WIN_SHA="$(awk '{print $1}' "$WIN_SHA_FILE")"
+
+          mkdir -p "dist/nova-plugin/skills"
+          cp -R packaging/plugin/skills/. dist/nova-plugin/skills/
+          cp packaging/plugin/README.md dist/nova-plugin/README.md
+          bash packaging/plugin/generate-manifest.sh "$VERSION" "$MACOS_SHA" "$WIN_SHA" dist/nova-plugin/plugin.json
+
+          # Structural sanity check before publishing (belt-and-suspenders;
+          # generate-manifest.sh already shape-checks its own inputs).
+          jq -e --arg v "$VERSION" \
+            '.version == $v
+             and (.artifacts.macos.sha256 | test("^[0-9a-f]{64}$"))
+             and (.artifacts.windows.sha256 | test("^[0-9a-f]{64}$"))' \
+            dist/nova-plugin/plugin.json > /dev/null
+
+          cp dist/nova-plugin/plugin.json "dist/nova-plugin-v${VERSION}.json"
+          tar -czf "dist/nova-plugin-v${VERSION}.tar.gz" -C dist/nova-plugin plugin.json skills README.md
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz
+            dist/nova-plugin-v${{ steps.manifest.outputs.version }}.json
 
   # ── Which optional publish steps can run (presence of their secrets) ──
   gate:
