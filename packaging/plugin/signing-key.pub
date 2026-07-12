@@ -1,0 +1,20 @@
+# Nova plugin bundle — ed25519 signing public key
+#
+# Algorithm: ed25519. The value below is the raw 32-byte public key,
+# lowercase hex (64 chars).
+#
+# The matching PRIVATE key is held only as the GitHub Actions repo secret
+# `NOVA_PLUGIN_SIGNING_KEY` (an openssl ed25519 PEM), used by the
+# `plugin-manifest` job in .github/workflows/release.yml to sign
+# nova-plugin-v<version>.tar.gz — the signature is published as the
+# nova-plugin-v<version>.tar.gz.sig sidecar on each GitHub Release (raw
+# 64-byte ed25519 signature over the exact bundle bytes, hex-encoded).
+#
+# This file is committed for transparency/reference only — it is NOT the
+# trust root bamboo actually uses. bamboo ships this same key baked into
+# its default trusted-publishers store, so installing an official signed
+# Nova release needs no extra flags. Publishing it here just lets anyone
+# cross-check "the key bamboo trusts for nova" against what this repo's own
+# release pipeline signs with.
+
+e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59
