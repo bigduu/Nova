@@ -347,6 +347,82 @@ jobs:
           ( cd dist && shasum -a 256 "nova-plugin-v${VERSION}.tar.gz" > "nova-plugin-v${VERSION}.tar.gz.sha256" )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # ── Sign the bundle so bamboo's plugin-trust layer can verify Nova is
+      # an authentic publisher ───────────────────────────────────────────
+      # PINNED scheme — bamboo's verifier expects EXACTLY this, do not change
+      # without updating bamboo too:
+      #   - ed25519, raw 64-byte signature (no ASN.1/DER wrapping).
+      #   - signed message = the exact bytes of the .tar.gz bundle itself
+      #     (NOT its sha256).
+      #   - sidecar `nova-plugin-v<ver>.tar.gz.sig` = the signature as
+      #     lowercase hex (128 chars).
+      # The private key lives only as the `NOVA_PLUGIN_SIGNING_KEY` repo
+      # secret (an openssl ed25519 PEM); its public half is committed at
+      # packaging/plugin/signing-key.pub for reference (bamboo's actual
+      # trust root is its own baked-in default, not this file).
+      #
+      # Decision — skip-with-warning, not fail, when the secret is unset:
+      # this lets the pipeline keep publishing (an UNSIGNED bundle, which
+      # bamboo will refuse without `--allow-unsigned`) instead of hard-
+      # breaking every release before the secret is provisioned. Once
+      # `NOVA_PLUGIN_SIGNING_KEY` is set and signing should be mandatory,
+      # flip the empty-key branch below from `exit 0` to `exit 1`.
+      - name: Sign plugin bundle (ed25519)
+        id: sign
+        env:
+          NOVA_PLUGIN_SIGNING_KEY: ${{ secrets.NOVA_PLUGIN_SIGNING_KEY }}
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          BUNDLE="dist/nova-plugin-v${VERSION}.tar.gz"
+
+          if [ -z "$NOVA_PLUGIN_SIGNING_KEY" ]; then
+            echo "::warning::NOVA_PLUGIN_SIGNING_KEY secret is not set — publishing an UNSIGNED plugin bundle ($BUNDLE has no .sig). Installing it will require bamboo's --allow-unsigned flag until the secret is provisioned. See packaging/plugin/signing-key.pub."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$NOVA_PLUGIN_SIGNING_KEY" > signing_key.pem
+          chmod 600 signing_key.pem
+          trap 'rm -f signing_key.pem' EXIT
+
+          openssl pkeyutl -sign -inkey signing_key.pem -rawin -in "$BUNDLE" -out sig.bin
+          xxd -p -c 256 sig.bin | tr -d '\n' > "${BUNDLE}.sig"
+          rm -f sig.bin
+
+          if ! grep -Eq '^[0-9a-f]{128}$' "${BUNDLE}.sig"; then
+            echo "::error::signature is not 128 lowercase hex chars ($(wc -c < "${BUNDLE}.sig") chars produced) — aborting release rather than publishing a malformed .sig"
+            exit 1
+          fi
+
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "Signed $BUNDLE -> ${BUNDLE}.sig (128 hex chars)"
+
+      # Self-verify before publishing: reconstruct the pinned public key's
+      # PEM from the hex committed at packaging/plugin/signing-key.pub and
+      # confirm the signature just produced actually verifies against it.
+      # Catches a wrong/corrupt NOVA_PLUGIN_SIGNING_KEY (e.g. mismatched
+      # keypair) before it ships an unverifiable .sig to users.
+      - name: Self-verify plugin bundle signature
+        if: steps.sign.outputs.signed == 'true'
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          BUNDLE="dist/nova-plugin-v${VERSION}.tar.gz"
+          PUBHEX="$(grep -Eo '[0-9a-f]{64}' packaging/plugin/signing-key.pub | head -1)"
+
+          # ed25519 SubjectPublicKeyInfo DER = fixed 12-byte ASN.1 prefix +
+          # the raw 32-byte public key — lets openssl load a bare hex pubkey.
+          printf '302a300506032b6570032100%s' "$PUBHEX" | xxd -r -p > pub.der
+          openssl pkey -pubin -inform DER -in pub.der -pubout -out pub.pem
+          xxd -r -p "${BUNDLE}.sig" > sig.bin
+
+          if ! openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in "$BUNDLE" -sigfile sig.bin; then
+            echo "::error::self-verify FAILED — the signature just produced does not verify against packaging/plugin/signing-key.pub. NOVA_PLUGIN_SIGNING_KEY may not match the pinned public key. Aborting before publishing a broken signature."
+            rm -f pub.der pub.pem sig.bin
+            exit 1
+          fi
+          rm -f pub.der pub.pem sig.bin
+          echo "Self-verify OK: bundle signature matches packaging/plugin/signing-key.pub"
+
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -356,6 +432,21 @@ jobs:
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sha256
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.json
+
+      # Attached in its own step (rather than folded into the files list
+      # above) because the .sig only exists when signing actually ran — see
+      # the skip-if-unset decision on "Sign plugin bundle" above. A second
+      # action-gh-release call updating the same just-created release
+      # matches this workflow's existing pattern (release-windows, and the
+      # step right above, both do this already).
+      - name: Attach plugin signature to GitHub Release
+        if: steps.sign.outputs.signed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sig
 
   # ── Which optional publish steps can run (presence of their secrets) ──
   gate:
