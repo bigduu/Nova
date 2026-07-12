@@ -340,6 +340,11 @@ jobs:
 
           cp dist/nova-plugin/plugin.json "dist/nova-plugin-v${VERSION}.json"
           tar -czf "dist/nova-plugin-v${VERSION}.tar.gz" -C dist/nova-plugin plugin.json skills README.md
+          # Bundle checksum sidecar: `bamboo plugin install <url> --sha256 <hex>`
+          # verifies the downloaded bundle against this (secure-by-default —
+          # a URL install without a checksum is refused). Same `<hex>  <file>`
+          # format as the binary-artifact sidecars.
+          ( cd dist && shasum -a 256 "nova-plugin-v${VERSION}.tar.gz" > "nova-plugin-v${VERSION}.tar.gz.sha256" )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Attach to GitHub Release
@@ -349,6 +354,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz
+            dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sha256
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.json
 
   # ── Which optional publish steps can run (presence of their secrets) ──
