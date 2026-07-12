@@ -44,6 +44,39 @@ Installing from a URL **without** a checksum is refused (so a tampered or
 wrong-URL `.tar.gz` can't be silently trusted); pass `--allow-unverified` only
 if you knowingly accept that risk.
 
+## Publisher signature (authenticity, not just integrity)
+
+The `.sha256` above only proves the bundle wasn't corrupted in transit — it
+says nothing about *who* produced it. On top of that, `nova-plugin-v<version>.tar.gz`
+is signed with **ed25519**: the `plugin-manifest` job in `release.yml` signs
+the exact bundle bytes with a private key held as the `NOVA_PLUGIN_SIGNING_KEY`
+GitHub Actions secret, and publishes the signature as a sidecar,
+`nova-plugin-v<version>.tar.gz.sig` (the raw 64-byte signature, lowercase hex
+— 128 chars), next to the bundle and its checksum on the release page. The
+release job also self-verifies the signature against the public key below
+before publishing, so a broken/mismatched signing key fails the release
+instead of shipping an unverifiable `.sig`.
+
+The matching public key is committed at
+[`signing-key.pub`](./signing-key.pub) in this same directory:
+
+```
+e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59
+```
+
+That file is committed for transparency/reference only — **bamboo ships this
+same key baked into its own default trusted-publishers store**, so
+installing an official, signed Nova release needs no extra flags: `bamboo
+plugin install` verifies the `.sig` against its built-in key automatically.
+(A pre-signing release, or one cut before the secret was provisioned, has no
+`.sig`; bamboo requires an explicit `--allow-unsigned` to install those.)
+
+To trust a **third-party** (non-official) build of a plugin signed with a
+different key, add that key to bamboo's own trust store yourself — bamboo's
+plugin-trust layer supports registering additional trusted publisher keys
+alongside its built-in defaults; see bamboo's plugin-trust documentation for
+the exact command.
+
 ## macOS permissions (read this before first use)
 
 Nova needs two TCC-gated macOS permissions:
