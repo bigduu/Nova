@@ -19,3 +19,9 @@ pub use crate::platform::mac::elements::{CachedElement, UiElement};
 /// even though `collect_actionable` never constructs one there yet).
 #[cfg(target_os = "windows")]
 pub use crate::platform::windows::elements::{CachedElement, UiElement};
+
+/// Same re-export, from the headless stub backend (every other OS) — the
+/// types exist so the shared tool layer compiles; marks are always empty
+/// there (see `platform::headless`'s module doc).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub use crate::platform::headless::{CachedElement, UiElement};
