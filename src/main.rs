@@ -776,3 +776,87 @@ fn log_platform_permissions() {
          rather than a permission issue — see platform::windows::capture."
     );
 }
+
+// ── Headless variants (every other OS) ────────────────────────────────
+//
+// The per-OS functions above all get a third arm on OSes with no desktop
+// backend (see `platform::headless`'s module doc): the server still starts
+// and serves MCP introspection, the desktop-diagnostic CLI flags report
+// cleanly instead of vanishing from the binary, and there is no bootstrap/
+// daemon/permission machinery to run.
+
+/// What every desktop-diagnostic CLI flag prints on a headless build.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const HEADLESS_DIAG: &str = "this is a headless nova build (no macOS/Windows desktop backend): \
+     the MCP server starts and lists its tools, but desktop diagnostics and desktop control are \
+     unavailable on this OS.";
+
+/// Nothing to bootstrap: no window-server connection (macOS) and no DPI
+/// awareness to declare (Windows).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn platform_startup_bootstrap() {}
+
+/// No capture daemon exists on a headless build (the macOS-only plumbing these
+/// flags drive) — reported cleanly rather than silently ignored, mirroring the
+/// Windows arm.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn maybe_run_capture_daemon(cli: &Cli) {
+    if cli.capture_daemon || cli.capture_worker {
+        eprintln!("--capture-daemon/--capture-worker are macOS-only plumbing; {HEADLESS_DIAG}");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn run_selftest_direct() -> ! {
+    eprintln!("--selftest-direct: {HEADLESS_DIAG}");
+    std::process::exit(0);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn run_selftest() -> Result<()> {
+    eprintln!("--selftest: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_hit_dump(_app: &str) -> Result<()> {
+    eprintln!("--hit-dump: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_ax_warm(_app: &str) -> Result<()> {
+    eprintln!("--ax-warm: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_uia_probe(_app: &str, _query: Option<&str>) -> Result<()> {
+    eprintln!("--uia-probe: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_ocr_langs() -> Result<()> {
+    eprintln!("--ocr-langs: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_ocr_probe(_app: &str) -> Result<()> {
+    eprintln!("--ocr-probe: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_capture_probe(_app: &str) -> Result<()> {
+    eprintln!("--capture-probe: {HEADLESS_DIAG}");
+    Ok(())
+}
+
+/// No OS permission concept applies — log the headless story once so a
+/// registry probe reading the startup log sees why tools will error.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn log_platform_permissions() {
+    tracing::info!("{}", HEADLESS_DIAG);
+}

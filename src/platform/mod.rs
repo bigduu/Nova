@@ -51,8 +51,13 @@ pub mod mac;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+// Every other OS gets the headless stub backend: the crate builds, the MCP
+// server starts and answers introspection (`initialize`/`tools/list`), and
+// every actual desktop action returns a uniform "this build is headless"
+// error. Exists for registry health checks (e.g. Glama's Docker probe) and
+// Linux CI — see `platform::headless`'s module doc.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-compile_error!("nova currently supports macOS and Windows only; see src/platform/mod.rs");
+pub mod headless;
 
 // ── Shared neutral types ─────────────────────────────────────────────
 //
@@ -433,4 +438,67 @@ static WIN_UI_TREE: windows::elements::WinUiTree = windows::elements::WinUiTree;
 #[cfg(target_os = "windows")]
 pub fn ui_tree() -> &'static dyn UiTree {
     &WIN_UI_TREE
+}
+
+// ── Headless accessors (every other OS) ─────────────────────────────
+//
+// The stub backend for OSes with no desktop implementation — see
+// `platform::headless`'s module doc. Same per-capability shape as the real
+// accessors above; every impl is a zero-sized type whose methods return a
+// uniform "headless build" error (marks degrade to empty, per UiTree's
+// graceful-degradation contract).
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_OCR: headless::HeadlessOcrEngine = headless::HeadlessOcrEngine;
+
+/// The OCR engine — headless stub (no backend on this OS).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn ocr() -> &'static dyn OcrEngine {
+    &HEADLESS_OCR
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_SCREEN_CAPTURE: headless::HeadlessScreenCapture = headless::HeadlessScreenCapture;
+
+/// Screen/window pixel capture — headless stub (no backend on this OS).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn screen_capture() -> &'static dyn ScreenCapture {
+    &HEADLESS_SCREEN_CAPTURE
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_WINDOW_MANAGER: headless::HeadlessWindowManager = headless::HeadlessWindowManager;
+
+/// Window/application enumeration — headless stub (no backend on this OS).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn window_manager() -> &'static dyn WindowManager {
+    &HEADLESS_WINDOW_MANAGER
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_CLIPBOARD: headless::HeadlessClipboard = headless::HeadlessClipboard;
+
+/// The system clipboard — headless stub (no backend on this OS).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn clipboard() -> &'static dyn Clipboard {
+    &HEADLESS_CLIPBOARD
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_INPUT: headless::HeadlessInputInjector = headless::HeadlessInputInjector;
+
+/// The input injector — headless stub (no backend on this OS).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn input() -> &'static dyn InputInjector {
+    &HEADLESS_INPUT
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static HEADLESS_UI_TREE: headless::HeadlessUiTree = headless::HeadlessUiTree;
+
+/// Set-of-Mark element discovery — headless stub (no tree, marks come back
+/// empty).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn ui_tree() -> &'static dyn UiTree {
+    &HEADLESS_UI_TREE
 }

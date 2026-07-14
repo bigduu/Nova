@@ -71,6 +71,9 @@ fn reset_capture_connection() {
 }
 #[cfg(target_os = "windows")]
 fn reset_capture_connection() {}
+/// Headless builds never open a capture connection — nothing to reset.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reset_capture_connection() {}
 
 /// The coordinate frame of a full-display capture before any screenshot has
 /// been taken yet — macOS's `CGDisplay`-derived frame, or Windows'
@@ -82,6 +85,18 @@ fn default_view_frame() -> crate::display::view::ViewFrame {
 #[cfg(target_os = "windows")]
 fn default_view_frame() -> crate::display::view::ViewFrame {
     crate::platform::windows::geometry::display_view_frame()
+}
+/// Headless builds have no display to derive a frame from; a degenerate
+/// zero-size frame keeps the math well-defined (see `ViewFrame::to_logical`'s
+/// degenerate-input handling) on the error paths that are all a headless
+/// capture can take.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn default_view_frame() -> crate::display::view::ViewFrame {
+    crate::display::view::ViewFrame {
+        origin: (0.0, 0.0),
+        region: (0.0, 0.0),
+        screenshot: (0.0, 0.0),
+    }
 }
 
 /// One-line diagnostic logged alongside every capture, distinguishing a real
@@ -96,6 +111,10 @@ fn capture_permission_diag() -> String {
 #[cfg(target_os = "windows")]
 fn capture_permission_diag() -> String {
     "windows: no screen-recording permission concept (GDI/PrintWindow capture)".to_string()
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn capture_permission_diag() -> String {
+    "headless build: no desktop backend on this OS (capture always errors)".to_string()
 }
 
 /// Outer backstop on any daemon round-trip. The client's recovery ladder is

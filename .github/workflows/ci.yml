@@ -91,3 +91,34 @@ jobs:
 
       - name: Clippy (Windows target)
         run: cargo clippy --target aarch64-pc-windows-msvc --all-targets -- -D warnings
+
+  # Headless-build gate (src/platform/headless): NATIVE ubuntu, so beyond
+  # check/clippy it actually RUNS the server and proves the MCP handshake +
+  # tools/list works with no desktop backend — the exact probe MCP registries
+  # (e.g. Glama's Docker health check, see ./Dockerfile) run against us. The
+  # desktop e2e tests are all `#![cfg]`-gated to macOS, so `--test e2e_stdio`
+  # is the one that exists here.
+  linux-headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-headless-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy (headless build)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Stdio handshake smoke test (headless build)
+        run: cargo test --test e2e_stdio --verbose
