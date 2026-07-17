@@ -38,6 +38,11 @@ use crate::platform::{ElementHandle, UiTree};
 pub struct UiElement {
     pub role: String,
     pub label: String,
+    /// The control's current value for text-like roles, else empty. Mirrors the
+    /// mac field so the platform-neutral `read_ui` renderer compiles on both
+    /// targets. Not yet populated from UIA (`ValuePattern`) here — a follow-up;
+    /// left empty for now, which the renderer treats the same as "no value".
+    pub value: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,

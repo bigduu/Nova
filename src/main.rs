@@ -55,6 +55,12 @@ struct Cli {
     #[arg(long, value_name = "APP")]
     marks: Option<String>,
 
+    /// DEBUG: print the `read_ui` text listing nova would return for the app
+    /// matching this substring (the AX-first, no-screenshot view), then exit.
+    /// No MCP needed.
+    #[arg(long, value_name = "APP")]
+    read_ui: Option<String>,
+
     /// DEBUG: hit-test a grid over the content area of the app matching this
     /// substring and print, per distinct element, its role/actions and whether
     /// the actionable-ancestor climb accepts it. Shows WHY visible rows aren't
@@ -200,6 +206,25 @@ async fn main() -> Result<()> {
                 }
             }
             None => eprintln!("[marks] no on-screen window matching {app:?}"),
+        }
+        return Ok(());
+    }
+    if let Some(app) = cli.read_ui.as_deref() {
+        match nova::tools::window::pid_for_window(app) {
+            Some((pid, frame)) => {
+                eprintln!("[read_ui] {app:?} -> pid {pid} clip={frame:?}");
+                let els = nova::platform::ui_tree().collect_actionable(pid, 200, Some(frame));
+                let (_, lines) = nova::server::build_ui_entries(els, pid);
+                println!(
+                    "{}",
+                    nova::server::format_ui_listing(
+                        &lines,
+                        &format!("window matching {app:?}"),
+                        None
+                    )
+                );
+            }
+            None => eprintln!("[read_ui] no on-screen window matching {app:?}"),
         }
         return Ok(());
     }

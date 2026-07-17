@@ -15,7 +15,8 @@ stdio or Streamable HTTP.
 
 | Tool | What it does |
 | --- | --- |
-| `screenshot` | Capture the whole display or a single `window=` — returns a JPEG + the pixel-coordinate contract. Numbers actionable elements (Set-of-Mark) by default. |
+| `read_ui` | List the actionable UI as text — `[N] role "label"` straight from the Accessibility tree, no screenshot. Then `click_mark(number=N)`. The AX-first path: cheaper and faster than an image; screenshots become verification-only. |
+| `screenshot` | Capture the whole display or a single `window=` — returns a JPEG + the pixel-coordinate contract. Numbers actionable elements (Set-of-Mark) by default (same `[N]` list as `read_ui`, plus the picture). |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
 | `ocr` | Recognize on-screen text via Apple Vision (on-device, no model files). Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. CJK + Latin. |
 | `click_mark` | Activate a numbered element straight through the Accessibility tree (no cursor, no pixel guessing). |
@@ -104,11 +105,14 @@ nova --http                       # 127.0.0.1:3100/mcp
 nova --http --addr 0.0.0.0:8080   # reachable on the LAN
 ```
 
-**First calls.** Take a `screenshot` to see the desktop and get the numbered
-elements, then `click_mark(number=N)` to activate one — no coordinates needed.
-Drop to `zoom_region` only when a target sits on a surface with no Accessibility
-tree (canvas, games). All pointer tools use the pixel space of the most recent
-screenshot, so screenshot → act → screenshot to confirm.
+**First calls.** Call `read_ui` (optionally `read_ui(window="<name>")`) to list the
+numbered actionable elements as text, then `click_mark(number=N)` to activate one —
+no screenshot, no coordinates needed. Take a `screenshot` when you need to *see* the
+screen (verify a visual result, read a rendered view) or `screenshot(marks=true)` when
+you want the picture alongside the same numbered list; drop to `zoom_region` / `ocr`
+for surfaces with no Accessibility tree (canvas, games). All pointer tools use the
+pixel space of the most recent screenshot, so the loop is: `read_ui` → act → `read_ui`
+(or screenshot) to confirm.
 
 ## Permissions & code signing (macOS)
 
@@ -159,17 +163,23 @@ later rebuilds, re-signed with the same cert, keep the grant.
 ## Coordinate grounding
 
 A general LLM judging pixel coordinates off a downscaled screenshot is the main
-source of mis-clicks. The `screenshot` tool returns a text note with the image's
-exact dimensions and the coordinate contract, and offers three options to make
-targeting precise. **All click/move/scroll tools work in the pixel space of the
-last screenshot** — the server remembers that frame and maps clicks back to the
-real screen, so the model just "clicks what it sees".
+source of mis-clicks — so the primary path avoids pixels entirely.
 
-- **Set-of-Mark (default)** — `screenshot` draws numbered boxes over actionable
-  UI elements (via the Accessibility tree) and lists each one; the agent then
-  calls `click_mark(number=N)` to drive it straight through Accessibility — no
-  pixel guessing at all. The most reliable targeting. Needs Accessibility
-  permission; degrades to plain coordinates without it.
+- **`read_ui` (AX-first, no image)** — list the actionable UI as text (`[N] role
+  "label"`, plus a field's `value`) straight from the Accessibility tree, then
+  `click_mark(number=N)`. No capture, no image tokens, works in the background;
+  this is the default way to *find and click* things. Screenshots are for when you
+  need to *see* the screen. Needs Accessibility permission; an app with no tree
+  comes back empty (fall back to `screenshot` / `ocr`).
+- **Set-of-Mark screenshot** — `screenshot(marks=true)` (the default) draws
+  numbered boxes over the same actionable elements and returns the SAME `[N]` list
+  PLUS the picture, so `click_mark(number=N)` works identically — use it in place of
+  `read_ui` when you also need the image. Needs Accessibility permission; degrades
+  to plain coordinates without it.
+
+When a screenshot *is* needed, **all click/move/scroll tools work in the pixel space
+of the last screenshot** — the server remembers that frame and maps clicks back to
+the real screen, so the model just "clicks what it sees":
 - `screenshot(window: "<name>")` — capture a single window (substring of its
   title or app name) instead of the whole display. Smaller, sharper image → less
   context and far less downscaling → better precision. Later clicks map into

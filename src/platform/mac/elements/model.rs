@@ -5,7 +5,7 @@
 //! control straight through its AX action (true background, no cursor), with a
 //! coordinate-click fallback. [`CachedElement`] pairs the two with the mark number.
 
-use super::attrs::{ax_label, ax_pair, ax_role, click_action_for, element_rect};
+use super::attrs::{ax_label, ax_pair, ax_role, click_action_for, element_rect, value_for_role};
 use super::walk::child_elements;
 use accessibility::{AXAttribute, AXUIElement};
 use core_foundation::base::{CFType, TCFType};
@@ -17,6 +17,11 @@ use core_foundation::string::CFString;
 pub struct UiElement {
     pub role: String,
     pub label: String,
+    /// The control's current value for text-like roles (a field's contents, a
+    /// combo box's selection), else empty. Populated at discovery time via
+    /// [`super::attrs::value_for_role`] so a text-only reader (`read_ui`) can
+    /// report what a field holds without a screenshot. Empty on Windows for now.
+    pub value: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -79,6 +84,7 @@ pub(crate) fn element_info_with_role(el: &AXUIElement, role: &str) -> Option<UiE
     Some(UiElement {
         role: role.to_string(),
         label: ax_label(el),
+        value: value_for_role(el, role),
         x,
         y,
         width,
@@ -293,6 +299,7 @@ mod tests {
         let e = UiElement {
             role: "AXButton".into(),
             label: "OK".into(),
+            value: String::new(),
             x: 100.0,
             y: 200.0,
             width: 80.0,

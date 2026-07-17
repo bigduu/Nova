@@ -205,6 +205,10 @@ fn to_ui_element(
         UiElement {
             role,
             label: name,
+            // TODO: populate from UIA ValuePattern (UIA_ValueValuePropertyId) via
+            // the cached property blob; left empty for now (renderer treats empty
+            // as "no value"), so this matches the mac field without a UIA change.
+            value: String::new(),
             x,
             y,
             width: w,

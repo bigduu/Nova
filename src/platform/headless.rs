@@ -24,6 +24,10 @@ use super::{ElementHandle, OcrLine, WindowHandle};
 pub struct UiElement {
     pub role: String,
     pub label: String,
+    /// The control's current value for text-like roles, else empty. Mirrors the
+    /// mac/Windows field so the platform-neutral `read_ui` renderer compiles on
+    /// every target. Always empty here (this backend discovers no elements).
+    pub value: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,
