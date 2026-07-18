@@ -116,6 +116,23 @@ pub(crate) fn ax_value_string(el: &AXUIElement) -> String {
         .unwrap_or_default()
 }
 
+/// The element's user-visible VALUE for a text-like control, else empty.
+///
+/// Role-gated so the common marks (buttons, links, rows) pay NO extra AX
+/// round-trip — only text-bearing controls are read, and only for them is
+/// `AXValue` a meaningful CFString. A text-only consumer (`read_ui`) needs this
+/// to know what a field already contains WITHOUT taking a screenshot; without
+/// it, reading a form would still force an image. Deliberately excludes
+/// checkbox/radio roles: their `AXValue` is a `CFNumber` (0/1) that
+/// [`ax_value_string`] can't stringify, so surfacing "checked" state is left to
+/// a follow-up rather than emitting a misleading empty string here.
+pub(crate) fn value_for_role(el: &AXUIElement, role: &str) -> String {
+    match role {
+        "AXTextField" | "AXTextArea" | "AXComboBox" | "AXStaticText" => ax_value_string(el),
+        _ => String::new(),
+    }
+}
+
 /// The element's AX role (e.g. `AXButton`), or empty if it exposes none.
 pub(crate) fn ax_role(el: &AXUIElement) -> String {
     el.attribute(&AXAttribute::role())

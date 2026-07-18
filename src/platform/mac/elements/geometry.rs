@@ -149,6 +149,9 @@ pub(crate) fn geometry_rows(
                         UiElement {
                             role: "AXGroup".to_string(),
                             label,
+                            // Synthetic row container built from geometry, not a
+                            // single AX element with a readable value.
+                            value: String::new(),
                             x: rx,
                             y: ry,
                             width: rw,

@@ -359,8 +359,9 @@ fn click_cached_mark(
     // a reused frame) the wrong element.
     if !el.handle.is_alive() {
         return Err(format!(
-            "mark [{}] is stale — the page changed or refreshed since the marks screenshot, so its \
-             numbering no longer applies. Take a fresh screenshot(marks=true) and click the new number.",
+            "mark [{}] is stale — the page changed or refreshed since the marks were read, so its \
+             numbering no longer applies. Run a fresh read_ui (or screenshot(marks=true)) and click \
+             the new number.",
             el.number
         ));
     }
@@ -487,6 +488,143 @@ fn screenshot_note(img: &crate::tools::screenshot::ScreenshotImage, plan: &Captu
     note
 }
 
+// ── read_ui: AX text snapshot (no screenshot) ───────────────────────
+
+/// Default / maximum number of elements a `read_ui` walk returns. The walk
+/// budget doubles as the output cap: 200 covers a dense window, 400 matches the
+/// `screenshot(marks=true)` walk budget and bounds a pathological tree.
+const DEFAULT_READ_UI_MAX: usize = 200;
+const MAX_READ_UI: usize = 400;
+/// Bound on the `read_ui` AX walk, mirroring the screenshot marks-walk timeout —
+/// a cold web tree or a wedged app must not hang the tool.
+const READ_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One entry in a `read_ui` text listing: the click-by-number contract WITHOUT
+/// an image. Kept separate from [`crate::capture::screenshot::Mark`] (which
+/// carries screenshot-pixel coordinates a text read has no use for) so the
+/// renderer stays trivially unit-testable with no display/AX handle.
+#[derive(Debug, Clone)]
+pub struct UiLine {
+    pub number: u32,
+    pub role: String,
+    pub label: String,
+    pub value: String,
+}
+
+/// Split the AX walk output into the click cache (keyed by mark number) AND the
+/// text lines, in ONE pass so the `[N]` printed in the listing and the
+/// `set_marks` key always agree. Mirrors `build_marks` (screenshot.rs) minus the
+/// pixel projection + overlay drawing: numbers are 1-based in walk order,
+/// `center` is the element's global-logical midpoint (the coordinate-click
+/// fallback), and `value` is carried through for text controls. Platform-neutral
+/// (both `UiElement`/`CachedElement` re-exports share these fields), so it
+/// compiles unchanged for the Windows target.
+pub fn build_ui_entries(
+    elements: Vec<(
+        crate::tools::elements::UiElement,
+        Box<dyn crate::platform::ElementHandle>,
+    )>,
+    pid: i32,
+) -> (Vec<crate::tools::elements::CachedElement>, Vec<UiLine>) {
+    let mut cached = Vec::with_capacity(elements.len());
+    let mut lines = Vec::with_capacity(elements.len());
+    for (el, handle) in elements {
+        let number = cached.len() as u32 + 1;
+        let center = el.center();
+        lines.push(UiLine {
+            number,
+            role: el.role.clone(),
+            label: el.label.clone(),
+            value: el.value.clone(),
+        });
+        cached.push(crate::tools::elements::CachedElement {
+            number,
+            handle,
+            center,
+            role: el.role,
+            label: el.label,
+            pid,
+        });
+    }
+    (cached, lines)
+}
+
+/// Trim a control's value for the listing so a long text field can't blow up the
+/// note. Char-based (not byte) so multi-byte text is never split mid-codepoint;
+/// newlines/carriage-returns/tabs collapse to spaces to keep one element on one line.
+fn truncate_value(v: &str) -> String {
+    const MAX: usize = 80;
+    let flat = v.replace(['\n', '\r', '\t'], " ");
+    if flat.chars().count() <= MAX {
+        flat
+    } else {
+        let head: String = flat.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
+/// Render the `read_ui` text listing: one `[N] role "label"` line per element
+/// (plus `= "value"` for text controls). Shares the `[N] role "label"` token
+/// shape with [`format_marks`] so `click_mark`'s numbering contract is identical
+/// whether the marks came from `read_ui` or `screenshot(marks=true)`. With a
+/// `filter`, only matching lines are shown but their ORIGINAL numbers are kept
+/// (so `click_mark(N)` still resolves against the full cache) and the header
+/// reports shown/total.
+pub fn format_ui_listing(lines: &[UiLine], subject: &str, filter: Option<&str>) -> String {
+    if lines.is_empty() {
+        return format!(
+            "read_ui of {subject}: no actionable elements found (the app may expose no \
+             accessibility tree — try screenshot(marks=true), or `ocr` to read plain text)."
+        );
+    }
+    let shown: Vec<&UiLine> = match filter {
+        Some(f) => lines
+            .iter()
+            .filter(|l| {
+                l.role.to_lowercase().contains(f)
+                    || l.label.to_lowercase().contains(f)
+                    || l.value.to_lowercase().contains(f)
+            })
+            .collect(),
+        None => lines.iter().collect(),
+    };
+    if shown.is_empty() {
+        return format!(
+            "read_ui of {subject}: none of {} actionable elements match filter {:?} \
+             (re-run without filter to see them all).",
+            lines.len(),
+            filter.unwrap_or("")
+        );
+    }
+    let header = match filter {
+        Some(f) => format!(
+            "read_ui of {subject}: {} of {} actionable elements match {f:?}",
+            shown.len(),
+            lines.len()
+        ),
+        None => format!("read_ui of {subject}: {} actionable elements", lines.len()),
+    };
+    let mut s = format!(
+        "{header}. Activate one with click_mark(number=N) — no screenshot needed \
+         (background, no cursor). Take a screenshot only to VERIFY a visual result or to read a \
+         marks-less surface; re-run read_ui after the UI changes (numbers reset each read):"
+    );
+    for l in shown {
+        let label = if l.label.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", l.label)
+        };
+        let value = if l.value.is_empty() {
+            String::new()
+        } else {
+            format!(" = \"{}\"", truncate_value(&l.value))
+        };
+        s.push_str(&format!("\n  [{}] {}{}{}", l.number, l.role, label, value));
+    }
+    s
+}
+
 // ── Tool implementations ────────────────────────────────────────────
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -496,32 +634,42 @@ use serde::Deserialize;
 /// Server-level usage guidance surfaced to the model via the MCP `initialize`
 /// `instructions` field. A client that injects server instructions into the
 /// system prompt (bamboo does, only while nova is connected) gives the model the
-/// coordinate-grounding workflow up front — which is the single biggest fix for
-/// "the agent can't find the right pixel to click".
+/// AX-first targeting workflow up front — which is the single biggest fix for
+/// "the agent can't find the right thing to click".
 ///
-/// The failure this prevents (observed in real sessions): the model drives off
+/// The workflow it anchors: read the UI as TEXT with `read_ui` (the Accessibility
+/// tree, no image), act by number with `click_mark`, and take a screenshot only
+/// to VERIFY a visual result or to drive a surface with no tree. This keeps most
+/// steps off the image path entirely.
+///
+/// The failure it prevents (observed in real sessions): the model drives off
 /// full-display screenshots, which are downscaled to ~1280px wide. On a busy or
 /// Retina desktop the target app is a fraction of that frame, so list rows /
 /// sidebar entries / buttons end up ~10px tall — too small to READ (it misreads
 /// labels) and too small to CLICK precisely (it guesses y-coordinates and keeps
-/// missing). The cure is to capture the specific window or zoom a region before
-/// reading or clicking.
+/// missing). `read_ui` sidesteps this (it reads labels exactly, clicks by number);
+/// when a screenshot IS needed, capturing the specific window or zooming a region
+/// is the cure.
 pub const NOVA_INSTRUCTIONS: &str = "\
-Nova controls the macOS desktop: screenshots + mouse/keyboard. All click/move/\
-scroll coordinates are in the pixel space of the MOST RECENT screenshot.
+Nova controls the macOS desktop: read the UI as text (`read_ui`), act (`click_mark` / \
+click / type), and screenshot to VERIFY. Reach for a screenshot when you need to SEE the \
+screen — not as the default way to find things. All click/move/scroll coordinates are in \
+the pixel space of the MOST RECENT screenshot.
 
 Targeting — how to click the right thing, in PRIORITY ORDER (do not jump to raw \
 coordinates first):
-1. BEST — click by mark number. A window/display `screenshot` numbers every \
-actionable element BY DEFAULT (marks is on; needs Accessibility); each is listed \
-as `[N] role \"label\"`. Then call `click_mark(number=N)` to activate [N]. This activates \
-the control in the background with no cursor — web-page content via the page's own \
-JavaScript engine (an Accessibility press is a no-op on web content), native controls \
-via the Accessibility tree — falling back to a coordinate click only if neither applies. \
-It is the most reliable path — \
-use it whenever the element you want appears in the marks list. The numbers reset \
-on every marks capture and go stale when the UI changes, so take a fresh \
-`screenshot(marks=true)` right before each `click_mark`.
+1. BEST — read the UI as TEXT, then click by number. Call `read_ui` (or \
+`read_ui(window=\"<name>\")` to target a specific window) to list every actionable \
+element as `[N] role \"label\"` straight from the Accessibility tree — no screenshot, no \
+image tokens, works in the background. Web-page content is listed too, not just native \
+controls. Then `click_mark(number=N)` activates [N] with no \
+cursor — web-page content via the page's own JavaScript engine (an Accessibility press is \
+a no-op on web content), native controls via the Accessibility tree, else a click at its \
+center. Prefer `read_ui` for plain navigation: it is far cheaper and faster than an image. \
+`screenshot(marks=true)` returns the SAME numbered `[N] role \"label\"` list PLUS a picture \
+— use it in place of `read_ui` only when you also need to see the screen. The numbers reset \
+on every read/capture and go stale when the UI changes, so run a fresh `read_ui` (or \
+`screenshot(marks=true)`) right before each `click_mark`.
 2. Let the app find it for you. Prefer the app's OWN search (click the search box, \
 type the name, press Enter) over visually scanning a long list — far more reliable \
 than estimating a row's position.
@@ -548,12 +696,14 @@ click by number — pass grid=true if you want both.)
 eyeballing the grid — see \"Reading TEXT\" below.
 
 Confirm every action — do NOT operate blind:
-- After EACH input action (click, scroll, type, key press) take a screenshot to \
-see the result BEFORE deciding the next action. Never fire several scrolls or \
-clicks in a row without a screenshot in between — you cannot read what you \
-scrolled past, and an unconfirmed click may have missed.
-- When reading a long view by scrolling, scroll ONE step, screenshot, read, then \
-scroll again — capturing each screen so nothing is skipped.
+- After EACH input action (click, scroll, type, key press) check the result BEFORE \
+deciding the next action: `read_ui` again to confirm a control changed / a new view \
+appeared (cheap, no image), or take a screenshot when the outcome is VISUAL (something \
+rendered, a color/icon/layout changed) or the surface has no Accessibility tree. Never \
+fire several scrolls or clicks in a row without confirming in between — you cannot read \
+what you scrolled past, and an unconfirmed click may have missed.
+- When reading a long view by scrolling, scroll ONE step, then read (`read_ui` or \
+screenshot/`ocr`), then scroll again — capturing each screen so nothing is skipped.
 
 Keep captures focused — once you know WHICH part of the screen matters, capture \
 just that part instead of the whole display:
@@ -583,18 +733,18 @@ back EMPTY or sparse (canvas, games, image-/custom-rendered views, chat bubbles)
 Each line carries a clickable center, so left_click(x, y) a line to click text \
 that is not an Accessibility element.
 - Do NOT reach for `ocr` when the target IS an actionable native/web control \
-(button, link, field, list row): `screenshot(marks=true)` + `click_mark` is more \
-precise — it drives the control directly with no pixel guessing. And `ocr` \
-returns no image, so when you need to SEE layout / icons / state, take a \
-`screenshot`.
+(button, link, field, list row): `read_ui` (or `screenshot(marks=true)`) + \
+`click_mark` is more precise — it drives the control directly with no pixel \
+guessing. And `ocr` returns no image, so when you need to SEE layout / icons / \
+state, take a `screenshot`.
 - COMBINE by role within one window: the native CHROME (sidebar, toolbar, \
-buttons) is usually marked → use marks + click_mark there; the CONTENT (message \
-bubbles, a rendered document) is often AX-less → use `ocr` to read or click it. \
-A WeChat chat is the canonical case: marks finds only the few titlebar buttons, \
-while `ocr` reads the whole conversation. Typical flow: \
-`screenshot(window=\"X\", marks=true)` to act on controls, then `ocr(window=\"X\")` \
-to read the content — and pass `window=\"<name>\"` (or `zoom_region` first) for \
-sharper recognition of small text.
+buttons) is usually in the Accessibility tree → `read_ui` + click_mark there; the \
+CONTENT (message bubbles, a rendered document) is often AX-less → use `ocr` to \
+read or click it. A WeChat chat is the canonical case: read_ui/marks find only \
+the few titlebar buttons, while `ocr` reads the whole conversation. Typical flow: \
+`read_ui(window=\"X\")` to act on controls, then `ocr(window=\"X\")` to read the \
+content — and pass `window=\"<name>\"` (or `zoom_region` first) for sharper \
+recognition of small text.
 
 Typing:
 - `type_text` accepts ANY text, including non-ASCII (e.g. 中文) and emoji. To \
@@ -611,16 +761,16 @@ without moving your cursor or raising the window. It only works after a \
 `window=` capture, and browsers / Electron / custom-rendered apps IGNORE it — \
 so if a background action has no visible effect, retry WITHOUT background.
 - The Accessibility tree also drives controls directly, in the background, with no \
-coordinates: `click_mark(number=N)` (preferred — pick the element from a \
-`marks=true` shot), or by label match `ax_click`/`ax_set_value`/`ax_focus` (a \
+coordinates: `click_mark(number=N)` (preferred — pick the element from a `read_ui` \
+or `marks=true` shot), or by label match `ax_click`/`ax_set_value`/`ax_focus` (a \
 substring of the element's role/label). The label-match tools need a semantic \
 control, so they return \"no element\" on div-rendered pages (use click_mark on a \
 row mark there instead) and on canvas/game surfaces with no tree.
 
-Workflow for \"find X inside app Y\": screenshot(window=\"Y\", marks=true) → if X is \
-listed, click_mark(number=N) → screenshot to confirm. If X is not in the marks, \
-use Y's search box or zoom_region until X is legible, then click its coordinates \
-→ screenshot to confirm.";
+Workflow for \"find X inside app Y\": read_ui(window=\"Y\") → if X is listed, \
+click_mark(number=N) → read_ui again (or screenshot) to confirm. If X is not in the list, \
+use Y's search box, or take screenshot(window=\"Y\") / zoom_region until X is legible, then \
+click its coordinates → screenshot to confirm.";
 
 // Tool parameter types — all stub, to be fleshed out in implementation.
 
@@ -774,7 +924,7 @@ pub struct AxSetValueParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClickMarkParams {
     /// The mark number [N] of the element to activate, as listed by the most
-    /// recent `screenshot(marks=true)`.
+    /// recent `read_ui` or `screenshot(marks=true)`.
     pub number: u32,
     /// Deliver the coordinate-click fallback in the background to the captured
     /// window's process (native apps only). The AX action is always background;
@@ -794,6 +944,26 @@ pub struct OcrParams {
     /// Omitted, defaults to Simplified Chinese + English.
     #[serde(default)]
     pub languages: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadUiParams {
+    /// Target a single on-screen window: a case-insensitive substring of its
+    /// title or app name (e.g. "Safari", "Settings"). Omit to read the current
+    /// target app — the last window-captured or read_ui'd app, otherwise the
+    /// frontmost. Web-page content is included either way (as long as the app has
+    /// a window); a window= just narrows and sharpens the listing to that window.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Show only elements whose role, label, or value contains this
+    /// case-insensitive substring (e.g. "button", "search", "submit"). Omit to
+    /// list everything. Filtering only narrows the DISPLAY — the hidden elements
+    /// keep their numbers and stay clickable by click_mark(N).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Cap on the number of elements returned (default 200, max 400).
+    #[serde(default)]
+    pub max: Option<usize>,
 }
 
 #[tool_router]
@@ -900,7 +1070,8 @@ impl NovaServer {
                        you need to read or click TEXT on a surface where marks come back empty — \
                        canvas, games, image-rendered or custom-drawn views — or to grab a lot of \
                        text at once without parsing a screenshot. For native/web UI with an \
-                       Accessibility tree, screenshot(marks=true) + click_mark is still more precise. \
+                       Accessibility tree, read_ui (or screenshot(marks=true)) + click_mark is still \
+                       more precise. \
                        Languages default to Simplified Chinese + English; pass languages=[...] (BCP-47) \
                        to override."
     )]
@@ -1286,15 +1457,15 @@ impl NovaServer {
 
     #[tool(
         name = "click_mark",
-        description = "Activate an actionable element by the mark NUMBER shown in the most recent \
-                       screenshot(marks=true) — the reliable way to click without guessing \
-                       coordinates. Always background, no cursor movement: web-page content in a \
-                       scriptable browser (Safari, Chrome, Arc, Edge, Brave, …) is clicked through \
-                       the page's OWN JavaScript engine (an Accessibility press is a silent no-op on \
-                       web content), native controls through the Accessibility tree; if neither \
-                       applies it falls back to a click at the element's center. Numbers go stale \
-                       when the UI changes, so take a fresh screenshot(marks=true) right before \
-                       calling this. If the number is unknown, re-shoot with marks=true."
+        description = "Activate an actionable element by the mark NUMBER shown by the most recent \
+                       read_ui or screenshot(marks=true) — the reliable way to click without \
+                       guessing coordinates. Always background, no cursor movement: web-page content \
+                       in a scriptable browser (Safari, Chrome, Arc, Edge, Brave, …) is clicked \
+                       through the page's OWN JavaScript engine (an Accessibility press is a silent \
+                       no-op on web content), native controls through the Accessibility tree; if \
+                       neither applies it falls back to a click at the element's center. Numbers go \
+                       stale when the UI changes, so run a fresh read_ui (or screenshot(marks=true)) \
+                       right before calling this. If the number is unknown, read_ui again."
     )]
     #[tracing::instrument(skip_all, fields(number = %p.number, background = %p.background), level = "info")]
     async fn click_mark(
@@ -1303,8 +1474,8 @@ impl NovaServer {
     ) -> rmcp::model::CallToolResult {
         let Some(el) = self.get_mark(p.number) else {
             return err_result(&format!(
-                "unknown mark [{}] — take a screenshot with marks=true first (numbers reset each \
-                 marks capture)",
+                "unknown mark [{}] — run read_ui (or screenshot(marks=true)) first (numbers reset \
+                 each read/capture)",
                 p.number
             ));
         };
@@ -1334,6 +1505,121 @@ impl NovaServer {
             Ok(text) => ok_text(text),
             Err(join_err) => err_result(&format!("dump_ax task failed: {join_err}")),
         }
+    }
+
+    #[tool(
+        name = "read_ui",
+        description = "Read the actionable UI as TEXT — no screenshot. Lists every actionable \
+                       element of a window (or the frontmost app) as [N] role \"label\" (plus = \
+                       \"value\" for text fields), then you activate one with click_mark(number=N). \
+                       This is the AX-FIRST path: it uses the Accessibility tree directly, so it is \
+                       far cheaper and faster than a screenshot (text tokens, no image, no capture) \
+                       and it works in the background. Prefer it over screenshot(marks=true) for \
+                       plain navigation — find the control, click it by number, read_ui again to \
+                       confirm. Take a screenshot only when you must SEE a visual result (layout, \
+                       icons, colors, rendered state) or drive a surface with no Accessibility tree \
+                       (canvas/games — use ocr there). Web-page content is listed too, not just \
+                       native controls. Pass window=\"<name>\" to target a specific window for a \
+                       tighter list; filter=\"...\" to narrow by role/label; max to cap the count. Numbers reset each read, so read_ui again after the UI \
+                       changes. Needs Accessibility permission; an app with no tree comes back empty \
+                       (fall back to screenshot/ocr)."
+    )]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, filter = ?p.filter, max = ?p.max), level = "info")]
+    async fn read_ui(
+        &self,
+        Parameters(p): Parameters<ReadUiParams>,
+    ) -> rmcp::model::CallToolResult {
+        let max = p.max.unwrap_or(DEFAULT_READ_UI_MAX).clamp(1, MAX_READ_UI);
+        let filter = p
+            .filter
+            .map(|f| f.trim().to_lowercase())
+            .filter(|f| !f.is_empty());
+
+        // Resolve the target app (pid) + a clip rect + a human subject. The clip
+        // matters: the AX walk's web hit-test / geometry passes only run WITH a
+        // clip, so a bare (frontmost) read still resolves that app's own window
+        // frame — otherwise a page's web content would be invisible. Both lookups
+        // are blocking daemon round-trips, so they run off the async runtime.
+        let (pid, clip, subject) = match p.window.clone() {
+            Some(query) => {
+                let q = query.clone();
+                match tokio::task::spawn_blocking(move || crate::tools::window::pid_for_window(&q))
+                    .await
+                {
+                    Ok(Some((pid, frame))) => {
+                        (pid, Some(frame), format!("window matching {query:?}"))
+                    }
+                    Ok(None) => {
+                        return err_result(&format!(
+                            "no on-screen window matching {query:?} — take a screenshot (omit \
+                             window=) to see the windows that are on screen, then retry with an \
+                             exact name."
+                        ));
+                    }
+                    Err(join_err) => {
+                        return err_result(&format!("read_ui window lookup failed: {join_err}"));
+                    }
+                }
+            }
+            None => {
+                // `current_ax_pid()` returns the STICKY target_pid (the last
+                // window-captured / read_ui'd app) when set, and only falls back to
+                // the true frontmost app otherwise. Name the source honestly rather
+                // than always claiming "the frontmost app" — after a window capture,
+                // a bare read_ui reads that (possibly background) app. Read the lock
+                // and drop it before any await.
+                let cached = *self.target_pid.lock().expect("target_pid mutex");
+                let (pid, subject) = match cached {
+                    Some(pid) => (pid, "the current target app".to_string()),
+                    None => {
+                        let Some(pid) =
+                            tokio::task::spawn_blocking(crate::tools::window::frontmost_app_pid)
+                                .await
+                                .ok()
+                                .flatten()
+                        else {
+                            return err_result(
+                                "no target app (take a window screenshot first, or pass \
+                                 window=\"<name>\")",
+                            );
+                        };
+                        (pid, "the frontmost app".to_string())
+                    }
+                };
+                let clip = tokio::task::spawn_blocking(move || {
+                    crate::tools::window::frontmost_window_frame(pid)
+                })
+                .await
+                .ok()
+                .flatten();
+                (pid, clip, subject)
+            }
+        };
+
+        // Walk the AX tree + build the listing off the async runtime; a cold web
+        // tree or a wedged app must not hang the tool, so bound it.
+        let walk = tokio::task::spawn_blocking(move || {
+            let elements = crate::platform::ui_tree().collect_actionable(pid, max, clip);
+            build_ui_entries(elements, pid)
+        });
+        let (cached, lines) = match tokio::time::timeout(READ_UI_TIMEOUT, walk).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(join_err)) => return err_result(&format!("read_ui walk failed: {join_err}")),
+            Err(_) => {
+                return err_result(
+                    "read_ui timed out (the accessibility walk did not complete; try \
+                     screenshot(marks=true) instead).",
+                );
+            }
+        };
+
+        // Cache the marks so click_mark works with NO screenshot in between, route
+        // input to this app, and keep its (web) AX tree warm for the next read.
+        self.set_marks(cached);
+        self.set_target_pid(Some(pid));
+        crate::platform::ui_tree().keep_warm(pid);
+
+        ok_text(format_ui_listing(&lines, &subject, filter.as_deref()))
     }
 }
 
@@ -1438,6 +1724,7 @@ mod tests {
             "ax_set_value",
             "ax_focus",
             "click_mark",
+            "read_ui",
             "dump_ax",
         ];
         for name in expected {
@@ -1599,6 +1886,97 @@ mod tests {
         };
         let note = screenshot_note(&img, &plan);
         assert!(note.contains("No actionable elements detected"), "{note}");
+    }
+
+    // ── read_ui text listing (hermetic — no display / AX) ───────────────
+
+    fn ui_line(number: u32, role: &str, label: &str, value: &str) -> UiLine {
+        UiLine {
+            number,
+            role: role.to_string(),
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn read_ui_listing_uses_the_same_mark_token_as_screenshots() {
+        // The `[N] role "label"` shape must match `format_marks` so click_mark's
+        // numbering contract is identical across read_ui and screenshot(marks).
+        let lines = vec![
+            ui_line(1, "AXButton", "Send", ""),
+            ui_line(2, "AXLink", "Home", ""),
+        ];
+        let out = format_ui_listing(&lines, "window matching \"Mail\"", None);
+        assert!(out.contains("[1] AXButton \"Send\""), "{out}");
+        assert!(out.contains("[2] AXLink \"Home\""), "{out}");
+        assert!(out.contains("click_mark"), "{out}");
+        assert!(out.contains("2 actionable elements"), "{out}");
+    }
+
+    #[test]
+    fn read_ui_listing_shows_field_value() {
+        let lines = vec![ui_line(1, "AXTextField", "Search", "hello world")];
+        let out = format_ui_listing(&lines, "the frontmost app", None);
+        assert!(
+            out.contains("[1] AXTextField \"Search\" = \"hello world\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn read_ui_listing_empty_points_to_alternatives() {
+        let out = format_ui_listing(&[], "the frontmost app", None);
+        assert!(out.contains("no actionable elements"), "{out}");
+        // Steers the model to the fallbacks rather than dead-ending.
+        assert!(out.contains("screenshot") && out.contains("ocr"), "{out}");
+    }
+
+    #[test]
+    fn read_ui_filter_narrows_display_but_keeps_original_numbers() {
+        // Filtering is display-only: hidden elements keep their numbers so
+        // click_mark(N) still resolves against the full cache.
+        let lines = vec![
+            ui_line(1, "AXButton", "Send", ""),
+            ui_line(2, "AXTextField", "Search", ""),
+            ui_line(3, "AXButton", "Search again", ""),
+        ];
+        let out = format_ui_listing(&lines, "the frontmost app", Some("search"));
+        assert!(out.contains("2 of 3 actionable elements"), "{out}");
+        // Matches keep their ORIGINAL numbers ([2], [3]); [1] is hidden.
+        assert!(out.contains("[2] AXTextField \"Search\""), "{out}");
+        assert!(out.contains("[3] AXButton \"Search again\""), "{out}");
+        assert!(!out.contains("[1] AXButton \"Send\""), "{out}");
+    }
+
+    #[test]
+    fn read_ui_filter_no_match_is_explicit() {
+        let lines = vec![ui_line(1, "AXButton", "Send", "")];
+        let out = format_ui_listing(&lines, "the frontmost app", Some("zzz"));
+        assert!(out.contains("none of 1 actionable elements match"), "{out}");
+    }
+
+    #[test]
+    fn read_ui_value_is_truncated_and_single_line() {
+        // Value carries every kind of vertical whitespace a control might hold.
+        let long = format!("{}\nsecond\rthird\tfourth", "x".repeat(200));
+        let lines = vec![ui_line(1, "AXTextArea", "Body", &long)];
+        let out = format_ui_listing(&lines, "the frontmost app", None);
+        assert!(out.contains('…'), "long value should be truncated: {out}");
+        // Newlines/carriage-returns/tabs in the value must not break the
+        // one-element-per-line layout: only the leading list-separator newline
+        // remains, and no stray \r/\t leak through.
+        assert_eq!(out.matches('\n').count(), 1, "{out}");
+        assert!(!out.contains('\r') && !out.contains('\t'), "{out}");
+    }
+
+    #[test]
+    fn truncate_value_preserves_short_multibyte_text() {
+        assert_eq!(truncate_value("héllo 中文"), "héllo 中文");
+        let long = "中".repeat(100);
+        let out = truncate_value(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 81); // 80 kept + ellipsis
     }
 
     /// A zero/negative-size zoom must be rejected up front, before any capture

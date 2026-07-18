@@ -59,6 +59,28 @@ pub fn pid_for_window(query: &str) -> Option<(i32, (f64, f64, f64, f64))> {
         .map(|w| (w.pid, (w.x, w.y, w.width, w.height)))
 }
 
+/// Global-logical frame `(x, y, w, h)` of the largest on-screen window owned by
+/// `pid`, if any. Used as the `read_ui` clip when no window query is given: the
+/// AX walk's web hit-test / geometry passes only run WITH a clip rect (a `None`
+/// clip returns just the native tree walk), so resolving the frontmost app's own
+/// window frame is what lets a bare `read_ui` still surface web-page content.
+/// Largest-area (not first) for the same reason as [`pid_for_window`]: an app's
+/// tiny auxiliary/PiP windows must not win over its real main window. Needs
+/// Screen Recording; `None` if the app has no titled on-screen window.
+pub fn frontmost_window_frame(pid: i32) -> Option<(f64, f64, f64, f64)> {
+    crate::platform::window_manager()
+        .list_windows()
+        .ok()?
+        .into_iter()
+        .filter(|w| w.pid == pid && !w.title.is_empty())
+        .max_by(|a, b| {
+            (a.width * a.height)
+                .partial_cmp(&(b.width * b.height))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|w| (w.x, w.y, w.width, w.height))
+}
+
 /// `CGWindowID` of the window owned by `pid` whose global frame matches `rect`
 /// (the capture's clip). Lets mark discovery match an AX window node to the
 /// captured window EXACTLY (via `_AXUIElementGetWindow`) instead of by size —

@@ -3,7 +3,9 @@
 //! visible window. This is the "native chrome" half of mark discovery; the web
 //! content half is the hit-test pass (see [`super::hittest`]).
 
-use super::attrs::{ax_label, ax_window_id, element_array, element_rect, rects_intersect, Rect};
+use super::attrs::{
+    ax_label, ax_window_id, element_array, element_rect, rects_intersect, value_for_role, Rect,
+};
 use super::model::{is_target, UiElement};
 use crate::platform::mac::elements::attrs::ax_role;
 use accessibility::AXUIElement;
@@ -241,6 +243,7 @@ impl Walk {
                             UiElement {
                                 role: role.clone(),
                                 label: ax_label(el),
+                                value: value_for_role(el, &role),
                                 x: r.0,
                                 y: r.1,
                                 width: r.2,
