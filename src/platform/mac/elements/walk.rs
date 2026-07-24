@@ -84,14 +84,13 @@ pub(crate) fn child_elements(el: &AXUIElement, role: &str) -> Vec<AXUIElement> {
 /// any title-bar inset), applied PER ELEMENT so a frame WebKit already reports
 /// globally is left untouched.
 #[derive(Clone, Copy)]
-struct CoordLift {
+pub(crate) struct CoordLift {
     /// Local→global translation: `global = local + off`.
     off: (f64, f64),
-    /// The window's true global origin (from `clip`). A frame whose origin sits
-    /// left of / above this is in local space and must be lifted; one at/after it
-    /// is already global and is left alone.
-    gx: f64,
-    gy: f64,
+    /// Independently sourced global window frame. Comparing intersection before
+    /// and after translation works on negative-coordinate secondary displays,
+    /// unlike an origin-only `x < global_x` heuristic.
+    clip: Rect,
 }
 
 impl CoordLift {
@@ -109,7 +108,11 @@ impl CoordLift {
     /// even for two same-sized windows of one app. When it's `None` (no clip, or
     /// the id couldn't be resolved) fall back to matching by frame SIZE — AX
     /// reports the right size even when the origin is view-local.
-    fn derive(win: &AXUIElement, clip: Rect, target_window: Option<u32>) -> Option<CoordLift> {
+    pub(crate) fn derive(
+        win: &AXUIElement,
+        clip: Rect,
+        target_window: Option<u32>,
+    ) -> Option<CoordLift> {
         let raw = element_rect(win)?;
         let is_captured = match target_window {
             Some(id) => ax_window_id(win) == Some(id),
@@ -120,18 +123,23 @@ impl CoordLift {
         }
         Some(CoordLift {
             off: (clip.0 - raw.0, clip.1 - raw.1),
-            gx: clip.0,
-            gy: clip.1,
+            clip,
         })
     }
 
     /// Lift `r` into global coords if it sits in the window's local space.
-    fn lift(lift: Option<CoordLift>, r: Rect) -> Rect {
-        match lift {
-            Some(c) if c.off != (0.0, 0.0) && (r.0 < c.gx - 1.0 || r.1 < c.gy - 1.0) => {
-                (r.0 + c.off.0, r.1 + c.off.1, r.2, r.3)
-            }
-            _ => r,
+    pub(crate) fn lift(lift: Option<CoordLift>, r: Rect) -> Rect {
+        let Some(c) = lift else {
+            return r;
+        };
+        if c.off == (0.0, 0.0) || rects_intersect(r, c.clip) {
+            return r;
+        }
+        let shifted = (r.0 + c.off.0, r.1 + c.off.1, r.2, r.3);
+        if rects_intersect(shifted, c.clip) {
+            shifted
+        } else {
+            r
         }
     }
 }
@@ -278,8 +286,7 @@ mod tests {
         // off = clip_origin - window_ax_origin = (3439,1408) - (0,30)
         CoordLift {
             off: (3439.0, 1378.0),
-            gx: 3439.0,
-            gy: 1408.0,
+            clip: (3439.0, 1408.0, 1720.0, 1409.0),
         }
     }
 
@@ -314,8 +321,7 @@ mod tests {
         // Primary display: AX agrees with the window list, so nothing shifts.
         let c = Some(CoordLift {
             off: (0.0, 0.0),
-            gx: 0.0,
-            gy: 30.0,
+            clip: (0.0, 30.0, 1720.0, 1409.0),
         });
         assert_eq!(
             CoordLift::lift(c, (303.0, 1259.0, 976.0, 81.0)),
@@ -324,6 +330,18 @@ mod tests {
         assert_eq!(
             CoordLift::lift(None, (1.0, 2.0, 3.0, 4.0)),
             (1.0, 2.0, 3.0, 4.0)
+        );
+    }
+
+    #[test]
+    fn lifts_view_local_content_on_a_negative_coordinate_display() {
+        let c = Some(CoordLift {
+            off: (-1600.0, 70.0),
+            clip: (-1600.0, 100.0, 1200.0, 900.0),
+        });
+        assert_eq!(
+            CoordLift::lift(c, (100.0, 200.0, 300.0, 40.0)),
+            (-1500.0, 270.0, 300.0, 40.0)
         );
     }
 }

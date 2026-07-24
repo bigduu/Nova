@@ -5,11 +5,13 @@
 
 use accessibility::{AXAttribute, AXUIElement, Error as AxError};
 use accessibility_sys::{
-    error_string, kAXErrorSuccess, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    AXUIElementCopyAttributeValue, AXUIElementRef, AXValueGetValue, AXValueRef,
+    error_string, kAXErrorSuccess, kAXValueTypeCGPoint, kAXValueTypeCGSize, AXIsProcessTrusted,
+    AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementRef, AXValueGetValue, AXValueRef,
 };
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, CFTypeRef, TCFType};
+use core_foundation::boolean::CFBoolean;
+use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use std::ffi::c_void;
 
@@ -80,6 +82,69 @@ pub(crate) fn element_array(el: &AXUIElement, name: &str) -> Vec<AXUIElement> {
     array.into_iter().map(|e| e.clone()).collect()
 }
 
+/// Read an AX attribute known to contain one `AXUIElement`.
+pub(crate) fn element_attribute(el: &AXUIElement, name: &str) -> Option<AXUIElement> {
+    let attr = CFString::new(name);
+    let mut value: CFTypeRef = std::ptr::null();
+    // SAFETY: standard AX copy-attribute call. The named attributes used by
+    // callers (`AXFocusedApplication`, `AXFocusedWindow`, `AXMainWindow`) are
+    // specified to return an AXUIElementRef.
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(
+            el.as_concrete_TypeRef(),
+            attr.as_concrete_TypeRef(),
+            &mut value,
+        )
+    };
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` is the +1 AXUIElementRef described above; transfer that
+    // ownership into the safe wrapper.
+    Some(unsafe { AXUIElement::wrap_under_create_rule(value as accessibility_sys::AXUIElementRef) })
+}
+
+/// Process id owning an AX element.
+pub(crate) fn ax_pid(el: &AXUIElement) -> Option<i32> {
+    let mut pid = 0i32;
+    // SAFETY: the call only writes one pid_t into our local.
+    let err = unsafe { AXUIElementGetPid(el.as_concrete_TypeRef(), &mut pid) };
+    (err == kAXErrorSuccess && pid > 0).then_some(pid)
+}
+
+/// Whether the current Nova process has the macOS Accessibility TCC grant.
+pub(crate) fn process_is_trusted() -> bool {
+    // SAFETY: argument-free process trust query.
+    unsafe { AXIsProcessTrusted() }
+}
+
+/// Read an arbitrary string-valued AX attribute.
+pub(crate) fn ax_string(el: &AXUIElement, name: &'static str) -> String {
+    let attr = AXAttribute::<CFType>::new(&CFString::from_static_string(name));
+    el.attribute(&attr)
+        .ok()
+        .and_then(|v| v.downcast_into::<CFString>())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// Read an arbitrary boolean-ish AX attribute. Cocoa controls use either
+/// CFBoolean or CFNumber for these states depending on the role/provider.
+pub(crate) fn ax_bool(el: &AXUIElement, name: &'static str) -> Option<bool> {
+    let attr = AXAttribute::<CFType>::new(&CFString::from_static_string(name));
+    let value = el.attribute(&attr).ok()?;
+    if value.instance_of::<CFBoolean>() {
+        return value.downcast_into::<CFBoolean>().map(bool::from);
+    }
+    if value.instance_of::<CFNumber>() {
+        return value
+            .downcast_into::<CFNumber>()
+            .and_then(|number| number.to_i64())
+            .map(|number| number != 0);
+    }
+    None
+}
+
 /// Render an accessibility error with its symbolic name (e.g.
 /// `kAXErrorActionUnsupported (-25206)`) instead of a bare numeric code.
 pub(crate) fn ax_err(e: &AxError) -> String {
@@ -91,17 +156,23 @@ pub(crate) fn ax_err(e: &AxError) -> String {
 
 /// Best human label for an element: title, else description.
 pub(crate) fn ax_label(el: &AXUIElement) -> String {
-    el.attribute(&AXAttribute::title())
-        .ok()
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            el.attribute(&AXAttribute::description())
-                .ok()
-                .map(|s| s.to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default()
+    let title = ax_title(el);
+    if !title.is_empty() {
+        return title;
+    }
+    ax_description(el)
+}
+
+pub(crate) fn ax_title(el: &AXUIElement) -> String {
+    ax_string(el, "AXTitle")
+}
+
+pub(crate) fn ax_description(el: &AXUIElement) -> String {
+    ax_string(el, "AXDescription")
+}
+
+pub(crate) fn ax_help(el: &AXUIElement) -> String {
+    ax_string(el, "AXHelp")
 }
 
 /// The element's `AXValue` rendered as a string, if it holds one (e.g. an
@@ -127,10 +198,25 @@ pub(crate) fn ax_value_string(el: &AXUIElement) -> String {
 /// [`ax_value_string`] can't stringify, so surfacing "checked" state is left to
 /// a follow-up rather than emitting a misleading empty string here.
 pub(crate) fn value_for_role(el: &AXUIElement, role: &str) -> String {
+    let subrole = ax_subrole(el);
+    if is_secure_field(el, role, &subrole) {
+        return "[REDACTED]".to_string();
+    }
     match role {
-        "AXTextField" | "AXTextArea" | "AXComboBox" | "AXStaticText" => ax_value_string(el),
+        "AXTextField" | "AXSecureTextField" | "AXTextArea" | "AXComboBox" | "AXStaticText" => {
+            ax_value_string(el)
+        }
         _ => String::new(),
     }
+}
+
+/// Password/secure controls must be classified before their value is read.
+pub(crate) fn is_secure_field(el: &AXUIElement, role: &str, subrole: &str) -> bool {
+    role == "AXSecureTextField"
+        || subrole == "AXSecureTextField"
+        || role.to_ascii_lowercase().contains("secure")
+        || subrole.to_ascii_lowercase().contains("secure")
+        || ax_bool(el, "AXProtectedContent") == Some(true)
 }
 
 /// The element's AX role (e.g. `AXButton`), or empty if it exposes none.

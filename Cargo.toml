@@ -69,10 +69,12 @@ core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 accessibility = "0.2"
 accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
 core-foundation = "0.10"            # CFString/CFType — must match accessibility's
+# Running-app enumeration for AX-only target resolution.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSWorkspace", "NSRunningApplication"] }
 
 # Apple Vision OCR (VNRecognizeTextRequest) — native, on-device, no model files.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSData", "NSDictionary", "NSError"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSEnumerator", "NSData", "NSDictionary", "NSError"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "VNError", "objc2-core-foundation"] }
 
 # ── Platform-specific (Windows) ───────────────────────────────────────

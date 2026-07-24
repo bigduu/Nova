@@ -16,7 +16,7 @@
 //! Tauri shells) expose no JS-exec AppleScript command, so they are not matched
 //! here and fall back to AX / coordinate clicking.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// A scriptable browser we can drive via AppleScript JS execution.
 pub(crate) struct Browser {
@@ -71,6 +71,7 @@ pub(crate) fn js_click_at(
     cx: f64,
     cy: f64,
     label: &str,
+    deadline: std::time::Instant,
 ) -> Result<String, String> {
     let (cx, cy) = (cx.round() as i64, cy.round() as i64);
     let label_lit = js_string(label);
@@ -107,11 +108,35 @@ pub(crate) fn js_click_at(
         )
     };
 
-    let out = Command::new("osascript")
+    let mut child = Command::new("osascript")
         .arg("-e")
         .arg(&script)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("osascript spawn failed: {e}"))?;
+    let out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().map_err(|e| e.to_string())?,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(std::cmp::min(
+                    std::time::Duration::from_millis(20),
+                    remaining,
+                ));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("osascript web click exceeded the action deadline".to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("osascript status check failed: {error}"));
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let result = stdout.trim().trim_matches('"').trim();
     if !out.status.success() {

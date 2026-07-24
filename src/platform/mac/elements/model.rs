@@ -5,7 +5,7 @@
 //! control straight through its AX action (true background, no cursor), with a
 //! coordinate-click fallback. [`CachedElement`] pairs the two with the mark number.
 
-use super::attrs::{ax_label, ax_pair, ax_role, click_action_for, element_rect, value_for_role};
+use super::attrs::{ax_label, ax_role, click_action_for, element_rect, value_for_role};
 use super::walk::child_elements;
 use accessibility::{AXAttribute, AXUIElement};
 use core_foundation::base::{CFType, TCFType};
@@ -188,20 +188,16 @@ impl AxHandle {
         Err("element (and its descendants/ancestors) expose no click action".to_string())
     }
 
-    /// Whether this handle still points at a live, laid-out element. After a page
+    /// Whether this handle still points at a live element. After a page
     /// refresh or navigation Chromium destroys and rebuilds its AX tree, leaving
-    /// cached handles dangling; a dangling handle stops reporting a role/frame.
+    /// cached handles dangling; a dangling handle stops reporting a role.
+    /// Geometry is deliberately not required here: an offscreen/framelss
+    /// control may still expose a valid semantic action, while coordinate
+    /// fallback separately requires [`Self::current_center`].
     /// The click path checks this so a stale mark reports "re-capture" instead of
     /// silently pressing the wrong thing (or a destroyed node).
     pub fn is_alive(&self) -> bool {
-        // A live element still answers for its role; a destroyed one returns an
-        // error (or empty). Require a non-empty role AND a real frame so a
-        // re-used-but-collapsed node doesn't read as live.
-        if ax_role(&self.0).is_empty() {
-            return false;
-        }
-        matches!(ax_pair(&self.0, "AXSize", accessibility_sys::kAXValueTypeCGSize),
-            Some((w, h)) if w >= 1.0 && h >= 1.0)
+        !ax_role(&self.0).is_empty()
     }
 
     /// This handle's current center in global logical points, if still laid out —

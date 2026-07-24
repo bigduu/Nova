@@ -102,6 +102,234 @@ pub struct WindowHandle {
     pub is_visible: bool,
 }
 
+/// Which portion of an accessibility tree a semantic read should return.
+///
+/// `Interactive` preserves the existing Set-of-Mark/read_ui contract,
+/// `Content` returns human-readable semantic content even when it is not
+/// actionable, and `All` combines both in one deterministic snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiReadMode {
+    Interactive,
+    Content,
+    All,
+}
+
+impl UiReadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Content => "content",
+            Self::All => "all",
+        }
+    }
+
+    pub fn includes_interactive(self) -> bool {
+        matches!(self, Self::Interactive | Self::All)
+    }
+
+    pub fn includes_content(self) -> bool {
+        matches!(self, Self::Content | Self::All)
+    }
+}
+
+/// A semantic node's optional bounds in global logical points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl UiBounds {
+    pub fn center(self) -> (f64, f64) {
+        (self.x + self.width / 2.0, self.y + self.height / 2.0)
+    }
+
+    pub fn as_tuple(self) -> (f64, f64, f64, f64) {
+        (self.x, self.y, self.width, self.height)
+    }
+}
+
+/// Cross-platform semantic state. `None` means the backend/control does not
+/// expose that state; it must never be rendered as a misleading `false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiNodeStates {
+    pub enabled: Option<bool>,
+    pub focused: Option<bool>,
+    pub selected: Option<bool>,
+    pub checked: Option<bool>,
+    pub expanded: Option<bool>,
+}
+
+/// A node value whose secure/redacted state is impossible to confuse with
+/// ordinary text. Platform implementations must decide this before reading or
+/// returning a password value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiNodeValue {
+    Absent,
+    Text(String),
+    Redacted,
+}
+
+impl UiNodeValue {
+    pub fn as_filter_text(&self) -> &str {
+        match self {
+            Self::Absent => "",
+            Self::Text(value) => value,
+            Self::Redacted => "[REDACTED]",
+        }
+    }
+
+    pub fn is_redacted(&self) -> bool {
+        matches!(self, Self::Redacted)
+    }
+}
+
+/// One platform-neutral accessibility/UIA node.
+///
+/// The optional live handle is carried separately in [`CollectedUiNode`] so
+/// readable content nodes can share this same DTO without pretending they are
+/// actionable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiNode {
+    pub role: String,
+    pub name: String,
+    pub description: String,
+    pub value: UiNodeValue,
+    pub actions: Vec<String>,
+    pub states: UiNodeStates,
+    pub bounds: Option<UiBounds>,
+    pub depth: usize,
+    pub actionable: bool,
+}
+
+/// One collected semantic node plus its optional live action handle.
+#[derive(Debug, Clone)]
+pub struct CollectedUiNode {
+    pub node: UiNode,
+    pub handle: Option<Box<dyn ElementHandle>>,
+}
+
+/// Exact app/window selected for a semantic read without taking a screenshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiTarget {
+    pub pid: i32,
+    pub app_name: String,
+    pub window_title: String,
+    /// Opaque native window id (CGWindowID/HWND) when available.
+    pub window_id: Option<u64>,
+    pub bounds: Option<UiBounds>,
+}
+
+/// Hard budgets passed into a blocking AX/UIA walk. The platform implementation
+/// checks the deadline itself: an outer async timeout cannot cancel an already
+/// running `spawn_blocking` task.
+#[derive(Debug, Clone, Copy)]
+pub struct UiSnapshotOptions {
+    pub mode: UiReadMode,
+    pub max_nodes: usize,
+    pub max_chars: usize,
+    pub deadline: std::time::Instant,
+}
+
+/// Why a successful snapshot has partial rather than complete coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiPartialReason {
+    NodeLimit,
+    CharacterLimit,
+    Deadline,
+    ProviderPartial,
+}
+
+impl UiPartialReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeLimit => "node_limit",
+            Self::CharacterLimit => "character_limit",
+            Self::Deadline => "deadline",
+            Self::ProviderPartial => "provider_partial",
+        }
+    }
+}
+
+/// Coverage of a successful semantic walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiReadCoverage {
+    Complete,
+    Partial,
+    Empty,
+}
+
+impl UiReadCoverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Empty => "empty_view",
+        }
+    }
+}
+
+/// Successful accessibility/UIA snapshot before the server assigns ephemeral
+/// snapshot/node ids and click marks.
+#[derive(Debug, Clone)]
+pub struct UiSnapshot {
+    pub target: UiTarget,
+    pub nodes: Vec<CollectedUiNode>,
+    pub coverage: UiReadCoverage,
+    pub truncated: bool,
+    pub partial_reason: Option<UiPartialReason>,
+}
+
+/// Typed reason a semantic read could not produce a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiReadErrorKind {
+    PermissionDenied,
+    TargetNotFound,
+    NoSemanticTree,
+    TimedOut,
+    UnsupportedPlatform,
+    BackendFailure,
+}
+
+impl UiReadErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "permission_denied",
+            Self::TargetNotFound => "target_not_found",
+            Self::NoSemanticTree => "no_semantic_tree",
+            Self::TimedOut => "timed_out",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::BackendFailure => "backend_failure",
+        }
+    }
+}
+
+/// A typed semantic-read failure with a human diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiReadError {
+    pub kind: UiReadErrorKind,
+    pub message: String,
+}
+
+impl UiReadError {
+    pub fn new(kind: UiReadErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UiReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for UiReadError {}
+
 // ── Capability traits ────────────────────────────────────────────────
 
 /// Screen/window pixel capture.
@@ -205,6 +433,12 @@ pub trait WindowManager: Send + Sync {
 /// `impl Clone for Box<dyn ElementHandle>` forwards to it so callers can
 /// still write ordinary `.clone()`.
 pub trait ElementHandle: std::fmt::Debug + Send {
+    /// Configure provider-side action timeouts before any live validation or
+    /// action RPC. Implementations that have no provider state may keep the
+    /// default no-op.
+    fn prepare_for_action(&self, _deadline: std::time::Instant) -> Result<(), String> {
+        Ok(())
+    }
     /// Perform this element's click-like action. Returns the action name
     /// performed (e.g. `"AXPress"`), or an error if nothing in the element's
     /// subtree/ancestry exposes one.
@@ -222,7 +456,12 @@ pub trait ElementHandle: std::fmt::Debug + Send {
     /// browser (caller should fall back to [`ElementHandle::click`] and then
     /// a coordinate click); `Some(Err)` when the JS path was attempted but
     /// failed (also fall back).
-    fn try_web_click(&self, pid: i32, label: &str) -> Option<Result<String, String>>;
+    fn try_web_click(
+        &self,
+        pid: i32,
+        label: &str,
+        deadline: std::time::Instant,
+    ) -> Option<Result<String, String>>;
     fn clone_box(&self) -> Box<dyn ElementHandle>;
 }
 
@@ -238,6 +477,23 @@ impl Clone for Box<dyn ElementHandle> {
 /// panics: the whole point of marks is to work even when the target app
 /// exposes a thin or absent accessibility tree.
 pub trait UiTree: Send + Sync {
+    /// Resolve an app/window using Accessibility/UIA only. This path must not
+    /// invoke screen capture (or ScreenCaptureKit metadata enumeration on
+    /// macOS), so `ax_read` works when Screen Recording is denied.
+    fn resolve_target(
+        &self,
+        query: Option<&str>,
+        preferred_pid: Option<i32>,
+        deadline: std::time::Instant,
+    ) -> Result<UiTarget, UiReadError>;
+
+    /// Read a bounded semantic snapshot for `target`.
+    fn read_snapshot(
+        &self,
+        target: &UiTarget,
+        options: UiSnapshotOptions,
+    ) -> Result<UiSnapshot, UiReadError>;
+
     /// Discover actionable elements for `pid`, clipped to `clip` (a
     /// global-logical rect) when given. Empty when Accessibility permission
     /// is missing or the app exposes no tree — callers degrade gracefully.
@@ -249,12 +505,28 @@ pub trait UiTree: Send + Sync {
     ) -> Vec<(crate::tools::elements::UiElement, Box<dyn ElementHandle>)>;
     /// Press the first element of `pid` whose role/label contains `query`
     /// (case-insensitive), via whichever click-like action it supports.
-    fn ax_click(&self, pid: i32, query: &str) -> Result<String, String>;
+    fn ax_click(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String>;
     /// Set the matched element's value directly (e.g. fill a field without
     /// focusing/typing).
-    fn ax_set_value(&self, pid: i32, query: &str, value: &str) -> Result<String, String>;
+    fn ax_set_value(
+        &self,
+        pid: i32,
+        query: &str,
+        value: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String>;
     /// Move keyboard focus to the matched element.
-    fn ax_focus(&self, pid: i32, query: &str) -> Result<String, String>;
+    fn ax_focus(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String>;
     /// Bring `pid`'s app to the front (best-effort) before a coordinate-click
     /// fallback, so the click lands on content rather than merely focusing
     /// the window.

@@ -37,15 +37,34 @@ pub struct NovaServer {
     /// stream (frontmost app). Set by `window=` captures, cleared by full-display
     /// captures, preserved across `region=` zooms.
     target_pid: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
-    /// Actionable elements from the most recent `marks=true` screenshot, keyed by
-    /// mark number. Lets `click_mark` drive a control by the number the model saw
-    /// (AX action straight on the cached handle, coordinate fallback to its
-    /// center) instead of re-matching a guessed label. Replaced on each
-    /// `marks=true` capture; the numbers go stale once the UI changes, so the
-    /// model is told to re-shoot with `marks=true` before clicking.
-    marks: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<u32, crate::tools::elements::CachedElement>>,
-    >,
+    /// One generation-scoped action cache shared by `ax_read`, its `read_ui`
+    /// alias, screenshot marks, `ax_activate`, and compatibility `click_mark`.
+    /// A new AX read, mark-bearing capture, or activation attempt replaces
+    /// the whole generation atomically.
+    interaction: std::sync::Arc<std::sync::Mutex<InteractionSnapshot>>,
+    next_snapshot_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes generation replacement with the short validation + consume
+    /// phase of an action attempt. Provider dispatch deliberately runs after
+    /// releasing this gate so a wedged AX/UIA RPC cannot block future reads.
+    interaction_action_gate: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct InteractionSnapshot {
+    id: String,
+    marks: std::collections::HashMap<u32, crate::tools::elements::CachedElement>,
+    /// Snapshot-local semantic node id -> actionable mark. Content-only nodes
+    /// deliberately have no entry and therefore cannot be activated.
+    node_marks: std::collections::HashMap<String, u32>,
+    nodes: std::collections::HashSet<String>,
+    related_action_nodes: std::collections::HashMap<String, Vec<String>>,
+}
+
+struct AxNodeMaps {
+    targets: Vec<crate::tools::elements::CachedElement>,
+    node_marks: std::collections::HashMap<String, u32>,
+    nodes: std::collections::HashSet<String>,
+    related_action_nodes: std::collections::HashMap<String, Vec<String>>,
 }
 
 // The capture daemon's connection-drop backstop (used by `acquire_capture`
@@ -171,43 +190,411 @@ impl NovaServer {
         *self.target_pid.lock().expect("target_pid mutex") = pid;
     }
 
-    /// The process the accessibility-action tools operate on: the last
-    /// window-captured app if known, otherwise the frontmost app.
-    ///
-    /// Async on purpose: the frontmost-app fallback is a daemon round-trip
-    /// (blocking socket I/O, worst case the full recovery ladder) — it must
-    /// run on the blocking pool, and NEVER while holding the `target_pid`
-    /// mutex (every input tool locks that mutex; holding it across the ladder
-    /// would freeze all input tools for its duration).
+    /// The process the accessibility-action tools operate on: the last target
+    /// app if still live, otherwise the focused/frontmost app. Resolution is
+    /// Accessibility/UIA-only; it never asks the capture daemon.
     async fn current_ax_pid(&self) -> Option<i32> {
         let cached = *self.target_pid.lock().expect("target_pid mutex");
-        if cached.is_some() {
-            return cached;
-        }
-        tokio::task::spawn_blocking(crate::tools::window::frontmost_app_pid)
-            .await
-            .ok()
-            .flatten()
+        let deadline = std::time::Instant::now() + READ_UI_TIMEOUT;
+        tokio::task::spawn_blocking(move || {
+            crate::platform::ui_tree()
+                .resolve_target(None, cached, deadline)
+                .ok()
+                .map(|target| target.pid)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
-    /// Replace the Set-of-Mark cache with the elements of the latest `marks`
-    /// capture (clearing the old numbers, which are now stale).
-    fn set_marks(&self, targets: Vec<crate::tools::elements::CachedElement>) {
-        let mut cache = self.marks.lock().expect("marks mutex");
-        cache.clear();
-        for t in targets {
-            cache.insert(t.number, t);
+    fn next_snapshot_id(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let generation = self
+            .next_snapshot_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        format!("ax-{}-{generation}", std::process::id())
+    }
+
+    /// Replace the entire action cache. The caller must hold
+    /// `interaction_action_gate` whenever an action could race this mutation.
+    fn replace_interaction_unlocked(
+        &self,
+        targets: Vec<crate::tools::elements::CachedElement>,
+        node_marks: std::collections::HashMap<String, u32>,
+        nodes: std::collections::HashSet<String>,
+        related_action_nodes: std::collections::HashMap<String, Vec<String>>,
+    ) -> String {
+        let id = self.next_snapshot_id();
+        let marks = targets
+            .into_iter()
+            .map(|target| (target.number, target))
+            .collect();
+        *self.interaction.lock().expect("interaction mutex") = InteractionSnapshot {
+            id: id.clone(),
+            marks,
+            node_marks,
+            nodes,
+            related_action_nodes,
+        };
+        id
+    }
+
+    /// Start a new, empty generation. Every ax_read call does this before
+    /// parsing or touching a provider, so a failed/invalid/timed-out read can
+    /// never leave the previous generation actionable.
+    fn invalidate_interaction(&self) -> String {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        self.replace_interaction_unlocked(
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    /// Replace the cache with screenshot marks. Each mark also receives a
+    /// deterministic node id so a future structured screenshot consumer can
+    /// use the same generation-safe activation protocol.
+    fn set_marks(&self, targets: Vec<crate::tools::elements::CachedElement>) -> String {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let node_marks = targets
+            .iter()
+            .map(|target| (format!("n{}", target.number), target.number))
+            .collect();
+        let nodes = targets
+            .iter()
+            .map(|target| format!("n{}", target.number))
+            .collect();
+        self.replace_interaction_unlocked(targets, node_marks, nodes, Default::default())
+    }
+
+    fn ax_node_maps(
+        targets: Vec<(String, crate::tools::elements::CachedElement)>,
+        lines: &[AxLine],
+    ) -> AxNodeMaps {
+        let node_marks = targets
+            .iter()
+            .map(|(node_id, target)| (node_id.clone(), target.number))
+            .collect();
+        let nodes = lines.iter().map(|line| line.node_id.clone()).collect();
+        let mut related_action_nodes = std::collections::HashMap::new();
+        for (index, line) in lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.mark.is_none())
+        {
+            let mut related = Vec::new();
+            // A lower-depth predecessor is the nearest actionable ancestor in
+            // a depth-first snapshot.
+            if let Some(ancestor) = lines[..index]
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    candidate.mark.is_some() && candidate.node.depth < line.node.depth
+                })
+                .map(|candidate| candidate.node_id.clone())
+            {
+                related.push(ancestor);
+            }
+            // Actionable descendants remain contiguous until the traversal
+            // returns to this node's depth.
+            related.extend(
+                lines[index + 1..]
+                    .iter()
+                    .take_while(|candidate| candidate.node.depth > line.node.depth)
+                    .filter(|candidate| candidate.mark.is_some())
+                    .take(3)
+                    .map(|candidate| candidate.node_id.clone()),
+            );
+            related_action_nodes.insert(line.node_id.clone(), related);
         }
+        AxNodeMaps {
+            targets: targets.into_iter().map(|(_, target)| target).collect(),
+            node_marks,
+            nodes,
+            related_action_nodes,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_ax_nodes(
+        &self,
+        targets: Vec<(String, crate::tools::elements::CachedElement)>,
+        lines: &[AxLine],
+    ) -> String {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let maps = Self::ax_node_maps(targets, lines);
+        self.replace_interaction_unlocked(
+            maps.targets,
+            maps.node_marks,
+            maps.nodes,
+            maps.related_action_nodes,
+        )
+    }
+
+    /// Publish a completed read only if no newer read/capture superseded the
+    /// empty generation reserved at request start.
+    fn publish_ax_nodes(
+        &self,
+        generation: &str,
+        targets: Vec<(String, crate::tools::elements::CachedElement)>,
+        lines: &[AxLine],
+    ) -> Result<String, String> {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let maps = Self::ax_node_maps(targets, lines);
+        let mut interaction = self.interaction.lock().expect("interaction mutex");
+        if interaction.id != generation {
+            return Err(format!(
+                "ax_read generation {generation:?} was superseded by a newer read or capture"
+            ));
+        }
+        interaction.marks = maps
+            .targets
+            .into_iter()
+            .map(|target| (target.number, target))
+            .collect();
+        interaction.node_marks = maps.node_marks;
+        interaction.nodes = maps.nodes;
+        interaction.related_action_nodes = maps.related_action_nodes;
+        Ok(generation.to_string())
     }
 
     /// Look up a marked element by its number (cloned out so the AX call runs
     /// off the lock).
     fn get_mark(&self, number: u32) -> Option<crate::tools::elements::CachedElement> {
-        self.marks
+        self.interaction
             .lock()
-            .expect("marks mutex")
+            .expect("interaction mutex")
+            .marks
             .get(&number)
             .cloned()
+    }
+
+    fn get_ax_node(
+        &self,
+        snapshot_id: &str,
+        node_id: &str,
+    ) -> Result<crate::tools::elements::CachedElement, String> {
+        let interaction = self.interaction.lock().expect("interaction mutex");
+        if interaction.id != snapshot_id {
+            return Err(format!(
+                "stale snapshot {snapshot_id:?}; the current generation is {:?}. Run a fresh \
+                 ax_read and use its snapshot_id/node_id.",
+                interaction.id
+            ));
+        }
+        let Some(mark) = interaction.node_marks.get(node_id) else {
+            if interaction.nodes.contains(node_id) {
+                let related = interaction
+                    .related_action_nodes
+                    .get(node_id)
+                    .filter(|nodes| !nodes.is_empty())
+                    .map(|nodes| {
+                        format!(
+                            " Related actionable ancestor/descendant nodes: {}.",
+                            nodes.join(", ")
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        " No actionable ancestor/descendant is available in this snapshot."
+                            .to_string()
+                    });
+                return Err(format!(
+                    "node {node_id:?} is readable content but is not actionable.{related} Select \
+                     an actionable node from a fresh ax_read; Nova will not invent a click."
+                ));
+            }
+            return Err(format!(
+                "node {node_id:?} is unknown in snapshot {snapshot_id:?}"
+            ));
+        };
+        interaction
+            .marks
+            .get(mark)
+            .cloned()
+            .ok_or_else(|| format!("node {node_id:?} no longer has a live action target"))
+    }
+
+    fn activate_ax_node(
+        &self,
+        snapshot_id: &str,
+        node_id: &str,
+        target: crate::tools::input::InputTarget,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let element = self.get_ax_node(snapshot_id, node_id)?;
+        // Consume before crossing the process boundary. Provider calls can
+        // report failure after partially applying an action, and an outer
+        // timeout cannot cancel a blocking AX/UIA RPC. Releasing the short
+        // coordination gate here prevents a wedged provider from wedging every
+        // future read while also making this token strictly single-use.
+        self.replace_interaction_unlocked(
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        drop(_gate);
+        match click_cached_mark(element, target, deadline) {
+            Ok(message) => Ok(format!(
+                "{message}; snapshot consumed — run a fresh ax_read before the next action"
+            )),
+            Err(error) => Err(format!(
+                "{error}; snapshot was consumed before dispatch — run a fresh ax_read before \
+                 retrying"
+            )),
+        }
+    }
+
+    fn activate_mark(
+        &self,
+        number: u32,
+        target: crate::tools::input::InputTarget,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let element = self.get_mark(number).ok_or_else(|| {
+            format!(
+                "unknown mark [{number}] — run ax_read (or screenshot(marks=true)) first \
+                 (numbers reset each read/capture)"
+            )
+        })?;
+        self.replace_interaction_unlocked(
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        drop(_gate);
+        match click_cached_mark(element, target, deadline) {
+            Ok(message) => Ok(format!(
+                "{message}; mark generation consumed — read/capture fresh marks before the next \
+                 action"
+            )),
+            Err(error) => Err(format!(
+                "{error}; mark generation was consumed before dispatch — read/capture fresh marks \
+                 before retrying"
+            )),
+        }
+    }
+
+    async fn run_ax_read(&self, p: ReadUiParams) -> rmcp::model::CallToolResult {
+        let invalidator = self.clone();
+        let generation =
+            match tokio::task::spawn_blocking(move || invalidator.invalidate_interaction()).await {
+                Ok(generation) => generation,
+                Err(join_error) => {
+                    return err_result(&format!(
+                        "capability=ax:read status=backend_failure message=\"{}\"",
+                        sanitize_ax_field(&join_error.to_string(), 1_024)
+                    ));
+                }
+            };
+        let mode = match parse_ax_read_mode(p.mode.as_deref()) {
+            Ok(mode) => mode,
+            Err(error) => return err_result(&error),
+        };
+        let max_nodes = p.max.unwrap_or(DEFAULT_READ_UI_MAX).clamp(1, MAX_READ_UI);
+        let max_chars = p
+            .max_chars
+            .unwrap_or(DEFAULT_AX_READ_CHARS)
+            .clamp(4_096, MAX_AX_READ_CHARS);
+        let filter = p
+            .filter
+            .map(|filter| filter.trim().to_lowercase())
+            .filter(|filter| !filter.is_empty());
+        let query = p
+            .window
+            .map(|query| query.trim().to_string())
+            .filter(|query| !query.is_empty());
+        let preferred_pid = *self.target_pid.lock().expect("target_pid mutex");
+        let deadline = std::time::Instant::now() + READ_UI_TIMEOUT;
+
+        let read = tokio::task::spawn_blocking(move || {
+            let target = crate::platform::ui_tree().resolve_target(
+                query.as_deref(),
+                preferred_pid,
+                deadline,
+            )?;
+            crate::platform::ui_tree().read_snapshot(
+                &target,
+                crate::platform::UiSnapshotOptions {
+                    mode,
+                    max_nodes,
+                    max_chars,
+                    deadline,
+                },
+            )
+        });
+        let snapshot =
+            match tokio::time::timeout(READ_UI_TIMEOUT + std::time::Duration::from_secs(1), read)
+                .await
+            {
+                Ok(Ok(Ok(snapshot))) => snapshot,
+                Ok(Ok(Err(error))) => return err_result(&format_ax_error(error)),
+                Ok(Err(join_error)) => {
+                    return err_result(&format!(
+                        "capability=ax:read status=backend_failure message=\"{}\"",
+                        sanitize_ax_field(&join_error.to_string(), 1_024)
+                    ));
+                }
+                Err(_) => {
+                    return err_result(
+                        "capability=ax:read status=timed_out message=\"semantic read exceeded its \
+                         bounded deadline\" guidance=\"retry once; do not assume permission \
+                         denial or silently switch to screenshots\"",
+                    );
+                }
+            };
+
+        let mut built = build_ax_entries(snapshot);
+        let cached = std::mem::take(&mut built.cached);
+        let publisher = self.clone();
+        let publish_generation = generation.clone();
+        let publish_lines = built.lines.clone();
+        let snapshot_id = match tokio::task::spawn_blocking(move || {
+            publisher.publish_ax_nodes(&publish_generation, cached, &publish_lines)
+        })
+        .await
+        {
+            Ok(Ok(snapshot_id)) => snapshot_id,
+            Ok(Err(error)) => return err_result(&error),
+            Err(join_error) => {
+                return err_result(&format!(
+                    "capability=ax:read status=backend_failure message=\"{}\"",
+                    sanitize_ax_field(&join_error.to_string(), 1_024)
+                ));
+            }
+        };
+        self.set_target_pid(Some(built.target.pid));
+        crate::platform::ui_tree().keep_warm(built.target.pid);
+        ok_text(format_ax_snapshot(
+            &snapshot_id,
+            &built,
+            mode,
+            filter.as_deref(),
+            max_chars,
+        ))
     }
 
     /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
@@ -350,8 +737,13 @@ impl NovaServer {
 fn click_cached_mark(
     el: crate::tools::elements::CachedElement,
     target: crate::tools::input::InputTarget,
+    deadline: std::time::Instant,
 ) -> Result<String, String> {
     let input = crate::platform::input();
+    el.handle.prepare_for_action(deadline)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("semantic action deadline elapsed before validation".to_string());
+    }
 
     // A page refresh / navigation destroys and rebuilds the app's AX tree, so a
     // handle cached from an earlier marks shot can dangle. Detect that up front
@@ -360,8 +752,8 @@ fn click_cached_mark(
     if !el.handle.is_alive() {
         return Err(format!(
             "mark [{}] is stale — the page changed or refreshed since the marks were read, so its \
-             numbering no longer applies. Run a fresh read_ui (or screenshot(marks=true)) and click \
-             the new number.",
+             numbering no longer applies. Run a fresh ax_read and activate the new snapshot-local \
+             node.",
             el.number
         ));
     }
@@ -374,10 +766,11 @@ fn click_cached_mark(
     // frontmost). Gated on BOTH the element living under an `AXWebArea` AND the
     // owning app being a scriptable browser, so native chrome (the toolbar/tabs,
     // even in Safari/Chrome) and non-browser apps keep the reliable AX path.
-    match el.handle.try_web_click(el.pid, &el.label) {
+    match el.handle.try_web_click(el.pid, &el.label, deadline) {
         Some(Ok(desc)) => {
             return Ok(format!(
-                "clicked mark [{}] {} {:?} via {desc} — background, no cursor (AXPress is a \
+                "route=web_dom clicked mark [{}] {} {:?} via {desc} — background, no cursor \
+                 (AXPress is a \
                  no-op on web content)",
                 el.number, el.role, el.label
             ));
@@ -388,11 +781,17 @@ fn click_cached_mark(
         None => {}
     }
 
+    if std::time::Instant::now() >= deadline {
+        return Err("semantic action deadline elapsed before AX/UIA activation".to_string());
+    }
     let ax_err = match el.handle.click() {
         Ok(action) => {
             return Ok(format!(
-                "performed {action} on mark [{}] {} {:?} (via Accessibility — no cursor movement)",
-                el.number, el.role, el.label
+                "route={} performed {action} on mark [{}] {} {:?} — no cursor movement",
+                semantic_action_route(),
+                el.number,
+                el.role,
+                el.label
             ));
         }
         Err(e) => e,
@@ -403,9 +802,25 @@ fn click_cached_mark(
     // activating the window.
     let saved = input.cursor_position().ok();
     crate::platform::ui_tree().raise_app(el.pid);
-    std::thread::sleep(std::time::Duration::from_millis(120));
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err("semantic action deadline elapsed before element-center fallback".to_string());
+    }
+    std::thread::sleep(std::cmp::min(
+        std::time::Duration::from_millis(120),
+        remaining,
+    ));
+    if std::time::Instant::now() >= deadline {
+        return Err("semantic action deadline elapsed before element-center fallback".to_string());
+    }
 
-    let (cx, cy) = el.center;
+    let Some((cx, cy)) = el.handle.current_center() else {
+        return Err(format!(
+            "mark [{}] no longer exposes a current frame; run a fresh ax_read before using the \
+             element-center fallback",
+            el.number
+        ));
+    };
     let click = input.left_click_at(cx, cy, target);
     if let Some((sx, sy)) = saved {
         let _ = input.mouse_move(sx, sy); // restore the user's pointer
@@ -417,10 +832,23 @@ fn click_cached_mark(
         )
     })?;
     Ok(format!(
-        "mark [{}] {} {:?}: no AX action ({ax_err}); raised its app and coordinate-clicked the \
-         center ({cx:.0}, {cy:.0}), cursor restored",
+        "route=element_center mark [{}] {} {:?}: no semantic action ({ax_err}); raised its app \
+         and clicked the freshly verified center ({cx:.0}, {cy:.0}), cursor restored",
         el.number, el.role, el.label
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn semantic_action_route() -> &'static str {
+    "ax"
+}
+#[cfg(target_os = "windows")]
+fn semantic_action_route() -> &'static str {
+    "uia"
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn semantic_action_route() -> &'static str {
+    "unsupported"
 }
 
 /// Render the Set-of-Mark list appended to the screenshot's text note.
@@ -495,9 +923,15 @@ fn screenshot_note(img: &crate::tools::screenshot::ScreenshotImage, plan: &Captu
 /// `screenshot(marks=true)` walk budget and bounds a pathological tree.
 const DEFAULT_READ_UI_MAX: usize = 200;
 const MAX_READ_UI: usize = 400;
+const DEFAULT_AX_READ_CHARS: usize = 30_000;
+const MAX_AX_READ_CHARS: usize = 100_000;
 /// Bound on the `read_ui` AX walk, mirroring the screenshot marks-walk timeout —
 /// a cold web tree or a wedged app must not hang the tool.
 const READ_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Generation validation, provider-side activation, and any fallback share one
+/// deadline. The generation is consumed before provider dispatch; platform
+/// handles configure AX/UIA RPC timeouts from this value.
+const AX_ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One entry in a `read_ui` text listing: the click-by-number contract WITHOUT
 /// an image. Kept separate from [`crate::capture::screenshot::Mark`] (which
@@ -625,6 +1059,299 @@ pub fn format_ui_listing(lines: &[UiLine], subject: &str, filter: Option<&str>) 
     s
 }
 
+#[derive(Debug, Clone)]
+struct AxLine {
+    node_id: String,
+    mark: Option<u32>,
+    node: crate::platform::UiNode,
+}
+
+struct BuiltAxEntries {
+    target: crate::platform::UiTarget,
+    coverage: crate::platform::UiReadCoverage,
+    truncated: bool,
+    partial_reason: Option<crate::platform::UiPartialReason>,
+    cached: Vec<(String, crate::tools::elements::CachedElement)>,
+    lines: Vec<AxLine>,
+}
+
+fn build_ax_entries(snapshot: crate::platform::UiSnapshot) -> BuiltAxEntries {
+    let mut cached = Vec::new();
+    let mut lines = Vec::with_capacity(snapshot.nodes.len());
+    for (index, mut collected) in snapshot.nodes.into_iter().enumerate() {
+        let node_id = format!("n{}", index + 1);
+        let mark = match collected.handle.take() {
+            Some(handle) if collected.node.actionable => {
+                let number = cached.len() as u32 + 1;
+                let label = if !collected.node.name.is_empty() {
+                    collected.node.name.clone()
+                } else if !collected.node.description.is_empty() {
+                    collected.node.description.clone()
+                } else {
+                    collected.node.value.as_filter_text().to_string()
+                };
+                cached.push((
+                    node_id.clone(),
+                    crate::tools::elements::CachedElement {
+                        number,
+                        handle,
+                        // Legacy field retained for screenshot-mark ABI. The
+                        // action path always asks the live handle for a fresh
+                        // center and can invoke a semantic control with no
+                        // bounds at all.
+                        center: collected
+                            .node
+                            .bounds
+                            .map(crate::platform::UiBounds::center)
+                            .unwrap_or((0.0, 0.0)),
+                        role: collected.node.role.clone(),
+                        label,
+                        pid: snapshot.target.pid,
+                    },
+                ));
+                Some(number)
+            }
+            _ => None,
+        };
+        lines.push(AxLine {
+            node_id,
+            mark,
+            node: collected.node,
+        });
+    }
+    BuiltAxEntries {
+        target: snapshot.target,
+        coverage: snapshot.coverage,
+        truncated: snapshot.truncated,
+        partial_reason: snapshot.partial_reason,
+        cached,
+        lines,
+    }
+}
+
+/// Keep the model-facing snapshot one-line-per-node and prevent any control
+/// character from forging headers or log-like output. Limits count Unicode
+/// scalar values, never bytes.
+fn sanitize_ax_field(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for character in value.chars().take(max_chars) {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' | '\t' => out.push(' '),
+            character if character.is_control() => out.push(' '),
+            character => out.push(character),
+        }
+    }
+    if value.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn ax_line_matches(line: &AxLine, filter: &str) -> bool {
+    line.node.role.to_lowercase().contains(filter)
+        || line.node.name.to_lowercase().contains(filter)
+        || line.node.description.to_lowercase().contains(filter)
+        || line
+            .node
+            .value
+            .as_filter_text()
+            .to_lowercase()
+            .contains(filter)
+        || line
+            .node
+            .actions
+            .iter()
+            .any(|action| action.to_lowercase().contains(filter))
+}
+
+fn parse_ax_read_mode(mode: Option<&str>) -> Result<crate::platform::UiReadMode, String> {
+    match mode.map(str::trim).filter(|mode| !mode.is_empty()) {
+        None | Some("all") => Ok(crate::platform::UiReadMode::All),
+        Some("interactive") => Ok(crate::platform::UiReadMode::Interactive),
+        Some("content") => Ok(crate::platform::UiReadMode::Content),
+        Some(other) => Err(format!(
+            "invalid ax_read mode {other:?}; expected \"interactive\", \"content\", or \"all\""
+        )),
+    }
+}
+
+fn format_ax_node(line: &AxLine) -> String {
+    let mark = line
+        .mark
+        .map(|mark| format!(" mark={mark}"))
+        .unwrap_or_default();
+    let mut rendered = format!(
+        "[{}{}] depth={} role=\"{}\"",
+        line.node_id,
+        mark,
+        line.node.depth,
+        sanitize_ax_field(&line.node.role, 128)
+    );
+    if !line.node.name.is_empty() {
+        rendered.push_str(&format!(
+            " name=\"{}\"",
+            sanitize_ax_field(&line.node.name, 4_096)
+        ));
+    }
+    if !line.node.description.is_empty() {
+        rendered.push_str(&format!(
+            " description=\"{}\"",
+            sanitize_ax_field(&line.node.description, 4_096)
+        ));
+    }
+    match &line.node.value {
+        crate::platform::UiNodeValue::Absent => {}
+        crate::platform::UiNodeValue::Text(value) => {
+            rendered.push_str(&format!(" value=\"{}\"", sanitize_ax_field(value, 4_096)))
+        }
+        crate::platform::UiNodeValue::Redacted => rendered.push_str(" value=\"[REDACTED]\""),
+    }
+    rendered.push_str(&format!(" actionable={}", line.node.actionable));
+    if !line.node.actions.is_empty() {
+        rendered.push_str(" actions=[");
+        rendered.push_str(
+            &line
+                .node
+                .actions
+                .iter()
+                .map(|action| format!("\"{}\"", sanitize_ax_field(action, 128)))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        rendered.push(']');
+    }
+    let states = [
+        ("enabled", line.node.states.enabled),
+        ("focused", line.node.states.focused),
+        ("selected", line.node.states.selected),
+        ("checked", line.node.states.checked),
+        ("expanded", line.node.states.expanded),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+    .collect::<Vec<_>>();
+    if !states.is_empty() {
+        rendered.push_str(&format!(" states={{{}}}", states.join(",")));
+    }
+    if let Some(bounds) = line.node.bounds {
+        rendered.push_str(&format!(
+            " bounds=({:.1},{:.1},{:.1},{:.1})",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        ));
+    }
+    rendered
+}
+
+fn format_ax_snapshot(
+    snapshot_id: &str,
+    built: &BuiltAxEntries,
+    mode: crate::platform::UiReadMode,
+    filter: Option<&str>,
+    max_chars: usize,
+) -> String {
+    let shown: Vec<_> = built
+        .lines
+        .iter()
+        .filter(|line| filter.is_none_or(|filter| ax_line_matches(line, filter)))
+        .collect();
+    let mut body = String::new();
+    let mut rendered_count = 0usize;
+    // Reserve enough room for the bounded metadata header and fallback
+    // instruction, so the final hard guard cannot silently invalidate the
+    // header's explicit `truncated` flag.
+    let body_budget = max_chars.saturating_sub(1_600);
+    for line in &shown {
+        let rendered = format_ax_node(line);
+        let added = rendered.chars().count() + 1;
+        if body.chars().count().saturating_add(added) > body_budget {
+            break;
+        }
+        body.push('\n');
+        body.push_str(&rendered);
+        rendered_count += 1;
+    }
+    let render_truncated = rendered_count < shown.len();
+    let truncated = built.truncated || render_truncated;
+    let reason = if render_truncated {
+        Some("character_limit")
+    } else {
+        built
+            .partial_reason
+            .map(crate::platform::UiPartialReason::as_str)
+    };
+    let filter_note = filter
+        .map(|_| {
+            format!(
+                " filter_applied=true shown={}/{}",
+                rendered_count,
+                built.lines.len()
+            )
+        })
+        .unwrap_or_else(|| format!(" shown={rendered_count}/{}", built.lines.len()));
+    let mut output = format!(
+        "capability=ax:read snapshot_id=\"{}\" mode={} coverage={} truncated={}{} \
+         target={{pid={},app=\"{}\",window=\"{}\"}}{}",
+        sanitize_ax_field(snapshot_id, 128),
+        mode.as_str(),
+        built.coverage.as_str(),
+        truncated,
+        reason
+            .map(|reason| format!(" partial_reason={reason}"))
+            .unwrap_or_default(),
+        built.target.pid,
+        sanitize_ax_field(&built.target.app_name, 256),
+        sanitize_ax_field(&built.target.window_title, 512),
+        filter_note,
+    );
+    if built.coverage != crate::platform::UiReadCoverage::Complete {
+        output.push_str(
+            " fallback=use_focused_ocr_for_missing_rendered_text_then_screenshot_or_zoom_for_\
+             visual_only_state",
+        );
+    }
+    output.push_str(
+        ". Action: call ax_activate(snapshot_id, node_id) for an actionable node. Every activation \
+         attempt consumes the generation before provider dispatch; rerun ax_read after any result.",
+    );
+    output.push_str(&body);
+    if output.chars().count() > max_chars {
+        output = output.chars().take(max_chars.saturating_sub(1)).collect();
+        output.push('…');
+    }
+    output
+}
+
+fn format_ax_error(error: crate::platform::UiReadError) -> String {
+    let guidance = match error.kind {
+        crate::platform::UiReadErrorKind::PermissionDenied => {
+            "grant Accessibility permission and retry; do not fall back to screenshot/OCR"
+        }
+        crate::platform::UiReadErrorKind::TargetNotFound => {
+            "list the actual apps/windows or pass a different window query"
+        }
+        crate::platform::UiReadErrorKind::NoSemanticTree => {
+            "use focused OCR for rendered text, then screenshot/zoom for visual-only state"
+        }
+        crate::platform::UiReadErrorKind::TimedOut => {
+            "retry once; if the provider remains unavailable, inspect or restart the target app"
+        }
+        crate::platform::UiReadErrorKind::UnsupportedPlatform => {
+            "use another supported Nova desktop backend"
+        }
+        crate::platform::UiReadErrorKind::BackendFailure => {
+            "retry after checking the target app and Accessibility provider"
+        }
+    };
+    format!(
+        "capability=ax:read status={} message=\"{}\" guidance=\"{}\"",
+        error.kind.as_str(),
+        sanitize_ax_field(&error.message, 1_024),
+        guidance
+    )
+}
+
 // ── Tool implementations ────────────────────────────────────────────
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -651,126 +1378,40 @@ use serde::Deserialize;
 /// when a screenshot IS needed, capturing the specific window or zooming a region
 /// is the cure.
 pub const NOVA_INSTRUCTIONS: &str = "\
-Nova controls the macOS desktop: read the UI as text (`read_ui`), act (`click_mark` / \
-click / type), and screenshot to VERIFY. Reach for a screenshot when you need to SEE the \
-screen — not as the default way to find things. All click/move/scroll coordinates are in \
-the pixel space of the MOST RECENT screenshot.
+Nova controls the macOS and Windows desktop. `ax_read` is the canonical `ax:read` \
+capability and the FIRST operation for labels, controls, fields, structured text, and \
+semantic state. It reads Accessibility/UIA directly without a screenshot; `read_ui` is \
+only a compatibility alias.
 
-Targeting — how to click the right thing, in PRIORITY ORDER (do not jump to raw \
-coordinates first):
-1. BEST — read the UI as TEXT, then click by number. Call `read_ui` (or \
-`read_ui(window=\"<name>\")` to target a specific window) to list every actionable \
-element as `[N] role \"label\"` straight from the Accessibility tree — no screenshot, no \
-image tokens, works in the background. Web-page content is listed too, not just native \
-controls. Then `click_mark(number=N)` activates [N] with no \
-cursor — web-page content via the page's own JavaScript engine (an Accessibility press is \
-a no-op on web content), native controls via the Accessibility tree, else a click at its \
-center. Prefer `read_ui` for plain navigation: it is far cheaper and faster than an image. \
-`screenshot(marks=true)` returns the SAME numbered `[N] role \"label\"` list PLUS a picture \
-— use it in place of `read_ui` only when you also need to see the screen. The numbers reset \
-on every read/capture and go stale when the UI changes, so run a fresh `read_ui` (or \
-`screenshot(marks=true)`) right before each `click_mark`.
-2. Let the app find it for you. Prefer the app's OWN search (click the search box, \
-type the name, press Enter) over visually scanning a long list — far more reliable \
-than estimating a row's position.
-3. FALLBACK — read coordinates, only when the target is NOT in the marks list. \
-Web pages are covered by marks too: real links/buttons on semantic pages, and on \
-div-rendered pages (e.g. webmail) the list ROWS are numbered as well (clicking \
-such a row lands via a coordinate at its center, so it still needs a fresh \
-`marks=true` shot right before, since these go stale on scroll). So coordinate \
-mode is mainly for canvas / game / custom-rendered surfaces that expose no marks \
-at all. Then:
-  - Do NOT guess off a full-display `screenshot`: it is downscaled (max ~1280px \
-wide), so on a busy/Retina screen small UI is only a few pixels tall — too small \
-to read or click. Capture the specific window: `screenshot(window=\"<name>\")` \
-(larger, sharper, clicks map into the window automatically), and if the target is \
-still small, zoom: `zoom_region(x, y, w, h)` re-captures that rectangle (in the \
-last shot's pixel space) at native resolution. Click only once the target is \
-clearly legible.
-  - In this coordinate mode a labeled magenta grid is overlaid automatically \
-(rules with their pixel x/y values along the edges): read a target's (x, y) off \
-the nearest labeled rules and interpolate within the cell instead of guessing. \
-(The grid is shown whenever marks is off; with marks on it is hidden since you \
-click by number — pass grid=true if you want both.)
-  - To READ or click text on such a marks-less surface, prefer `ocr` over \
-eyeballing the grid — see \"Reading TEXT\" below.
+READ in this order:
+1. Call `ax_read(window?, mode=\"all\")`. Respect its coverage/status. \
+`permission_denied` means grant Accessibility and retry — do NOT hide it with OCR or a \
+screenshot.
+2. If AX coverage is absent/partial and the missing information is rendered TEXT, call \
+focused-window `ocr`; its returned center is the grounded click point for that text.
+3. Use focused `screenshot(window=...)` / `zoom_region` only when pixels are necessary: \
+layout, icon, color, image, canvas, or visual verification. Raw coordinates are last.
 
-Confirm every action — do NOT operate blind:
-- After EACH input action (click, scroll, type, key press) check the result BEFORE \
-deciding the next action: `read_ui` again to confirm a control changed / a new view \
-appeared (cheap, no image), or take a screenshot when the outcome is VISUAL (something \
-rendered, a color/icon/layout changed) or the surface has no Accessibility tree. Never \
-fire several scrolls or clicks in a row without confirming in between — you cannot read \
-what you scrolled past, and an unconfirmed click may have missed.
-- When reading a long view by scrolling, scroll ONE step, then read (`read_ui` or \
-screenshot/`ocr`), then scroll again — capturing each screen so nothing is skipped.
+ACT in this order:
+1. Immediately before acting, run a fresh `ax_read`, then call \
+`ax_activate(snapshot_id, node_id)` on the exact actionable node. It fails closed on a \
+stale generation and reports route=ax|uia|web_dom|element_center. Every activation attempt \
+consumes the generation before provider dispatch, so rerun ax_read after any result.
+2. Let ax_activate use its freshly verified element-center fallback when semantic \
+activation is unsupported. For AX-less rendered text, use the center returned by OCR.
+3. Only then click coordinates from a focused screenshot/zoom. Never guess from a \
+downscaled full-display image. `click_mark(number=N)` remains a compatibility action; \
+prefer generation-safe `ax_activate`. Legacy substring `ax_click`/`ax_focus`/\
+`ax_set_value` reject ambiguous matches instead of choosing the first.
 
-Keep captures focused — once you know WHICH part of the screen matters, capture \
-just that part instead of the whole display:
-- `screenshot(window=\"<name>\")` or `zoom_region(x, y, w, h)` returns a smaller, \
-sharper image. Smaller means fewer pixels for the model to read, so each turn \
-carries less context and comes back faster — and a `zoom_region` capture grabs \
-only that rectangle, so it is also quicker to take than a full-display shot. \
-Reserve the full-display capture for when you genuinely need the whole screen \
-(orienting, finding which window to target); for repeated work inside one app or \
-one panel, stay scoped to it.
+VERIFY after every action before continuing. Prefer `ax_read` for semantic outcomes \
+(text/state/new controls). Use a screenshot only when the expected outcome is genuinely \
+visual. When scrolling through content, scroll one step, read/observe it, then continue.
 
-Targeting a window by name (`window=\"<name>\"`):
-- The name is a case-insensitive SUBSTRING of an ON-SCREEN window's title or its \
-app's name, exactly as it appears on screen — match the literal on-screen text, \
-do not translate or transliterate it. \
-- If your guess is wrong the tool does NOT guess for you: it returns \"no \
-on-screen window matching …\" and LISTS the windows that are actually on screen. \
-Read that list and retry with the correct name — do not repeat the same guess. \
-- When you do not already know the exact on-screen name, take a full-display \
-`screenshot` first (omit window=) to read the real window/app names, then target one.
-
-Reading TEXT — when to use `ocr`, and how to combine it with the rest:
-- USE `ocr` to (a) READ a lot of text at once (a chat thread, an article, a log, \
-a list/table) — it returns the lines as TEXT, far cheaper than parsing a \
-screenshot image; or (b) read or click text on a surface where `marks` comes \
-back EMPTY or sparse (canvas, games, image-/custom-rendered views, chat bubbles). \
-Each line carries a clickable center, so left_click(x, y) a line to click text \
-that is not an Accessibility element.
-- Do NOT reach for `ocr` when the target IS an actionable native/web control \
-(button, link, field, list row): `read_ui` (or `screenshot(marks=true)`) + \
-`click_mark` is more precise — it drives the control directly with no pixel \
-guessing. And `ocr` returns no image, so when you need to SEE layout / icons / \
-state, take a `screenshot`.
-- COMBINE by role within one window: the native CHROME (sidebar, toolbar, \
-buttons) is usually in the Accessibility tree → `read_ui` + click_mark there; the \
-CONTENT (message bubbles, a rendered document) is often AX-less → use `ocr` to \
-read or click it. A WeChat chat is the canonical case: read_ui/marks find only \
-the few titlebar buttons, while `ocr` reads the whole conversation. Typical flow: \
-`read_ui(window=\"X\")` to act on controls, then `ocr(window=\"X\")` to read the \
-content — and pass `window=\"<name>\"` (or `zoom_region` first) for sharper \
-recognition of small text.
-
-Typing:
-- `type_text` accepts ANY text, including non-ASCII (e.g. 中文) and emoji. To \
-enter something by name, click the field and type it directly.
-
-Foreground vs background input:
-- By DEFAULT clicks/scroll/typing go to the foreground (the real cursor moves; \
-the target window is activated). This works for EVERY app, including browsers \
-and Electron apps (Arc, Chrome, VS Code, Slack, WeChat). Use this unless you \
-have a specific reason not to.
-- For a NATIVE macOS app you do not want to disturb, pass background=true on a \
-click/scroll/type to deliver it straight to the captured window's process \
-without moving your cursor or raising the window. It only works after a \
-`window=` capture, and browsers / Electron / custom-rendered apps IGNORE it — \
-so if a background action has no visible effect, retry WITHOUT background.
-- The Accessibility tree also drives controls directly, in the background, with no \
-coordinates: `click_mark(number=N)` (preferred — pick the element from a `read_ui` \
-or `marks=true` shot), or by label match `ax_click`/`ax_set_value`/`ax_focus` (a \
-substring of the element's role/label). The label-match tools need a semantic \
-control, so they return \"no element\" on div-rendered pages (use click_mark on a \
-row mark there instead) and on canvas/game surfaces with no tree.
-
-Workflow for \"find X inside app Y\": read_ui(window=\"Y\") → if X is listed, \
-click_mark(number=N) → read_ui again (or screenshot) to confirm. If X is not in the list, \
-use Y's search box, or take screenshot(window=\"Y\") / zoom_region until X is legible, then \
-click its coordinates → screenshot to confirm.";
+All click/move/scroll coordinates use the pixel space of the MOST RECENT screenshot. \
+Keep image captures focused on one window or region. `type_text` accepts Unicode. \
+Foreground input is the universal default; background input is best-effort for native \
+apps and may be ignored by browsers/custom-rendered apps.";
 
 // Tool parameter types — all stub, to be fleshed out in implementation.
 
@@ -847,6 +1488,24 @@ pub struct MouseMoveParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinateActionSource {
+    /// Center returned by the immediately preceding focused OCR result.
+    OcrCenter,
+    /// Coordinate read from the immediately preceding focused screenshot/zoom.
+    VisualCoordinate,
+}
+
+impl CoordinateActionSource {
+    fn as_route(&self) -> &'static str {
+        match self {
+            Self::OcrCenter => "ocr_center",
+            Self::VisualCoordinate => "visual_coordinate",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClickParams {
     pub x: f64,
     pub y: f64,
@@ -854,6 +1513,11 @@ pub struct ClickParams {
     /// only; browsers/Electron ignore it). Default false = foreground.
     #[serde(default)]
     pub background: bool,
+    /// Grounding source for route reporting. Use `ocr_center` only for a center
+    /// returned by the immediately preceding OCR result. Omit/default
+    /// `visual_coordinate` for a focused screenshot/zoom coordinate.
+    #[serde(default)]
+    pub source: Option<CoordinateActionSource>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -934,6 +1598,18 @@ pub struct ClickMarkParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AxActivateParams {
+    /// Ephemeral snapshot id returned by the immediately preceding ax_read.
+    pub snapshot_id: String,
+    /// Snapshot-local node id (for example "n7"). The node must be actionable.
+    pub node_id: String,
+    /// Applies only to the verified element-center fallback. Semantic AX/UIA/DOM
+    /// activation is already background and cursor-free.
+    #[serde(default)]
+    pub background: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OcrParams {
     /// Capture only a single on-screen window (case-insensitive substring of its
     /// title or app name) instead of the whole display. Smaller, sharper image
@@ -964,13 +1640,23 @@ pub struct ReadUiParams {
     /// Cap on the number of elements returned (default 200, max 400).
     #[serde(default)]
     pub max: Option<usize>,
+    /// `interactive` returns actionable controls, `content` returns readable
+    /// labels/text, and `all` combines both in deterministic tree order.
+    /// Defaults to `all`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Unicode-character output budget (default 30000, max 100000). If hit,
+    /// `truncated=true` and `partial_reason=character_limit` are returned.
+    #[serde(default)]
+    pub max_chars: Option<usize>,
 }
 
 #[tool_router]
 impl NovaServer {
     #[tool(
         name = "screenshot",
-        description = "Capture the screen — the whole main display, or a single window with \
+        description = "Visual fallback after ax_read and, for missing rendered text, OCR. Capture \
+                       the whole main display or a single window with \
                        window=\"<name>\" — and return a base64 JPEG plus a text note with its pixel \
                        dimensions. ALL coordinate-taking tools (mouse_move, *_click, scroll) expect \
                        coordinates in THIS image's pixel space — origin (0,0) top-left, x right, y \
@@ -983,8 +1669,8 @@ impl NovaServer {
                        capture is larger and sharper, returns a smaller image (fewer pixels → less \
                        context, faster turn), and clicks map into the window automatically. \
                        marks is ON by default: it boxes+numbers actionable elements (needs \
-                       Accessibility) and lists each as [N] — activate one with click_mark(number=N), \
-                       the most reliable way to click with no coordinate guessing. A magenta \
+                       Accessibility) and lists each as [N] for compatibility with click_mark. \
+                       Prefer a fresh ax_read + ax_activate for semantic controls. A magenta \
                        coordinate grid (for reading x/y) is shown automatically when marks is off and \
                        hidden when it is on; pass grid=true to force both, or marks=false for pure \
                        coordinate mode. If a target is still too small to click, use zoom_region to \
@@ -1067,11 +1753,11 @@ impl NovaServer {
                        with a clickable center in the same pixel space as a screenshot — so you can \
                        both READ the text and click a line with left_click(x, y). Returns text only \
                        (no image), so it is a cheap, fast way to pull text off the screen. Best when \
-                       you need to read or click TEXT on a surface where marks come back empty — \
+                       use it after ax_read reports absent/partial coverage and you need rendered \
+                       TEXT from a surface where semantic nodes are empty or sparse — \
                        canvas, games, image-rendered or custom-drawn views — or to grab a lot of \
                        text at once without parsing a screenshot. For native/web UI with an \
-                       Accessibility tree, read_ui (or screenshot(marks=true)) + click_mark is still \
-                       more precise. \
+                       Accessibility/UIA tree, ax_read + ax_activate is still more precise. \
                        Languages default to Simplified Chinese + English; pass languages=[...] (BCP-47) \
                        to override."
     )]
@@ -1130,7 +1816,8 @@ impl NovaServer {
         }
         let mut note = format!(
             "OCR of {subject} ({w}x{h} px), {n} text lines. Coordinates are in this image's pixel \
-             space (same as a screenshot) — click a line by its center with left_click(x, y).\n",
+             space (same as a screenshot) — click a line by its center with \
+             left_click(x, y, source=\"ocr_center\").\n",
             n = lines.len(),
         );
         for (i, line) in lines.iter().enumerate() {
@@ -1171,7 +1858,10 @@ impl NovaServer {
 
     #[tool(
         name = "left_click",
-        description = "Left-click at the given (x, y) coordinates (in screenshot space)."
+        description = "Last-resort grounded left click in the most recent capture's pixel space. \
+                       Pass source=ocr_center when x/y came from focused OCR; otherwise \
+                       source=visual_coordinate (the default) means a focused screenshot/zoom. \
+                       The result reports that route."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn left_click(
@@ -1180,14 +1870,24 @@ impl NovaServer {
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::platform::input().left_click_at(lx, ly, self.current_target(p.background)) {
-            Ok(()) => ok_text(format!("left clicked at ({}, {})", p.x, p.y)),
+            Ok(()) => ok_text(format!(
+                "route={} left clicked at ({}, {})",
+                p.source
+                    .as_ref()
+                    .map(CoordinateActionSource::as_route)
+                    .unwrap_or("visual_coordinate"),
+                p.x,
+                p.y
+            )),
             Err(e) => err_result(&e.to_string()),
         }
     }
 
     #[tool(
         name = "right_click",
-        description = "Right-click at the given (x, y) coordinates (in screenshot space)."
+        description = "Grounded right click in the most recent capture's pixel space. Pass \
+                       source=ocr_center for an OCR-returned center; otherwise the reported route \
+                       defaults to visual_coordinate."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn right_click(
@@ -1196,14 +1896,24 @@ impl NovaServer {
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::platform::input().right_click_at(lx, ly, self.current_target(p.background)) {
-            Ok(()) => ok_text(format!("right clicked at ({}, {})", p.x, p.y)),
+            Ok(()) => ok_text(format!(
+                "route={} right clicked at ({}, {})",
+                p.source
+                    .as_ref()
+                    .map(CoordinateActionSource::as_route)
+                    .unwrap_or("visual_coordinate"),
+                p.x,
+                p.y
+            )),
             Err(e) => err_result(&e.to_string()),
         }
     }
 
     #[tool(
         name = "double_click",
-        description = "Double-click at the given (x, y) coordinates (in screenshot space)."
+        description = "Grounded double click in the most recent capture's pixel space. Pass \
+                       source=ocr_center for an OCR-returned center; otherwise the reported route \
+                       defaults to visual_coordinate."
     )]
     #[tracing::instrument(skip_all, fields(x = %p.x, y = %p.y), level = "info")]
     async fn double_click(
@@ -1212,7 +1922,15 @@ impl NovaServer {
     ) -> rmcp::model::CallToolResult {
         let (lx, ly) = self.to_logical(p.x, p.y);
         match crate::platform::input().double_click_at(lx, ly, self.current_target(p.background)) {
-            Ok(()) => ok_text(format!("double clicked at ({}, {})", p.x, p.y)),
+            Ok(()) => ok_text(format!(
+                "route={} double clicked at ({}, {})",
+                p.source
+                    .as_ref()
+                    .map(CoordinateActionSource::as_route)
+                    .unwrap_or("visual_coordinate"),
+                p.x,
+                p.y
+            )),
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -1364,8 +2082,8 @@ impl NovaServer {
         name = "batch_actions",
         description = "Execute a sequence of input actions (mouse_move, left_click, right_click, \
                        double_click, scroll, key_combo, type_text, wait) in one call to reduce \
-                       round-trips. Coordinates are in screenshot space. Take a screenshot \
-                       separately afterwards to observe the result."
+                       round-trips. Coordinates are in screenshot space. Afterwards use ax_read \
+                       for semantic outcomes or a screenshot only for visual outcomes."
     )]
     #[tracing::instrument(skip_all, fields(count = %p.actions.len()), level = "info")]
     async fn batch_actions(
@@ -1386,15 +2104,12 @@ impl NovaServer {
 
     #[tool(
         name = "ax_click",
-        description = "Press a UI control directly through the OS accessibility tree (macOS \
-                       Accessibility; Windows UI Automation is not yet implemented and returns a \
-                       clear error) — no coordinates, no cursor movement, works in the background \
+        description = "Legacy query action through macOS Accessibility or Windows UI Automation — \
+                       no coordinates, no cursor movement, works in the background \
                        (the app need not be frontmost). `query` is a case-insensitive substring of \
                        the element's accessibility role or label/title (e.g. \"Send\", \"Search\"). \
-                       Targets the last window-captured app (or the frontmost app). Only works for \
-                       apps that expose an accessibility tree; if it returns \"no element \
-                       matching\" (or the not-implemented error), fall back to screenshot + \
-                       left_click."
+                       Ambiguous matches fail closed. Prefer fresh ax_read + ax_activate for exact, \
+                       generation-safe actions."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_click(
@@ -1402,22 +2117,28 @@ impl NovaServer {
         Parameters(p): Parameters<AxQueryParams>,
     ) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid().await else {
-            return err_result("no target app (take a window screenshot first)");
+            return err_result("no AX/UIA target app; focus/open one or pass it to ax_read");
         };
-        match crate::platform::ui_tree().ax_click(pid, &p.query) {
-            Ok(msg) => ok_text(msg),
-            Err(e) => err_result(&e),
+        let query = p.query;
+        let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        let task = tokio::task::spawn_blocking(move || {
+            crate::platform::ui_tree().ax_click(pid, &query, deadline)
+        });
+        match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
+            .await
+        {
+            Ok(Ok(Ok(message))) => ok_text(message),
+            Ok(Ok(Err(error))) => err_result(&error),
+            Ok(Err(join_error)) => err_result(&format!("ax_click task failed: {join_error}")),
+            Err(_) => err_result("ax_click exceeded its bounded action deadline"),
         }
     }
 
     #[tool(
         name = "ax_set_value",
-        description = "Set a control's value directly through the OS accessibility tree (macOS \
-                       Accessibility; not yet implemented on Windows, where it returns a clear \
-                       error) — e.g. fill a text field without focusing or typing. Background, no \
-                       cursor. `query` matches the element's role/label; `value` is the text to \
-                       set. Targets the last window-captured app (or frontmost). Native-app \
-                       accessibility only."
+        description = "Legacy query action that sets a control value through macOS Accessibility \
+                       or Windows UI Automation. Background, no cursor. Ambiguous substring matches \
+                       fail closed; prefer a fresh ax_read node whenever possible."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_set_value(
@@ -1425,21 +2146,29 @@ impl NovaServer {
         Parameters(p): Parameters<AxSetValueParams>,
     ) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid().await else {
-            return err_result("no target app (take a window screenshot first)");
+            return err_result("no AX/UIA target app; focus/open one or pass it to ax_read");
         };
-        match crate::platform::ui_tree().ax_set_value(pid, &p.query, &p.value) {
-            Ok(msg) => ok_text(msg),
-            Err(e) => err_result(&e),
+        let query = p.query;
+        let value = p.value;
+        let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        let task = tokio::task::spawn_blocking(move || {
+            crate::platform::ui_tree().ax_set_value(pid, &query, &value, deadline)
+        });
+        match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
+            .await
+        {
+            Ok(Ok(Ok(message))) => ok_text(message),
+            Ok(Ok(Err(error))) => err_result(&error),
+            Ok(Err(join_error)) => err_result(&format!("ax_set_value task failed: {join_error}")),
+            Err(_) => err_result("ax_set_value exceeded its bounded action deadline"),
         }
     }
 
     #[tool(
         name = "ax_focus",
-        description = "Move keyboard focus to a control through the OS accessibility tree (macOS \
-                       Accessibility; not yet implemented on Windows, where it returns a clear \
-                       error). Background, no cursor. `query` matches the element's role/label. \
-                       Targets the last window-captured app (or frontmost). Native-app \
-                       accessibility only."
+        description = "Legacy query action that focuses a control through macOS Accessibility or \
+                       Windows UI Automation. Background, no cursor. Ambiguous substring matches \
+                       fail closed; prefer a fresh ax_read node whenever possible."
     )]
     #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
     async fn ax_focus(
@@ -1447,44 +2176,88 @@ impl NovaServer {
         Parameters(p): Parameters<AxQueryParams>,
     ) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid().await else {
-            return err_result("no target app (take a window screenshot first)");
+            return err_result("no AX/UIA target app; focus/open one or pass it to ax_read");
         };
-        match crate::platform::ui_tree().ax_focus(pid, &p.query) {
-            Ok(msg) => ok_text(msg),
-            Err(e) => err_result(&e),
+        let query = p.query;
+        let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        let task = tokio::task::spawn_blocking(move || {
+            crate::platform::ui_tree().ax_focus(pid, &query, deadline)
+        });
+        match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
+            .await
+        {
+            Ok(Ok(Ok(message))) => ok_text(message),
+            Ok(Ok(Err(error))) => err_result(&error),
+            Ok(Err(join_error)) => err_result(&format!("ax_focus task failed: {join_error}")),
+            Err(_) => err_result("ax_focus exceeded its bounded action deadline"),
         }
     }
 
     #[tool(
         name = "click_mark",
-        description = "Activate an actionable element by the mark NUMBER shown by the most recent \
-                       read_ui or screenshot(marks=true) — the reliable way to click without \
-                       guessing coordinates. Always background, no cursor movement: web-page content \
+        description = "Compatibility activation by the mark NUMBER shown by the most recent \
+                       ax_read/read_ui or screenshot(marks=true). Prefer ax_activate with \
+                       snapshot_id/node_id because it rejects stale generations. Web-page content \
                        in a scriptable browser (Safari, Chrome, Arc, Edge, Brave, …) is clicked \
                        through the page's OWN JavaScript engine (an Accessibility press is a silent \
                        no-op on web content), native controls through the Accessibility tree; if \
                        neither applies it falls back to a click at the element's center. Numbers go \
-                       stale when the UI changes, so run a fresh read_ui (or screenshot(marks=true)) \
-                       right before calling this. If the number is unknown, read_ui again."
+                       stale when the UI changes, so run a fresh ax_read immediately before acting."
     )]
     #[tracing::instrument(skip_all, fields(number = %p.number, background = %p.background), level = "info")]
     async fn click_mark(
         &self,
         Parameters(p): Parameters<ClickMarkParams>,
     ) -> rmcp::model::CallToolResult {
-        let Some(el) = self.get_mark(p.number) else {
-            return err_result(&format!(
-                "unknown mark [{}] — run read_ui (or screenshot(marks=true)) first (numbers reset \
-                 each read/capture)",
-                p.number
-            ));
-        };
         let target = self.current_target(p.background);
-        // AX + input calls block; run them off the async runtime.
-        match tokio::task::spawn_blocking(move || click_cached_mark(el, target)).await {
-            Ok(Ok(msg)) => ok_text(msg),
-            Ok(Err(e)) => err_result(&e),
-            Err(join_err) => err_result(&format!("click_mark task failed: {join_err}")),
+        let server = self.clone();
+        let number = p.number;
+        let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        // Validation + token consumption are atomic inside the blocking task;
+        // provider dispatch runs after releasing the short coordination gate.
+        let task =
+            tokio::task::spawn_blocking(move || server.activate_mark(number, target, deadline));
+        match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
+            .await
+        {
+            Ok(Ok(Ok(message))) => ok_text(message),
+            Ok(Ok(Err(error))) => err_result(&error),
+            Ok(Err(join_error)) => err_result(&format!("click_mark task failed: {join_error}")),
+            Err(_) => err_result("click_mark exceeded its bounded action deadline"),
+        }
+    }
+
+    #[tool(
+        name = "ax_activate",
+        description = "Activate one actionable node from the immediately preceding ax_read using \
+                       its snapshot_id and node_id. This generation-safe action fails closed when \
+                       the UI has been read again. It uses the web DOM bridge for scriptable \
+                       browser content, native AX/UIA activation otherwise, then a freshly \
+                       verified element-center fallback. \
+                       The result reports route=ax|uia|web_dom|element_center. Every activation \
+                       attempt consumes that generation before provider dispatch, so rerun \
+                       ax_read after any result."
+    )]
+    #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id), level = "info")]
+    async fn ax_activate(
+        &self,
+        Parameters(p): Parameters<AxActivateParams>,
+    ) -> rmcp::model::CallToolResult {
+        let target = self.current_target(p.background);
+        let server = self.clone();
+        let snapshot_id = p.snapshot_id;
+        let node_id = p.node_id;
+        let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        let task = tokio::task::spawn_blocking(move || {
+            server.activate_ax_node(&snapshot_id, &node_id, target, deadline)
+        });
+        match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
+            .await
+        {
+            Ok(Ok(Ok(message))) => ok_text(message),
+            Ok(Ok(Err(error))) => err_result(&error),
+            Ok(Err(join_error)) => err_result(&format!("ax_activate task failed: {join_error}")),
+            Err(_) => err_result("ax_activate exceeded its bounded action deadline"),
         }
     }
 
@@ -1492,12 +2265,12 @@ impl NovaServer {
         name = "dump_ax",
         description = "DEBUG: dump the target app's Accessibility tree (roles, subroles, labels, \
                        actions, frames) as indented text — to diagnose why some elements are not \
-                       marked. Targets the last window-captured app (or frontmost)."
+                       exposed. Targets the current AX/UIA app (or frontmost)."
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn dump_ax(&self) -> rmcp::model::CallToolResult {
         let Some(pid) = self.current_ax_pid().await else {
-            return err_result("no target app (take a window screenshot first)");
+            return err_result("no AX/UIA target app; focus/open one or call ax_read(window=...)");
         };
         match tokio::task::spawn_blocking(move || crate::platform::ui_tree().dump_tree(pid, 2500))
             .await
@@ -1508,118 +2281,38 @@ impl NovaServer {
     }
 
     #[tool(
-        name = "read_ui",
-        description = "Read the actionable UI as TEXT — no screenshot. Lists every actionable \
-                       element of a window (or the frontmost app) as [N] role \"label\" (plus = \
-                       \"value\" for text fields), then you activate one with click_mark(number=N). \
-                       This is the AX-FIRST path: it uses the Accessibility tree directly, so it is \
-                       far cheaper and faster than a screenshot (text tokens, no image, no capture) \
-                       and it works in the background. Prefer it over screenshot(marks=true) for \
-                       plain navigation — find the control, click it by number, read_ui again to \
-                       confirm. Take a screenshot only when you must SEE a visual result (layout, \
-                       icons, colors, rendered state) or drive a surface with no Accessibility tree \
-                       (canvas/games — use ocr there). Web-page content is listed too, not just \
-                       native controls. Pass window=\"<name>\" to target a specific window for a \
-                       tighter list; filter=\"...\" to narrow by role/label; max to cap the count. Numbers reset each read, so read_ui again after the UI \
-                       changes. Needs Accessibility permission; an app with no tree comes back empty \
-                       (fall back to screenshot/ocr)."
+        name = "ax_read",
+        description = "Canonical `ax:read` capability. Read visible semantic UI directly from \
+                       macOS Accessibility or Windows UI Automation without taking a screenshot. \
+                       Returns an ephemeral snapshot_id, deterministic node ids, role/name/\
+                       description/value/actions/state, optional global-logical bounds, explicit \
+                       coverage/fallback status, and actionable marks. mode=all (default) combines \
+                       controls with labels/static text/headings; interactive or content narrows \
+                       the view. Call ax_activate(snapshot_id,node_id) on a fresh actionable node. \
+                       If coverage is absent/partial, use focused OCR for missing rendered text, \
+                       then screenshot/zoom only for visual-only pixels. permission_denied means \
+                       grant Accessibility; do not hide it with a screenshot fallback."
     )]
-    #[tracing::instrument(skip_all, fields(window = ?p.window, filter = ?p.filter, max = ?p.max), level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, max = ?p.max, mode = ?p.mode), level = "info")]
+    async fn ax_read(
+        &self,
+        Parameters(p): Parameters<ReadUiParams>,
+    ) -> rmcp::model::CallToolResult {
+        self.run_ax_read(p).await
+    }
+
+    #[tool(
+        name = "read_ui",
+        description = "Compatibility alias for ax_read, backed by the exact same semantic \
+                       traversal, renderer, snapshot generation, and action cache. Prefer the \
+                       canonical ax_read name in new prompts and integrations."
+    )]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, max = ?p.max, mode = ?p.mode), level = "info")]
     async fn read_ui(
         &self,
         Parameters(p): Parameters<ReadUiParams>,
     ) -> rmcp::model::CallToolResult {
-        let max = p.max.unwrap_or(DEFAULT_READ_UI_MAX).clamp(1, MAX_READ_UI);
-        let filter = p
-            .filter
-            .map(|f| f.trim().to_lowercase())
-            .filter(|f| !f.is_empty());
-
-        // Resolve the target app (pid) + a clip rect + a human subject. The clip
-        // matters: the AX walk's web hit-test / geometry passes only run WITH a
-        // clip, so a bare (frontmost) read still resolves that app's own window
-        // frame — otherwise a page's web content would be invisible. Both lookups
-        // are blocking daemon round-trips, so they run off the async runtime.
-        let (pid, clip, subject) = match p.window.clone() {
-            Some(query) => {
-                let q = query.clone();
-                match tokio::task::spawn_blocking(move || crate::tools::window::pid_for_window(&q))
-                    .await
-                {
-                    Ok(Some((pid, frame))) => {
-                        (pid, Some(frame), format!("window matching {query:?}"))
-                    }
-                    Ok(None) => {
-                        return err_result(&format!(
-                            "no on-screen window matching {query:?} — take a screenshot (omit \
-                             window=) to see the windows that are on screen, then retry with an \
-                             exact name."
-                        ));
-                    }
-                    Err(join_err) => {
-                        return err_result(&format!("read_ui window lookup failed: {join_err}"));
-                    }
-                }
-            }
-            None => {
-                // `current_ax_pid()` returns the STICKY target_pid (the last
-                // window-captured / read_ui'd app) when set, and only falls back to
-                // the true frontmost app otherwise. Name the source honestly rather
-                // than always claiming "the frontmost app" — after a window capture,
-                // a bare read_ui reads that (possibly background) app. Read the lock
-                // and drop it before any await.
-                let cached = *self.target_pid.lock().expect("target_pid mutex");
-                let (pid, subject) = match cached {
-                    Some(pid) => (pid, "the current target app".to_string()),
-                    None => {
-                        let Some(pid) =
-                            tokio::task::spawn_blocking(crate::tools::window::frontmost_app_pid)
-                                .await
-                                .ok()
-                                .flatten()
-                        else {
-                            return err_result(
-                                "no target app (take a window screenshot first, or pass \
-                                 window=\"<name>\")",
-                            );
-                        };
-                        (pid, "the frontmost app".to_string())
-                    }
-                };
-                let clip = tokio::task::spawn_blocking(move || {
-                    crate::tools::window::frontmost_window_frame(pid)
-                })
-                .await
-                .ok()
-                .flatten();
-                (pid, clip, subject)
-            }
-        };
-
-        // Walk the AX tree + build the listing off the async runtime; a cold web
-        // tree or a wedged app must not hang the tool, so bound it.
-        let walk = tokio::task::spawn_blocking(move || {
-            let elements = crate::platform::ui_tree().collect_actionable(pid, max, clip);
-            build_ui_entries(elements, pid)
-        });
-        let (cached, lines) = match tokio::time::timeout(READ_UI_TIMEOUT, walk).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(join_err)) => return err_result(&format!("read_ui walk failed: {join_err}")),
-            Err(_) => {
-                return err_result(
-                    "read_ui timed out (the accessibility walk did not complete; try \
-                     screenshot(marks=true) instead).",
-                );
-            }
-        };
-
-        // Cache the marks so click_mark works with NO screenshot in between, route
-        // input to this app, and keep its (web) AX tree warm for the next read.
-        self.set_marks(cached);
-        self.set_target_pid(Some(pid));
-        crate::platform::ui_tree().keep_warm(pid);
-
-        ok_text(format_ui_listing(&lines, &subject, filter.as_deref()))
+        self.run_ax_read(p).await
     }
 }
 
@@ -1724,6 +2417,8 @@ mod tests {
             "ax_set_value",
             "ax_focus",
             "click_mark",
+            "ax_activate",
+            "ax_read",
             "read_ui",
             "dump_ax",
         ];
@@ -1899,6 +2594,30 @@ mod tests {
         }
     }
 
+    fn ax_line(
+        node_id: &str,
+        role: &str,
+        name: &str,
+        value: crate::platform::UiNodeValue,
+        bounds: Option<crate::platform::UiBounds>,
+    ) -> AxLine {
+        AxLine {
+            node_id: node_id.to_string(),
+            mark: None,
+            node: crate::platform::UiNode {
+                role: role.to_string(),
+                name: name.to_string(),
+                description: String::new(),
+                value,
+                actions: Vec::new(),
+                states: crate::platform::UiNodeStates::default(),
+                bounds,
+                depth: 1,
+                actionable: false,
+            },
+        }
+    }
+
     #[test]
     fn read_ui_listing_uses_the_same_mark_token_as_screenshots() {
         // The `[N] role "label"` shape must match `format_marks` so click_mark's
@@ -1977,6 +2696,701 @@ mod tests {
         let out = truncate_value(&long);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), 81); // 80 kept + ellipsis
+    }
+
+    #[test]
+    fn ax_renderer_preserves_same_frame_text_and_never_prints_a_secret() {
+        let shared_bounds = Some(crate::platform::UiBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 24.0,
+        });
+        let lines = vec![
+            ax_line(
+                "n1",
+                "AXStaticText",
+                "first",
+                crate::platform::UiNodeValue::Text("alpha".to_string()),
+                shared_bounds,
+            ),
+            ax_line(
+                "n2",
+                "AXStaticText",
+                "second",
+                crate::platform::UiNodeValue::Text("beta".to_string()),
+                shared_bounds,
+            ),
+            ax_line(
+                "n3",
+                "AXSecureTextField",
+                "Password",
+                crate::platform::UiNodeValue::Redacted,
+                shared_bounds,
+            ),
+        ];
+        let target = crate::platform::UiTarget {
+            pid: 42,
+            app_name: "Example".to_string(),
+            window_title: "Login".to_string(),
+            window_id: Some(7),
+            bounds: shared_bounds,
+        };
+        let built = BuiltAxEntries {
+            target,
+            coverage: crate::platform::UiReadCoverage::Complete,
+            truncated: false,
+            partial_reason: None,
+            cached: Vec::new(),
+            lines,
+        };
+        let output = format_ax_snapshot(
+            "ax-test-1",
+            &built,
+            crate::platform::UiReadMode::All,
+            None,
+            20_000,
+        );
+        assert!(
+            output.contains("[n1]") && output.contains("alpha"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[n2]") && output.contains("beta"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[n3]") && output.contains("[REDACTED]"),
+            "{output}"
+        );
+        assert!(!output.contains("hunter2"), "{output}");
+    }
+
+    #[test]
+    fn ax_filter_only_changes_rendering_not_snapshot_local_ids() {
+        let lines = vec![
+            ax_line(
+                "n1",
+                "AXButton",
+                "Cancel",
+                crate::platform::UiNodeValue::Absent,
+                None,
+            ),
+            ax_line(
+                "n2",
+                "AXButton",
+                "Save",
+                crate::platform::UiNodeValue::Absent,
+                None,
+            ),
+        ];
+        let target = crate::platform::UiTarget {
+            pid: 1,
+            app_name: "Example".to_string(),
+            window_title: String::new(),
+            window_id: None,
+            bounds: None,
+        };
+        let built = BuiltAxEntries {
+            target,
+            coverage: crate::platform::UiReadCoverage::Complete,
+            truncated: false,
+            partial_reason: None,
+            cached: Vec::new(),
+            lines,
+        };
+        let output = format_ax_snapshot(
+            "ax-test-2",
+            &built,
+            crate::platform::UiReadMode::All,
+            Some("save"),
+            20_000,
+        );
+        assert!(!output.contains("[n1]"), "{output}");
+        assert!(output.contains("[n2]"), "{output}");
+        assert!(output.contains("shown=1/2"), "{output}");
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeElementHandle;
+
+    impl crate::platform::ElementHandle for FakeElementHandle {
+        fn click(&self) -> Result<&'static str, String> {
+            Ok("FakeInvoke")
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        fn current_center(&self) -> Option<(f64, f64)> {
+            Some((5.0, 5.0))
+        }
+
+        fn try_web_click(
+            &self,
+            _pid: i32,
+            _label: &str,
+            _deadline: std::time::Instant,
+        ) -> Option<Result<String, String>> {
+            None
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::platform::ElementHandle> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingFakeElementHandle;
+
+    impl crate::platform::ElementHandle for FailingFakeElementHandle {
+        fn prepare_for_action(&self, _deadline: std::time::Instant) -> Result<(), String> {
+            Err("provider unavailable".to_string())
+        }
+
+        fn click(&self) -> Result<&'static str, String> {
+            panic!("prepare_for_action must fail before click")
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        fn current_center(&self) -> Option<(f64, f64)> {
+            None
+        }
+
+        fn try_web_click(
+            &self,
+            _pid: i32,
+            _label: &str,
+            _deadline: std::time::Instant,
+        ) -> Option<Result<String, String>> {
+            None
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::platform::ElementHandle> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn fake_cached(number: u32) -> crate::tools::elements::CachedElement {
+        crate::tools::elements::CachedElement {
+            number,
+            handle: Box::new(FakeElementHandle),
+            center: (5.0, 5.0),
+            role: "Button".to_string(),
+            label: "Save".to_string(),
+            pid: 42,
+        }
+    }
+
+    #[test]
+    fn semantic_activation_does_not_require_coordinate_bounds() {
+        let node = crate::platform::UiNode {
+            role: "Button".to_string(),
+            name: "Save".to_string(),
+            description: String::new(),
+            value: crate::platform::UiNodeValue::Absent,
+            actions: vec!["Invoke".to_string()],
+            states: crate::platform::UiNodeStates::default(),
+            bounds: None,
+            depth: 1,
+            actionable: true,
+        };
+        let snapshot = crate::platform::UiSnapshot {
+            target: crate::platform::UiTarget {
+                pid: 42,
+                app_name: "Example".to_string(),
+                window_title: "Document".to_string(),
+                window_id: None,
+                bounds: None,
+            },
+            nodes: vec![crate::platform::CollectedUiNode {
+                node,
+                handle: Some(Box::new(FakeElementHandle)),
+            }],
+            coverage: crate::platform::UiReadCoverage::Complete,
+            truncated: false,
+            partial_reason: None,
+        };
+        let built = build_ax_entries(snapshot);
+        assert_eq!(built.lines[0].mark, Some(1));
+        assert_eq!(built.cached.len(), 1);
+    }
+
+    #[test]
+    fn ax_activation_rejects_a_stale_snapshot_generation() {
+        let server = NovaServer::new();
+        let line = AxLine {
+            node_id: "n1".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Save".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: true,
+            },
+        };
+        let old = server.set_ax_nodes(
+            vec![("n1".to_string(), fake_cached(1))],
+            std::slice::from_ref(&line),
+        );
+        assert!(server.get_ax_node(&old, "n1").is_ok());
+        let current = server.set_ax_nodes(vec![("n1".to_string(), fake_cached(1))], &[line]);
+        let error = server.get_ax_node(&old, "n1").expect_err("old generation");
+        assert!(error.contains("stale snapshot"), "{error}");
+        assert!(server.get_ax_node(&current, "n1").is_ok());
+    }
+
+    #[test]
+    fn activation_attempt_consumes_its_generation() {
+        let server = NovaServer::new();
+        let line = AxLine {
+            node_id: "n1".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Save".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: true,
+            },
+        };
+        let generation = server.set_ax_nodes(vec![("n1".to_string(), fake_cached(1))], &[line]);
+        let result = server.activate_ax_node(
+            &generation,
+            "n1",
+            crate::tools::input::InputTarget::Global,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let error = server
+            .get_ax_node(&generation, "n1")
+            .expect_err("action attempt must consume its generation");
+        assert!(error.contains("stale snapshot"), "{error}");
+    }
+
+    #[test]
+    fn failed_activation_attempt_also_consumes_its_generation() {
+        let server = NovaServer::new();
+        let line = AxLine {
+            node_id: "n1".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Save".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: true,
+            },
+        };
+        let cached = crate::tools::elements::CachedElement {
+            number: 1,
+            handle: Box::new(FailingFakeElementHandle),
+            center: (0.0, 0.0),
+            role: "Button".to_string(),
+            label: "Save".to_string(),
+            pid: 42,
+        };
+        let generation = server.set_ax_nodes(
+            vec![("n1".to_string(), cached)],
+            std::slice::from_ref(&line),
+        );
+
+        let error = server
+            .activate_ax_node(
+                &generation,
+                "n1",
+                crate::tools::input::InputTarget::Global,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect_err("provider failure must surface");
+        assert!(error.contains("provider unavailable"), "{error}");
+        assert!(error.contains("consumed before dispatch"), "{error}");
+        let stale = server
+            .get_ax_node(&generation, "n1")
+            .expect_err("failed action attempt must consume its generation");
+        assert!(stale.contains("stale snapshot"), "{stale}");
+    }
+
+    #[tokio::test]
+    async fn every_ax_read_attempt_invalidates_the_previous_generation() {
+        let server = NovaServer::new();
+        let line = AxLine {
+            node_id: "n1".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Save".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: true,
+            },
+        };
+        let old = server.set_ax_nodes(
+            vec![("n1".to_string(), fake_cached(1))],
+            std::slice::from_ref(&line),
+        );
+        let result = server
+            .ax_read(Parameters(ReadUiParams {
+                window: None,
+                filter: None,
+                max: None,
+                mode: Some("not-a-mode".to_string()),
+                max_chars: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let error = server
+            .get_ax_node(&old, "n1")
+            .expect_err("failed read must invalidate the old generation");
+        assert!(error.contains("stale snapshot"), "{error}");
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingFakeElementHandle {
+        entered: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    }
+
+    impl crate::platform::ElementHandle for BlockingFakeElementHandle {
+        fn click(&self) -> Result<&'static str, String> {
+            self.entered.wait();
+            self.release.wait();
+            Ok("FakeInvoke")
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        fn current_center(&self) -> Option<(f64, f64)> {
+            None
+        }
+
+        fn try_web_click(
+            &self,
+            _pid: i32,
+            _label: &str,
+            _deadline: std::time::Instant,
+        ) -> Option<Result<String, String>> {
+            None
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::platform::ElementHandle> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn provider_dispatch_does_not_hold_the_generation_gate() {
+        let server = NovaServer::new();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let line = AxLine {
+            node_id: "n1".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Save".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: true,
+            },
+        };
+        let cached = crate::tools::elements::CachedElement {
+            number: 1,
+            handle: Box::new(BlockingFakeElementHandle {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            center: (0.0, 0.0),
+            role: "Button".to_string(),
+            label: "Save".to_string(),
+            pid: 42,
+        };
+        let generation = server.set_ax_nodes(
+            vec![("n1".to_string(), cached)],
+            std::slice::from_ref(&line),
+        );
+
+        let actor = server.clone();
+        let action_generation = generation.clone();
+        let action = std::thread::spawn(move || {
+            actor.activate_ax_node(
+                &action_generation,
+                "n1",
+                crate::tools::input::InputTarget::Global,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+        });
+        entered.wait();
+        let stale = server.get_ax_node(&generation, "n1");
+
+        let invalidator = server.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let invalidate = std::thread::spawn(move || {
+            let next = invalidator.invalidate_interaction();
+            sent.send(next).expect("report invalidation");
+        });
+        let next = received.recv_timeout(std::time::Duration::from_millis(250));
+        release.wait();
+        let action_result = action.join().expect("action thread");
+        invalidate.join().expect("invalidation thread");
+        let stale = stale.expect_err("token must be consumed before provider dispatch");
+        assert!(stale.contains("stale snapshot"), "{stale}");
+        let next = next.expect("generation replacement must not wait for provider dispatch");
+        assert!(action_result.is_ok(), "{action_result:?}");
+        assert_ne!(next, generation);
+        assert!(server.get_ax_node(&generation, "n1").is_err());
+    }
+
+    #[test]
+    fn non_actionable_node_reports_a_related_action_target_without_clicking() {
+        let server = NovaServer::new();
+        let content = AxLine {
+            node_id: "n1".to_string(),
+            mark: None,
+            node: crate::platform::UiNode {
+                role: "Group".to_string(),
+                name: "Dialog".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: Vec::new(),
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 1,
+                actionable: false,
+            },
+        };
+        let action = AxLine {
+            node_id: "n2".to_string(),
+            mark: Some(1),
+            node: crate::platform::UiNode {
+                role: "Button".to_string(),
+                name: "Confirm".to_string(),
+                description: String::new(),
+                value: crate::platform::UiNodeValue::Absent,
+                actions: vec!["Invoke".to_string()],
+                states: crate::platform::UiNodeStates::default(),
+                bounds: None,
+                depth: 2,
+                actionable: true,
+            },
+        };
+        let snapshot =
+            server.set_ax_nodes(vec![("n2".to_string(), fake_cached(1))], &[content, action]);
+        let error = server
+            .get_ax_node(&snapshot, "n1")
+            .expect_err("content node must not activate");
+        assert!(error.contains("not actionable"), "{error}");
+        assert!(error.contains("n2"), "{error}");
+    }
+
+    #[test]
+    fn ax_renderer_enforces_a_unicode_character_budget_with_a_marker() {
+        let target = crate::platform::UiTarget {
+            pid: 1,
+            app_name: "Example".to_string(),
+            window_title: String::new(),
+            window_id: None,
+            bounds: None,
+        };
+        let built = BuiltAxEntries {
+            target,
+            coverage: crate::platform::UiReadCoverage::Complete,
+            truncated: false,
+            partial_reason: None,
+            cached: Vec::new(),
+            lines: vec![ax_line(
+                "n1",
+                "AXStaticText",
+                "long",
+                crate::platform::UiNodeValue::Text("中".repeat(4_000)),
+                None,
+            )],
+        };
+        let output = format_ax_snapshot(
+            "ax-budget",
+            &built,
+            crate::platform::UiReadMode::All,
+            None,
+            4_096,
+        );
+        assert!(output.contains("truncated=true"), "{output}");
+        assert!(
+            output.contains("partial_reason=character_limit"),
+            "{output}"
+        );
+        assert!(output.chars().count() <= 4_096);
+    }
+
+    #[test]
+    fn ax_read_mode_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_ax_read_mode(None).unwrap(),
+            crate::platform::UiReadMode::All
+        );
+        assert_eq!(
+            parse_ax_read_mode(Some("content")).unwrap(),
+            crate::platform::UiReadMode::Content
+        );
+        assert!(parse_ax_read_mode(Some("visual")).is_err());
+    }
+
+    #[test]
+    fn all_shipped_guidance_contains_the_same_ax_first_ladder() {
+        let documents = [
+            ("server instructions", NOVA_INSTRUCTIONS),
+            (
+                "plugin skill",
+                include_str!("../packaging/plugin/skills/nova-grounding/SKILL.md"),
+            ),
+            (
+                "plugin README",
+                include_str!("../packaging/plugin/README.md"),
+            ),
+            ("root README", include_str!("../README.md")),
+        ];
+        for (name, document) in documents {
+            let lower = document.to_lowercase();
+            for required in ["ax_read", "ax_activate", "ocr", "screenshot"] {
+                assert!(
+                    lower.contains(required),
+                    "{name} omitted required AX-first policy term {required:?}"
+                );
+            }
+            assert!(
+                lower.contains("consum") || lower.contains("single-use"),
+                "{name} does not state that each activation attempt is single-use"
+            );
+            assert!(
+                !lower.contains("take a screenshot after each"),
+                "{name} contains the retired screenshot-after-every-action policy"
+            );
+            assert!(
+                !lower.contains("take screenshot(marks=true)"),
+                "{name} contains the retired screenshot-first policy"
+            );
+        }
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../packaging/plugin/plugin.json"))
+                .expect("plugin template JSON");
+        let prompt = manifest["provides"]["prompts"][0]["content"]
+            .as_str()
+            .expect("nova_desktop prompt");
+        for required in ["ax_read", "ax_activate", "ocr", "screenshot"] {
+            assert!(prompt.to_lowercase().contains(required), "{prompt}");
+        }
+        assert!(
+            prompt.to_lowercase().contains("consum"),
+            "nova_desktop prompt omitted the single-use generation contract"
+        );
+    }
+
+    #[test]
+    fn mac_semantic_read_sources_have_no_capture_call_edge() {
+        let sources = [
+            include_str!("platform/mac/elements/target.rs"),
+            include_str!("platform/mac/elements/semantic.rs"),
+        ];
+        for source in sources {
+            for forbidden in [
+                "crate::platform::screen_capture(",
+                "crate::platform::window_manager(",
+                "crate::tools::window::",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "ax_read acquired a capture-backed dependency: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_manifest_preserves_the_reviewed_nova_desktop_prompt() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let output = std::env::temp_dir().join(format!(
+            "nova-plugin-prompt-golden-{}.json",
+            std::process::id()
+        ));
+        let status = std::process::Command::new("bash")
+            .arg(root.join("packaging/plugin/generate-manifest.sh"))
+            .arg("9.9.9")
+            .arg("a".repeat(64))
+            .arg("b".repeat(64))
+            .arg(&output)
+            .status()
+            .expect("run manifest generator");
+        assert!(status.success());
+        let template: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("packaging/plugin/plugin.json"))
+                .expect("read template"),
+        )
+        .expect("parse template");
+        let generated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output).expect("read generated"))
+                .expect("parse generated");
+        let _ = std::fs::remove_file(&output);
+        assert_eq!(
+            generated["provides"]["prompts"], template["provides"]["prompts"],
+            "release generation changed the reviewed nova_desktop prompt"
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[tokio::test]
+    async fn ax_read_and_read_ui_alias_share_the_headless_typed_outcome() {
+        fn params() -> ReadUiParams {
+            ReadUiParams {
+                window: None,
+                filter: None,
+                max: None,
+                mode: None,
+                max_chars: None,
+            }
+        }
+        let server = NovaServer::new();
+        let canonical = server.ax_read(Parameters(params())).await;
+        let alias = server.read_ui(Parameters(params())).await;
+        let canonical_text = canonical.content[0]
+            .as_text()
+            .expect("canonical text")
+            .text
+            .as_str();
+        let alias_text = alias.content[0]
+            .as_text()
+            .expect("alias text")
+            .text
+            .as_str();
+        assert!(canonical_text.contains("status=unsupported_platform"));
+        assert_eq!(canonical_text, alias_text);
     }
 
     /// A zero/negative-size zoom must be rejected up front, before any capture

@@ -1,12 +1,14 @@
 //! Nova — Computer Use MCP Server
 //!
-//! A macOS desktop control MCP server that gives LLMs the ability to:
+//! A native macOS/Windows desktop control MCP server that gives LLMs the ability to:
+//! - Read and activate semantic Accessibility/UIA nodes without screenshots
 //! - Capture screenshots of windows and the display
-//! - Control mouse and keyboard via CGEvent
+//! - Control mouse and keyboard through native input APIs
 //! - List and manage application windows
 //! - Read/write clipboard
 //!
-//! Built on Apple's ScreenCaptureKit, CoreGraphics, and Accessibility APIs.
+//! The canonical grounding ladder is `ax_read` → focused OCR → focused pixel
+//! capture, with screenshots reserved for genuinely visual information.
 
 pub mod capture;
 pub mod display;

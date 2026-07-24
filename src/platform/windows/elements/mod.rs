@@ -27,6 +27,7 @@ mod actions;
 pub(crate) mod automation;
 mod discover;
 mod handle;
+mod snapshot;
 
 pub use handle::WinElementHandle;
 
@@ -38,10 +39,9 @@ use crate::platform::{ElementHandle, UiTree};
 pub struct UiElement {
     pub role: String,
     pub label: String,
-    /// The control's current value for text-like roles, else empty. Mirrors the
-    /// mac field so the platform-neutral `read_ui` renderer compiles on both
-    /// targets. Not yet populated from UIA (`ValuePattern`) here — a follow-up;
-    /// left empty for now, which the renderer treats the same as "no value".
+    /// The control's current value for text-like roles, else empty. The legacy
+    /// Set-of-Mark path keeps this empty; the richer semantic snapshot carries
+    /// typed values/redaction without changing that compatibility contract.
     pub value: String,
     pub x: f64,
     pub y: f64,
@@ -74,6 +74,23 @@ pub struct CachedElement {
 pub struct WinUiTree;
 
 impl UiTree for WinUiTree {
+    fn resolve_target(
+        &self,
+        query: Option<&str>,
+        preferred_pid: Option<i32>,
+        deadline: std::time::Instant,
+    ) -> Result<crate::platform::UiTarget, crate::platform::UiReadError> {
+        snapshot::resolve_target(query, preferred_pid, deadline)
+    }
+
+    fn read_snapshot(
+        &self,
+        target: &crate::platform::UiTarget,
+        options: crate::platform::UiSnapshotOptions,
+    ) -> Result<crate::platform::UiSnapshot, crate::platform::UiReadError> {
+        snapshot::read_snapshot(target, options)
+    }
+
     fn collect_actionable(
         &self,
         pid: i32,
@@ -83,16 +100,32 @@ impl UiTree for WinUiTree {
         discover::collect_actionable(pid, max, clip)
     }
 
-    fn ax_click(&self, pid: i32, query: &str) -> Result<String, String> {
-        actions::ax_click(pid, query)
+    fn ax_click(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_click(pid, query, deadline)
     }
 
-    fn ax_set_value(&self, pid: i32, query: &str, value: &str) -> Result<String, String> {
-        actions::ax_set_value(pid, query, value)
+    fn ax_set_value(
+        &self,
+        pid: i32,
+        query: &str,
+        value: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_set_value(pid, query, value, deadline)
     }
 
-    fn ax_focus(&self, pid: i32, query: &str) -> Result<String, String> {
-        actions::ax_focus(pid, query)
+    fn ax_focus(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_focus(pid, query, deadline)
     }
 
     fn raise_app(&self, pid: i32) {

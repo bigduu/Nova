@@ -40,27 +40,31 @@
 //! ordinary Rust values — `Vec`s, `Box<dyn ElementHandle>` — with normal,
 //! deterministic scope-based `Drop`, which is exactly the safe pattern this
 //! module's own `IUIAutomation` handling now follows too.)
-use windows::core::VARIANT;
+use crate::platform::{UiNodeValue, UiReadMode};
+use windows::core::{Interface, VARIANT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationCondition,
-    UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-    UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId, UIA_DataItemControlTypeId,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_ExpandCollapsePatternId,
-    UIA_GroupControlTypeId, UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
-    UIA_InvokePatternId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
+    IUIAutomationCondition, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId,
+    UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_ExpandCollapsePatternId,
+    UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId,
+    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_InvokePatternId,
+    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
     UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
-    UIA_IsOffscreenPropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
-    UIA_IsTogglePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
-    UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_MenuBarControlTypeId,
-    UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_PaneControlTypeId,
-    UIA_RadioButtonControlTypeId, UIA_SelectionItemPatternId, UIA_SliderControlTypeId,
-    UIA_SplitButtonControlTypeId, UIA_TabItemControlTypeId, UIA_TableControlTypeId,
-    UIA_TextControlTypeId, UIA_TogglePatternId, UIA_ToolBarControlTypeId, UIA_TreeControlTypeId,
-    UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId, UIA_CONTROLTYPE_ID,
-    UIA_PROPERTY_ID,
+    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+    UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_NamePropertyId,
+    UIA_PaneControlTypeId, UIA_RadioButtonControlTypeId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_SelectionItemPatternId, UIA_SliderControlTypeId, UIA_SplitButtonControlTypeId,
+    UIA_TabItemControlTypeId, UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ToolBarControlTypeId, UIA_TreeControlTypeId,
+    UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    UIA_WindowControlTypeId, UIA_CONTROLTYPE_ID, UIA_PROPERTY_ID,
 };
 
 thread_local! {
@@ -149,6 +153,39 @@ pub(super) fn with_automation<T>(
     f(&automation)
 }
 
+/// Raw-error sibling of [`with_automation`] for callers that need to retain
+/// the HRESULT and map UIA timeout/access-denied/element-gone failures into a
+/// typed public error. It deliberately has the same fresh-per-call lifetime.
+pub(super) fn with_automation_raw<T>(
+    f: impl FnOnce(&IUIAutomation) -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    ensure_com_mta();
+    // SAFETY: identical activation/lifetime argument to `with_automation`.
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }?;
+    f(&automation)
+}
+
+/// Bound synchronous provider RPCs to the semantic-read deadline. An outer
+/// async timeout cannot cancel a blocking COM call, while UIAutomation2's
+/// transaction timeout can. Best-effort because very old providers may not
+/// support `IUIAutomation2`; callers still check the deadline between nodes.
+pub(super) fn configure_deadline(automation: &IUIAutomation, deadline: std::time::Instant) {
+    let remaining_ms = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_millis()
+        .clamp(1, u32::MAX as u128) as u32;
+    let Ok(automation2) = automation.cast::<IUIAutomation2>() else {
+        return;
+    };
+    // SAFETY: setters take bounded scalar millisecond values and mutate only
+    // this fresh automation client's timeout configuration.
+    unsafe {
+        let _ = automation2.SetConnectionTimeout(remaining_ms);
+        let _ = automation2.SetTransactionTimeout(remaining_ms);
+    }
+}
+
 // ── CacheRequest: batch every property/pattern into ONE round trip ──────
 
 /// Build the [`IUIAutomationCacheRequest`] every discovery call uses: the
@@ -181,6 +218,46 @@ pub(super) fn build_cache_request(
     }
 }
 
+/// Cache request for semantic snapshots. The first pass sets
+/// `include_value=false`, classifies `IsPassword`, and fetches every other
+/// property in one provider transaction. A second pass uses
+/// `include_value=true` together with [`build_nonsecure_snapshot_condition`],
+/// so `Value` is cached only for controls already selected by UIA as
+/// non-password fields.
+pub(super) fn build_snapshot_cache_request(
+    automation: &IUIAutomation,
+    include_value: bool,
+) -> windows::core::Result<IUIAutomationCacheRequest> {
+    unsafe {
+        let cr = automation.CreateCacheRequest()?;
+        for property in [
+            UIA_NamePropertyId,
+            UIA_ControlTypePropertyId,
+            UIA_BoundingRectanglePropertyId,
+            UIA_IsOffscreenPropertyId,
+            UIA_HelpTextPropertyId,
+            UIA_IsPasswordPropertyId,
+            UIA_IsEnabledPropertyId,
+            UIA_HasKeyboardFocusPropertyId,
+            UIA_IsKeyboardFocusablePropertyId,
+            UIA_IsInvokePatternAvailablePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId,
+            UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsValuePatternAvailablePropertyId,
+            UIA_SelectionItemIsSelectedPropertyId,
+            UIA_ToggleToggleStatePropertyId,
+            UIA_ExpandCollapseExpandCollapseStatePropertyId,
+        ] {
+            cr.AddProperty(property)?;
+        }
+        if include_value {
+            cr.AddProperty(UIA_ValueValuePropertyId)?;
+        }
+        Ok(cr)
+    }
+}
+
 /// Control types treated as actionable BY ROLE ALONE (mirrors macOS
 /// `mac::elements::model::is_actionable`'s AX-role allowlist) — an element
 /// matching one of these OR exposing a click-ish pattern (see
@@ -200,6 +277,11 @@ const ACTIONABLE_CONTROL_TYPES: &[UIA_CONTROLTYPE_ID] = &[
     UIA_TreeItemControlTypeId,
     UIA_DataItemControlTypeId,
 ];
+
+/// Whether `ct` belongs to the same role allowlist Set-of-Mark discovery uses.
+pub(super) fn is_actionable_control_type(ct: UIA_CONTROLTYPE_ID) -> bool {
+    ACTIONABLE_CONTROL_TYPES.contains(&ct)
+}
 
 /// The four click-ish pattern-availability properties. This is an
 /// order-INDEPENDENT availability SET — it only ever gets OR'd together into a
@@ -269,6 +351,44 @@ pub(super) fn build_queryable_condition(
     }
 }
 
+/// Candidate set for a semantic snapshot. UIA's content and control views are
+/// not strict supersets of one another across native/custom/web providers, so
+/// content/all reads intentionally union both. Interactive mode retains the
+/// existing Set-of-Mark condition exactly.
+pub(super) fn build_snapshot_condition(
+    automation: &IUIAutomation,
+    mode: UiReadMode,
+) -> windows::core::Result<IUIAutomationCondition> {
+    unsafe {
+        if mode == UiReadMode::Interactive {
+            return build_actionable_condition(automation);
+        }
+        let control = automation.ControlViewCondition()?;
+        let content = automation.ContentViewCondition()?;
+        let semantic = automation.CreateOrCondition(&control, &content)?;
+        if mode == UiReadMode::Content {
+            Ok(semantic)
+        } else {
+            let actionable = build_actionable_condition(automation)?;
+            automation.CreateOrCondition(&semantic, &actionable)
+        }
+    }
+}
+
+/// The second semantic batch is constrained provider-side to non-password
+/// controls before its cache request asks for `Value`.
+pub(super) fn build_nonsecure_snapshot_condition(
+    automation: &IUIAutomation,
+    mode: UiReadMode,
+) -> windows::core::Result<IUIAutomationCondition> {
+    unsafe {
+        let snapshot = build_snapshot_condition(automation, mode)?;
+        let nonsecure =
+            automation.CreatePropertyCondition(UIA_IsPasswordPropertyId, &VARIANT::from(false))?;
+        automation.CreateAndCondition(&snapshot, &nonsecure)
+    }
+}
+
 /// `(id, name)` pairs backing [`control_type_name`]. A lookup TABLE rather
 /// than a `match` on principle: the `windows` crate's generated `UIA_*Id`
 /// constants are PascalCase (mirroring the COM API's own naming), which trips
@@ -315,6 +435,94 @@ pub(super) fn control_type_name(ct: UIA_CONTROLTYPE_ID) -> String {
         .find(|(id, _)| *id == ct)
         .map(|(_, name)| name.to_string())
         .unwrap_or_else(|| format!("ControlType({})", ct.0))
+}
+
+/// Read one cached boolean property. Unsupported/sentinel values stay `None`
+/// instead of being rendered as a misleading `false`.
+pub(super) fn cached_bool_property(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    property: UIA_PROPERTY_ID,
+) -> Option<bool> {
+    // SAFETY: `build_cache_request` adds every property passed by callers.
+    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
+    bool::try_from(&value).ok()
+}
+
+/// Read one cached integer property (pattern state enums are represented as
+/// `i32` in UIA). Unsupported/sentinel values stay absent.
+pub(super) fn cached_i32_property(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    property: UIA_PROPERTY_ID,
+) -> Option<i32> {
+    // SAFETY: see `cached_bool_property`.
+    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
+    i32::try_from(&value).ok()
+}
+
+fn cached_string_property(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    property: UIA_PROPERTY_ID,
+) -> Option<String> {
+    // SAFETY: see `cached_bool_property`.
+    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
+    let value = windows::core::BSTR::try_from(&value).ok()?.to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Convert UIA's cached value into the neutral value type. The password check
+/// is intentionally the first operation: secure controls never execute a
+/// `UIA_ValueValuePropertyId` read and can only cross the platform boundary as
+/// the typed `Redacted` variant.
+pub(super) fn cached_node_value(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> UiNodeValue {
+    match cached_password_state(el) {
+        Some(true) => return UiNodeValue::Redacted,
+        Some(false) => {}
+        // Fail closed: an unclassifiable value must not be read and possibly
+        // expose a secure field through a broken/custom provider.
+        None => return UiNodeValue::Redacted,
+    }
+    cached_string_property(el, UIA_ValueValuePropertyId)
+        .map(UiNodeValue::Text)
+        .unwrap_or(UiNodeValue::Absent)
+}
+
+/// Cached password classification used before selecting the safe value pass.
+pub(super) fn cached_password_state(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<bool> {
+    // SAFETY: IsPassword is included in both semantic cache requests.
+    match unsafe { el.CachedIsPassword() } {
+        Ok(value) => Some(value.as_bool()),
+        Err(_) => None,
+    }
+}
+
+/// Deterministic action list derived entirely from the cached property blob.
+pub(super) fn cached_actions(
+    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    for (property, name) in [
+        (UIA_IsInvokePatternAvailablePropertyId, "Invoke"),
+        (UIA_IsTogglePatternAvailablePropertyId, "Toggle"),
+        (
+            UIA_IsSelectionItemPatternAvailablePropertyId,
+            "SelectionItem",
+        ),
+        (
+            UIA_IsExpandCollapsePatternAvailablePropertyId,
+            "ExpandCollapse",
+        ),
+        (UIA_IsValuePatternAvailablePropertyId, "SetValue"),
+        (UIA_IsKeyboardFocusablePropertyId, "Focus"),
+    ] {
+        if cached_bool_property(el, property) == Some(true) {
+            actions.push(name.to_string());
+        }
+    }
+    actions
 }
 
 // ── Pattern ladder (shared by handle.rs's click and actions.rs's ax_click) ──

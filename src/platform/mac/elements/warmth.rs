@@ -88,10 +88,9 @@ impl TreeWarmer {
         if let Ok(mut t) = self.shared.target.lock() {
             *t = Some(pid);
         }
-        // Warm it once right now too, so a brand-new target starts materializing
-        // immediately instead of waiting up to one heartbeat.
-        let app = AXUIElement::application(pid);
-        enable_web_accessibility(&app);
+        // Provider RPCs stay on the dedicated heartbeat thread. Callers such as
+        // an async MCP handler only update this pid and never block their
+        // executor on an unbounded AX message.
     }
 
     /// The app currently kept warm, if any.
@@ -132,6 +131,9 @@ fn run(shared: Arc<Shared>) {
         let target = shared.target.lock().ok().and_then(|t| *t);
         if let Some(pid) = target {
             let app = AXUIElement::application(pid);
+            // A wedged provider must not wedge the process-wide warmer thread
+            // forever. The next heartbeat can retry independently.
+            let _ = app.set_messaging_timeout(0.25);
             enable_web_accessibility(&app);
         }
         std::thread::sleep(HEARTBEAT);

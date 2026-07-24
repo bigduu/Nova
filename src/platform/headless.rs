@@ -182,6 +182,29 @@ impl super::WindowManager for HeadlessWindowManager {
 pub struct HeadlessUiTree;
 
 impl super::UiTree for HeadlessUiTree {
+    fn resolve_target(
+        &self,
+        _query: Option<&str>,
+        _preferred_pid: Option<i32>,
+        _deadline: std::time::Instant,
+    ) -> Result<super::UiTarget, super::UiReadError> {
+        Err(super::UiReadError::new(
+            super::UiReadErrorKind::UnsupportedPlatform,
+            unsupported("ax_read"),
+        ))
+    }
+
+    fn read_snapshot(
+        &self,
+        _target: &super::UiTarget,
+        _options: super::UiSnapshotOptions,
+    ) -> Result<super::UiSnapshot, super::UiReadError> {
+        Err(super::UiReadError::new(
+            super::UiReadErrorKind::UnsupportedPlatform,
+            unsupported("ax_read"),
+        ))
+    }
+
     fn collect_actionable(
         &self,
         _pid: i32,
@@ -191,13 +214,29 @@ impl super::UiTree for HeadlessUiTree {
         // Marks degrade gracefully by contract: no tree → no marks, not an error.
         Vec::new()
     }
-    fn ax_click(&self, _pid: i32, _query: &str) -> Result<String, String> {
+    fn ax_click(
+        &self,
+        _pid: i32,
+        _query: &str,
+        _deadline: std::time::Instant,
+    ) -> Result<String, String> {
         Err(unsupported("accessibility click"))
     }
-    fn ax_set_value(&self, _pid: i32, _query: &str, _value: &str) -> Result<String, String> {
+    fn ax_set_value(
+        &self,
+        _pid: i32,
+        _query: &str,
+        _value: &str,
+        _deadline: std::time::Instant,
+    ) -> Result<String, String> {
         Err(unsupported("accessibility set_value"))
     }
-    fn ax_focus(&self, _pid: i32, _query: &str) -> Result<String, String> {
+    fn ax_focus(
+        &self,
+        _pid: i32,
+        _query: &str,
+        _deadline: std::time::Instant,
+    ) -> Result<String, String> {
         Err(unsupported("accessibility focus"))
     }
     fn raise_app(&self, _pid: i32) {}
