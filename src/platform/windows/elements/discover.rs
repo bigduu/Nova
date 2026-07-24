@@ -130,7 +130,8 @@ fn collect_actionable_inner(
             if !seen.insert(key) {
                 continue;
             }
-            let handle = WinElementHandle::new(el, ui.role.clone(), ui.label.clone());
+            let handle =
+                WinElementHandle::new(automation.clone(), el, ui.role.clone(), ui.label.clone());
             out.push((ui, Box::new(handle) as Box<dyn ElementHandle>));
         }
         Ok(out)
@@ -205,9 +206,9 @@ fn to_ui_element(
         UiElement {
             role,
             label: name,
-            // TODO: populate from UIA ValuePattern (UIA_ValueValuePropertyId) via
-            // the cached property blob; left empty for now (renderer treats empty
-            // as "no value"), so this matches the mac field without a UIA change.
+            // Preserve Set-of-Mark/read_ui's existing compact behavior. Rich
+            // values and secure redaction belong to the semantic snapshot's
+            // separately budgeted two-pass cache.
             value: String::new(),
             x,
             y,

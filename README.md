@@ -2,12 +2,14 @@
 
 **A Computer Use implementation in Rust.** Nova is a [Model Context
 Protocol](https://modelcontextprotocol.io) server that gives an LLM agent
-control of the macOS desktop: screenshots, mouse, keyboard, scrolling,
-window/app introspection, and the clipboard — the "computer use" capability,
-built natively in Rust rather than wrapping a Python/JS automation stack.
+AX-first control of macOS and Windows: semantic UI reads/actions, screenshots,
+mouse, keyboard, scrolling, window/app introspection, OCR, and the clipboard —
+the "computer use" capability, built natively in Rust rather than wrapping a
+Python/JS automation stack.
 
-Built directly on Apple's ScreenCaptureKit, CoreGraphics (CGEvent), and the
-Accessibility APIs — a single self-contained binary, no runtime to install.
+Built directly on native platform APIs (macOS Accessibility/ScreenCaptureKit/
+CoreGraphics and Windows UI Automation/Win32) — a single self-contained binary,
+no runtime to install.
 Connect it to any MCP client (Claude Desktop, an agent runtime, your own) over
 stdio or Streamable HTTP.
 
@@ -15,11 +17,13 @@ stdio or Streamable HTTP.
 
 | Tool | What it does |
 | --- | --- |
-| `read_ui` | List the actionable UI as text — `[N] role "label"` straight from the Accessibility tree, no screenshot. Then `click_mark(number=N)`. The AX-first path: cheaper and faster than an image; screenshots become verification-only. |
-| `screenshot` | Capture the whole display or a single `window=` — returns a JPEG + the pixel-coordinate contract. Numbers actionable elements (Set-of-Mark) by default (same `[N]` list as `read_ui`, plus the picture). |
+| `ax_read` | Canonical `ax:read`: read semantic labels, text, values, roles, actions, state, and optional bounds through macOS Accessibility or Windows UIA, without a screenshot. Returns an ephemeral snapshot/node protocol and explicit coverage/status. |
+| `read_ui` | Compatibility alias backed by the same `ax_read` traversal and cache generation. |
+| `ax_activate` | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
+| `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
 | `ocr` | Recognize on-screen text via Apple Vision (on-device, no model files). Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. CJK + Latin. |
-| `click_mark` | Activate a numbered element straight through the Accessibility tree (no cursor, no pixel guessing). |
+| `click_mark` | Compatibility action for the latest numbered mark; prefer generation-safe `ax_activate`. |
 | `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` / `cursor_position` | Pointer input and cursor query, in the pixel space of the last screenshot. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
 | `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
@@ -32,7 +36,7 @@ stdio or Streamable HTTP.
 
 - **macOS 15+** (a transitive dependency, `apple-metal`, needs the macOS 15 SDK / Xcode 16+).
 - **Screen Recording** permission — for `screenshot` / `ocr` / `list_windows`.
-- **Accessibility** permission — for posting mouse/keyboard events and Set-of-Mark.
+- **Accessibility** permission — for `ax_read`, semantic activation, and input.
 
 > Both are granted to the **nova binary itself**, not the app that launches it —
 > see [Permissions & code signing](#permissions--code-signing-macos). On a dev
@@ -105,14 +109,14 @@ nova --http                       # 127.0.0.1:3100/mcp
 nova --http --addr 0.0.0.0:8080   # reachable on the LAN
 ```
 
-**First calls.** Call `read_ui` (optionally `read_ui(window="<name>")`) to list the
-numbered actionable elements as text, then `click_mark(number=N)` to activate one —
-no screenshot, no coordinates needed. Take a `screenshot` when you need to *see* the
-screen (verify a visual result, read a rendered view) or `screenshot(marks=true)` when
-you want the picture alongside the same numbered list; drop to `zoom_region` / `ocr`
-for surfaces with no Accessibility tree (canvas, games). All pointer tools use the
-pixel space of the most recent screenshot, so the loop is: `read_ui` → act → `read_ui`
-(or screenshot) to confirm.
+**First calls.** Call `ax_read` (optionally
+`ax_read(window="<name>", mode="all")`) for semantic content and controls, then
+`ax_activate(snapshot_id, node_id)` on an exact actionable node. Re-run
+`ax_read` after the action to verify semantic state. If AX/UIA coverage is
+absent or partial, use focused-window `ocr` for rendered text; use
+`screenshot(window=...)` / `zoom_region` only when pixels are necessary
+(layout, icon, color, image, canvas, or visual verification). All pointer tools
+use the pixel space of the most recent screenshot.
 
 ## Permissions & code signing (macOS)
 
@@ -165,17 +169,23 @@ later rebuilds, re-signed with the same cert, keep the grant.
 A general LLM judging pixel coordinates off a downscaled screenshot is the main
 source of mis-clicks — so the primary path avoids pixels entirely.
 
-- **`read_ui` (AX-first, no image)** — list the actionable UI as text (`[N] role
-  "label"`, plus a field's `value`) straight from the Accessibility tree, then
-  `click_mark(number=N)`. No capture, no image tokens, works in the background;
-  this is the default way to *find and click* things. Screenshots are for when you
-  need to *see* the screen. Needs Accessibility permission; an app with no tree
-  comes back empty (fall back to `screenshot` / `ocr`).
-- **Set-of-Mark screenshot** — `screenshot(marks=true)` (the default) draws
-  numbered boxes over the same actionable elements and returns the SAME `[N]` list
-  PLUS the picture, so `click_mark(number=N)` works identically — use it in place of
-  `read_ui` when you also need the image. Needs Accessibility permission; degrades
-  to plain coordinates without it.
+- **`ax_read` first (no image)** — returns actionable controls and
+  non-actionable readable content in deterministic tree order. A successful
+  macOS read requires Accessibility but does not contact ScreenCaptureKit.
+  `permission_denied` means fix that grant; it is not an instruction to take a
+  screenshot.
+- **Fresh semantic action** — call `ax_activate` with the returned snapshot and
+  node IDs. Native AX/UIA and the browser DOM bridge are tried before a freshly
+  revalidated element-center click. Stale generations fail closed; every
+  activation attempt consumes its generation before provider dispatch, so read
+  again after any result.
+- **OCR second** — when coverage is absent/partial and the missing information
+  is rendered text, use focused-window OCR and its returned text center with
+  `left_click(..., source="ocr_center")`.
+- **Screenshot/zoom last** — use pixels for visual-only state or a surface with
+  no semantic/text representation; coordinate clicks report
+  `route=visual_coordinate`. Screenshot marks and `click_mark` remain available
+  for compatibility.
 
 When a screenshot *is* needed, **all click/move/scroll tools work in the pixel space
 of the last screenshot** — the server remembers that frame and maps clicks back to
@@ -228,6 +238,7 @@ cargo test --test e2e_input mouse_move_roundtrips_through_cursor_position -- --i
 
 | Test (file) | What it does | Needs |
 | --- | --- | --- |
+| `semantic_snapshot_reads…` (`e2e_ax_read`) | Resolves and reads a focused or `NOVA_AX_WINDOW` app through AX/UIA without pixel capture | Accessibility / logged-in UIA desktop |
 | `mouse_move_roundtrips…` (`e2e_input`) | Moves the cursor, reads it back via `cursor_position`, asserts the position — restores the cursor | Accessibility |
 | `click_events_post…` (`e2e_input`) | Left/right/double click on the empty desktop corner (Esc dismisses the menu) | Accessibility |
 | `scroll_events_post…` (`e2e_input`) | Posts vertical scroll events | Accessibility |

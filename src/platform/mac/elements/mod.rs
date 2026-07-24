@@ -37,6 +37,8 @@ mod discover;
 mod geometry;
 mod hittest;
 mod model;
+mod semantic;
+mod target;
 mod walk;
 mod warmth;
 
@@ -62,7 +64,9 @@ pub use discover::{actionable_elements, collect_actionable};
 pub use model::{raise_app, web_area_origin, web_click_point, AxHandle, CachedElement, UiElement};
 pub use warmth::{warmer, TreeWarmer};
 
-use crate::platform::{ElementHandle, UiTree};
+use crate::platform::{
+    ElementHandle, UiReadError, UiSnapshot, UiSnapshotOptions, UiTarget, UiTree,
+};
 
 /// The macOS [`UiTree`]: Set-of-Mark discovery + query-driven AX actions,
 /// forwarding onto the moved `discover`/`actions`/`debug`/`model`/`warmth`
@@ -70,6 +74,29 @@ use crate::platform::{ElementHandle, UiTree};
 pub struct MacUiTree;
 
 impl UiTree for MacUiTree {
+    fn resolve_target(
+        &self,
+        query: Option<&str>,
+        preferred_pid: Option<i32>,
+        deadline: std::time::Instant,
+    ) -> Result<UiTarget, UiReadError> {
+        target::resolve_target(query, preferred_pid, deadline)
+    }
+
+    fn read_snapshot(
+        &self,
+        target: &UiTarget,
+        options: UiSnapshotOptions,
+    ) -> Result<UiSnapshot, UiReadError> {
+        let (mut snapshot, handles) = semantic::read_snapshot(target, options)?;
+        for (collected, handle) in snapshot.nodes.iter_mut().zip(handles) {
+            if let Some((handle, anchor)) = handle {
+                collected.handle = Some(Box::new(MacElementHandle::for_semantic(handle, anchor)));
+            }
+        }
+        Ok(snapshot)
+    }
+
     fn collect_actionable(
         &self,
         pid: i32,
@@ -79,24 +106,42 @@ impl UiTree for MacUiTree {
         discover::collect_actionable(pid, max, clip)
             .into_iter()
             .map(|(el, handle)| {
+                let desired_center = Some(el.center());
                 (
                     el,
-                    Box::new(MacElementHandle(handle)) as Box<dyn ElementHandle>,
+                    Box::new(MacElementHandle::with_center(handle, desired_center))
+                        as Box<dyn ElementHandle>,
                 )
             })
             .collect()
     }
 
-    fn ax_click(&self, pid: i32, query: &str) -> Result<String, String> {
-        actions::ax_click(pid, query)
+    fn ax_click(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_click(pid, query, deadline)
     }
 
-    fn ax_set_value(&self, pid: i32, query: &str, value: &str) -> Result<String, String> {
-        actions::ax_set_value(pid, query, value)
+    fn ax_set_value(
+        &self,
+        pid: i32,
+        query: &str,
+        value: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_set_value(pid, query, value, deadline)
     }
 
-    fn ax_focus(&self, pid: i32, query: &str) -> Result<String, String> {
-        actions::ax_focus(pid, query)
+    fn ax_focus(
+        &self,
+        pid: i32,
+        query: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        actions::ax_focus(pid, query, deadline)
     }
 
     fn raise_app(&self, pid: i32) {
@@ -123,19 +168,89 @@ impl UiTree for MacUiTree {
 /// `tools/elements/model.rs`; the trait wiring — including the NEW
 /// `try_web_click`, see below — lives here instead, alongside `MacUiTree`.
 #[derive(Debug, Clone)]
-struct MacElementHandle(model::AxHandle);
+struct MacElementHandle {
+    inner: model::AxHandle,
+    center_basis: CenterBasis,
+}
+
+#[derive(Debug, Clone)]
+enum CenterBasis {
+    /// Legacy screenshot marks already have an independent capture frame.
+    StaticOffset((f64, f64)),
+    /// Semantic reads recompute the global anchor at action time so moving a
+    /// WebKit window cannot leave a stale offset behind.
+    WindowAnchor(semantic::SemanticAnchor),
+    /// No independent global anchor: semantic activation is still allowed,
+    /// but coordinate fallback fails closed.
+    Unavailable,
+}
+
+impl MacElementHandle {
+    fn for_semantic(handle: model::AxHandle, anchor: Option<semantic::SemanticAnchor>) -> Self {
+        Self {
+            inner: handle,
+            center_basis: anchor
+                .map(CenterBasis::WindowAnchor)
+                .unwrap_or(CenterBasis::Unavailable),
+        }
+    }
+
+    fn with_center(handle: model::AxHandle, desired_center: Option<(f64, f64)>) -> Self {
+        let offset = match (desired_center, handle.current_center()) {
+            (Some(desired), Some(raw)) => (desired.0 - raw.0, desired.1 - raw.1),
+            _ => (0.0, 0.0),
+        };
+        Self {
+            inner: handle,
+            center_basis: CenterBasis::StaticOffset(offset),
+        }
+    }
+}
 
 impl ElementHandle for MacElementHandle {
+    fn prepare_for_action(&self, deadline: std::time::Instant) -> Result<(), String> {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| "AX action deadline elapsed".to_string())?;
+        let timeout = remaining.as_secs_f32().clamp(0.05, 0.5);
+        if let Some(pid) = attrs::ax_pid(self.inner.element()) {
+            accessibility::AXUIElement::application(pid)
+                .set_messaging_timeout(timeout)
+                .map_err(|error| format!("failed to configure AX action timeout: {error:?}"))?;
+        }
+        if let CenterBasis::WindowAnchor(anchor) = &self.center_basis {
+            let _ = anchor.window.element().set_messaging_timeout(timeout);
+        }
+        Ok(())
+    }
+
     fn click(&self) -> Result<&'static str, String> {
-        self.0.click()
+        self.inner.click()
     }
 
     fn is_alive(&self) -> bool {
-        self.0.is_alive()
+        self.inner.is_alive()
     }
 
     fn current_center(&self) -> Option<(f64, f64)> {
-        self.0.current_center()
+        match &self.center_basis {
+            CenterBasis::StaticOffset(offset) => self
+                .inner
+                .current_center()
+                .map(|center| (center.0 + offset.0, center.1 + offset.1)),
+            CenterBasis::WindowAnchor(anchor) => {
+                let global = target::global_window_bounds(anchor.window_id)?;
+                let lift = walk::CoordLift::derive(
+                    anchor.window.element(),
+                    global.as_tuple(),
+                    Some(anchor.window_id),
+                )?;
+                let rect = attrs::element_rect(self.inner.element())?;
+                let rect = walk::CoordLift::lift(Some(lift), rect);
+                Some((rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0))
+            }
+            CenterBasis::Unavailable => None,
+        }
     }
 
     /// Relocated from `server.rs::click_cached_mark`'s inline web-click branch
@@ -145,13 +260,18 @@ impl ElementHandle for MacElementHandle {
     /// `AXWebArea` (`model::web_click_point` returns `None` otherwise) AND the
     /// owning app being a scriptable browser (`webclick::browser_for_pid`), so
     /// native chrome and non-browser apps keep the reliable AX/coordinate path.
-    fn try_web_click(&self, pid: i32, label: &str) -> Option<Result<String, String>> {
+    fn try_web_click(
+        &self,
+        pid: i32,
+        label: &str,
+        deadline: std::time::Instant,
+    ) -> Option<Result<String, String>> {
         // `px,py` is the element's center RELATIVE to its web area, read in raw
         // AX coords — not derived from a cached (possibly view-local-lifted)
         // mark center, which would aim the click off-page on WKWebView windows.
-        let (px, py) = model::web_click_point(self.0.element())?;
+        let (px, py) = model::web_click_point(self.inner.element())?;
         let browser = webclick::browser_for_pid(pid)?;
-        match webclick::js_click_at(&browser, px, py, label) {
+        match webclick::js_click_at(&browser, px, py, label, deadline) {
             Ok(desc) => Some(Ok(format!("{} in-page JS [{desc}]", browser.name()))),
             // JS unavailable (Automation / "allow JS from Apple Events" off) or
             // the point was empty — the caller falls through to AX, then the

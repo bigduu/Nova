@@ -5,10 +5,12 @@
 //! the role `AXPress` plays there.
 
 use super::automation::{
-    build_actionable_condition, ensure_com_mta, invoke_pattern, pattern_for, with_automation,
+    build_actionable_condition, configure_deadline, ensure_com_mta, invoke_pattern, pattern_for,
 };
 use crate::platform::ElementHandle;
-use windows::Win32::UI::Accessibility::{IUIAutomationElement, TreeScope_Descendants};
+use windows::Win32::UI::Accessibility::{
+    IUIAutomation, IUIAutomationElement, TreeScope_Descendants, UIA_CONTROLTYPE_ID,
+};
 
 /// How far up to look for a click-ish ancestor when the element itself AND
 /// its descendants (see [`find_actionable_descendant`]) expose no pattern —
@@ -20,6 +22,7 @@ const ANCESTOR_CLICK_DEPTH: usize = 4;
 /// used ONLY for a cheap, infallible [`Debug`] impl — every real trait method
 /// below re-reads the LIVE element, never these cached strings.
 pub struct WinElementHandle {
+    automation: IUIAutomation,
     element: IUIAutomationElement,
     role: String,
     label: String,
@@ -42,6 +45,7 @@ unsafe impl Send for WinElementHandle {}
 impl Clone for WinElementHandle {
     fn clone(&self) -> Self {
         WinElementHandle {
+            automation: self.automation.clone(),
             // Cloning a windows-rs interface wrapper is an `AddRef`, not a
             // raw-pointer copy — always sound, any thread. Its mirror, the
             // implicit `Drop` (a COM `Release`), is likewise apartment-
@@ -67,8 +71,14 @@ impl std::fmt::Debug for WinElementHandle {
 }
 
 impl WinElementHandle {
-    pub(super) fn new(element: IUIAutomationElement, role: String, label: String) -> Self {
+    pub(super) fn new(
+        automation: IUIAutomation,
+        element: IUIAutomationElement,
+        role: String,
+        label: String,
+    ) -> Self {
         WinElementHandle {
+            automation,
             element,
             role,
             label,
@@ -82,14 +92,14 @@ impl WinElementHandle {
 /// UI Automation's own tree walk is what evaluates the condition, so there's
 /// no equivalent "how deep do I recurse myself" knob to set here — see the
 /// module/PR doc for why this is simpler on Windows than on macOS's AX API.
-fn find_actionable_descendant(el: &IUIAutomationElement) -> Option<IUIAutomationElement> {
-    with_automation(|automation| {
-        let condition = build_actionable_condition(automation).map_err(|e| e.to_string())?;
-        // SAFETY: one bounded, documented COM call; `condition` is valid for
-        // its duration.
-        unsafe { el.FindFirst(TreeScope_Descendants, &condition) }.map_err(|e| e.to_string())
-    })
-    .ok()
+fn find_actionable_descendant(
+    automation: &IUIAutomation,
+    el: &IUIAutomationElement,
+) -> Option<IUIAutomationElement> {
+    let condition = build_actionable_condition(automation).ok()?;
+    // SAFETY: one bounded, documented COM call; `condition` is valid for its
+    // duration and the automation client has an action deadline configured.
+    unsafe { el.FindFirst(TreeScope_Descendants, &condition) }.ok()
 }
 
 /// First ancestor (within [`ANCESTOR_CLICK_DEPTH`] levels) exposing a
@@ -97,29 +107,36 @@ fn find_actionable_descendant(el: &IUIAutomationElement) -> Option<IUIAutomation
 /// via `IUIAutomationTreeWalker::GetParentElement` since `FindFirst`/`FindAll`
 /// don't support an ancestor `TreeScope`.
 fn find_actionable_ancestor(
+    automation: &IUIAutomation,
     el: &IUIAutomationElement,
     depth: usize,
 ) -> Option<IUIAutomationElement> {
-    with_automation(|automation| {
-        // SAFETY: `ControlViewWalker`/`GetParentElement` are standard,
-        // bounded per-call COM operations; `depth` bounds the climb.
-        unsafe {
-            let walker = automation.ControlViewWalker().map_err(|e| e.to_string())?;
-            let mut cur = el.clone();
-            for _ in 0..depth {
-                cur = walker.GetParentElement(&cur).map_err(|e| e.to_string())?;
-                if pattern_for(&cur).is_some() {
-                    return Ok(Some(cur));
-                }
+    // SAFETY: `ControlViewWalker`/`GetParentElement` are standard, bounded
+    // per-call COM operations; `depth` bounds the climb and the client timeout
+    // bounds each provider transaction.
+    unsafe {
+        let walker = automation.ControlViewWalker().ok()?;
+        let mut cur = el.clone();
+        for _ in 0..depth {
+            cur = walker.GetParentElement(&cur).ok()?;
+            if pattern_for(&cur).is_some() {
+                return Some(cur);
             }
-            Ok(None)
         }
-    })
-    .ok()
-    .flatten()
+        None
+    }
 }
 
 impl ElementHandle for WinElementHandle {
+    fn prepare_for_action(&self, deadline: std::time::Instant) -> Result<(), String> {
+        ensure_com_mta();
+        if std::time::Instant::now() >= deadline {
+            return Err("UI Automation action deadline elapsed".to_string());
+        }
+        configure_deadline(&self.automation, deadline);
+        Ok(())
+    }
+
     /// Drive the control through UI Automation's pattern ladder (see
     /// `automation::pattern_for`/`invoke_pattern`): try the element's own
     /// pattern first, then a descendant's, then an ancestor's — a list row or
@@ -131,13 +148,15 @@ impl ElementHandle for WinElementHandle {
             invoke_pattern(&self.element, action)?;
             return Ok(action);
         }
-        if let Some(descendant) = find_actionable_descendant(&self.element) {
+        if let Some(descendant) = find_actionable_descendant(&self.automation, &self.element) {
             if let Some(action) = pattern_for(&descendant) {
                 invoke_pattern(&descendant, action)?;
                 return Ok(action);
             }
         }
-        if let Some(ancestor) = find_actionable_ancestor(&self.element, ANCESTOR_CLICK_DEPTH) {
+        if let Some(ancestor) =
+            find_actionable_ancestor(&self.automation, &self.element, ANCESTOR_CLICK_DEPTH)
+        {
             if let Some(action) = pattern_for(&ancestor) {
                 invoke_pattern(&ancestor, action)?;
                 return Ok(action);
@@ -150,17 +169,18 @@ impl ElementHandle for WinElementHandle {
         ))
     }
 
-    /// Whether this handle still points at a live, laid-out element. A
+    /// Whether this handle still points at a live element. A
     /// destroyed/disconnected element (e.g. after a page navigation rebuilds
     /// the tree) errors on this live read (`UIA_E_ELEMENTNOTAVAILABLE`/
     /// `RPC_E_DISCONNECTED`) rather than panicking; treated as not alive.
     fn is_alive(&self) -> bool {
         ensure_com_mta();
-        // SAFETY: reading a live property never mutates the element.
-        match unsafe { self.element.CurrentBoundingRectangle() } {
-            Ok(r) => (r.right - r.left) >= 1 && (r.bottom - r.top) >= 1,
-            Err(_) => false,
-        }
+        // SAFETY: reading a live property never mutates the element. Geometry
+        // is optional for semantic activation; current_center separately
+        // requires a real rectangle for coordinate fallback.
+        unsafe { self.element.CurrentControlType() }
+            .map(|control_type| control_type != UIA_CONTROLTYPE_ID(0))
+            .unwrap_or(false)
     }
 
     fn current_center(&self) -> Option<(f64, f64)> {
@@ -182,7 +202,12 @@ impl ElementHandle for WinElementHandle {
     /// to actually fire a click. There is no Windows analog of that detour —
     /// see the crate/PR doc for the full rationale; this is a deliberate
     /// permanent `None`, not a placeholder.
-    fn try_web_click(&self, _pid: i32, _label: &str) -> Option<Result<String, String>> {
+    fn try_web_click(
+        &self,
+        _pid: i32,
+        _label: &str,
+        _deadline: std::time::Instant,
+    ) -> Option<Result<String, String>> {
         None
     }
 

@@ -2,8 +2,20 @@
 
 This is the [bamboo](https://github.com/bigduu/bamboo) plugin bundle for
 [Nova](https://github.com/bigduu/Nova) — a Computer Use MCP server that gives
-an agent control of the macOS (and, headless-only for now, Windows) desktop:
-screenshots, mouse/keyboard, Set-of-Mark UI grounding, and on-device OCR.
+an agent AX-first control of macOS and Windows: semantic Accessibility/UIA
+reads and actions, mouse/keyboard, focused screenshots, and OCR fallback.
+
+The required priority is:
+
+1. `ax_read` for semantic labels, content, controls, values, and state;
+2. fresh, single-use `ax_activate(snapshot_id,node_id)` for exact semantic
+   activation (every attempt consumes its generation before provider dispatch);
+3. focused OCR for rendered text missing from the semantic tree;
+4. focused screenshot/zoom and raw coordinates only for visual-only state.
+
+`read_ui` and `click_mark` remain compatibility aliases. A
+`permission_denied` result must be fixed by granting Accessibility, not hidden
+with a screenshot fallback.
 
 ## What's in this bundle
 
@@ -11,9 +23,8 @@ screenshots, mouse/keyboard, Set-of-Mark UI grounding, and on-device OCR.
   `nova` MCP server (stdio, launching the per-platform binary bamboo places
   under `bin/<platform>/nova[.exe]`), the `nova-grounding` skill, and a
   `nova_desktop` prompt preset.
-- `skills/nova-grounding/SKILL.md` — the coordinate/marks/click_mark
-  targeting workflow: how to reliably click the right pixel or UI element
-  instead of guessing.
+- `skills/nova-grounding/SKILL.md` — the AX-first read/action and ordered
+  OCR/screenshot fallback workflow.
 
 The `nova` binary itself is **not** in this bundle. `plugin.json`'s
 `artifacts` point at the platform archives published alongside Nova's
@@ -82,7 +93,10 @@ the exact command.
 Nova needs two TCC-gated macOS permissions:
 
 - **Screen Recording** — for `screenshot`, `ocr`, `list_windows`.
-- **Accessibility** — for posting mouse/keyboard input and Set-of-Mark.
+- **Accessibility** — for `ax_read`, semantic activation, and input.
+
+`ax_read` does not require Screen Recording. Grant Screen Recording only when
+the workflow reaches capture/OCR.
 
 Nova runs as an unbundled subprocess of bamboo (stdio MCP transport), so the
 permission prompt and grant attach to the **launching process — Bamboo**,
