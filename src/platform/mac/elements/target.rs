@@ -67,6 +67,37 @@ fn workspace_apps() -> (Option<RunningApp>, Vec<RunningApp>) {
     (frontmost, out)
 }
 
+/// Stable-rank explicit queries so an exact application name wins over a
+/// background helper whose longer name merely contains the same text.
+///
+/// Focus/frontmost order is preserved within each rank. Applications with no
+/// name match remain candidates because the query may instead name a window.
+fn rank_explicit_query_candidates(
+    candidate_pids: &mut [i32],
+    names: &HashMap<i32, String>,
+    query: Option<&str>,
+) {
+    let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
+        return;
+    };
+    let query = query.to_lowercase();
+    let ranks: HashMap<i32, u8> = names
+        .iter()
+        .map(|(&pid, name)| {
+            let name = name.to_lowercase();
+            let rank = if name == query {
+                0
+            } else if name.contains(&query) {
+                1
+            } else {
+                2
+            };
+            (pid, rank)
+        })
+        .collect();
+    candidate_pids.sort_by_key(|pid| ranks.get(pid).copied().unwrap_or(2));
+}
+
 fn deadline_error() -> UiReadError {
     UiReadError::new(
         UiReadErrorKind::TimedOut,
@@ -316,6 +347,7 @@ pub(super) fn resolve_target(
         candidate_pids.push(app.pid);
     }
     candidate_pids.extend(applications.iter().map(|app| app.pid));
+    rank_explicit_query_candidates(&mut candidate_pids, &names, query);
 
     let mut seen = HashSet::new();
     for pid in candidate_pids {
@@ -342,4 +374,49 @@ pub(super) fn resolve_target(
             None => "no focused or preferred AX application is available".to_string(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rank_explicit_query_candidates;
+    use std::collections::HashMap;
+
+    #[test]
+    fn exact_app_name_beats_earlier_background_helper_substring() {
+        let names = HashMap::from([
+            (10, "Setapp Finder Integration".to_string()),
+            (20, "Terminal".to_string()),
+            (30, "Finder".to_string()),
+        ]);
+        let mut candidates = vec![10, 20, 30];
+
+        rank_explicit_query_candidates(&mut candidates, &names, Some("finder"));
+
+        assert_eq!(candidates, vec![30, 10, 20]);
+    }
+
+    #[test]
+    fn partial_app_matches_keep_their_existing_focus_order() {
+        let names = HashMap::from([
+            (10, "Setapp Finder Integration".to_string()),
+            (20, "Terminal".to_string()),
+            (30, "iBoysoft Finder Integration".to_string()),
+        ]);
+        let mut candidates = vec![30, 20, 10];
+
+        rank_explicit_query_candidates(&mut candidates, &names, Some("Finder"));
+
+        assert_eq!(candidates, vec![30, 10, 20]);
+    }
+
+    #[test]
+    fn absent_or_blank_query_preserves_focus_order() {
+        let names = HashMap::from([(10, "Finder".to_string()), (20, "Terminal".to_string())]);
+
+        for query in [None, Some("  ")] {
+            let mut candidates = vec![20, 10];
+            rank_explicit_query_candidates(&mut candidates, &names, query);
+            assert_eq!(candidates, vec![20, 10]);
+        }
+    }
 }

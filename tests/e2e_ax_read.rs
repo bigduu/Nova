@@ -37,10 +37,18 @@ fn semantic_snapshot_reads_a_live_app_without_pixel_capture() {
         .expect("read semantic snapshot");
 
     assert_eq!(snapshot.target.pid, target.pid);
-    assert!(matches!(
-        snapshot.coverage,
-        UiReadCoverage::Complete | UiReadCoverage::Partial | UiReadCoverage::Empty
-    ));
+    assert!(
+        matches!(
+            snapshot.coverage,
+            UiReadCoverage::Complete | UiReadCoverage::Partial
+        ),
+        "a live smoke target must expose non-empty semantic coverage, got {}",
+        snapshot.coverage.as_str()
+    );
+    assert!(
+        !snapshot.nodes.is_empty(),
+        "a live smoke target must expose at least one semantic node"
+    );
     for collected in &snapshot.nodes {
         if collected.node.role.to_lowercase().contains("password")
             || collected.node.role.to_lowercase().contains("secure")
