@@ -28,6 +28,7 @@ use std::time::Instant;
 struct RunningApp {
     pid: i32,
     name: String,
+    bundle_id: String,
 }
 
 struct WindowCandidate {
@@ -48,6 +49,10 @@ fn workspace_apps() -> (Option<RunningApp>, Vec<RunningApp>) {
                 .localizedName()
                 .map(|name| name.to_string())
                 .unwrap_or_default(),
+            bundle_id: app
+                .bundleIdentifier()
+                .map(|identifier| identifier.to_string())
+                .unwrap_or_default(),
         })
     });
     let applications = workspace.runningApplications();
@@ -61,20 +66,41 @@ fn workspace_apps() -> (Option<RunningApp>, Vec<RunningApp>) {
                     .localizedName()
                     .map(|name| name.to_string())
                     .unwrap_or_default(),
+                bundle_id: app
+                    .bundleIdentifier()
+                    .map(|identifier| identifier.to_string())
+                    .unwrap_or_default(),
             })
         })
         .collect();
     (frontmost, out)
 }
 
+fn app_query_rank(app_name: &str, bundle_id: &str, query: &str) -> u8 {
+    let app_name = app_name.to_lowercase();
+    let bundle_id = bundle_id.to_lowercase();
+    let bundle_leaf = bundle_id.rsplit('.').next().unwrap_or_default();
+    if app_name == query || bundle_id == query || bundle_leaf == query {
+        0
+    } else if app_name.contains(query) || bundle_id.contains(query) {
+        1
+    } else {
+        2
+    }
+}
+
 /// Stable-rank explicit queries so an exact application name wins over a
-/// background helper whose longer name merely contains the same text.
+/// background helper whose longer name merely contains the same text. The
+/// bundle identifier's final component is also an exact alias, so a
+/// locale-independent query such as "Finder" resolves localized "访达"
+/// (`com.apple.finder`) before Finder Sync extensions.
 ///
 /// Focus/frontmost order is preserved within each rank. Applications with no
 /// name match remain candidates because the query may instead name a window.
 fn rank_explicit_query_candidates(
     candidate_pids: &mut [i32],
     names: &HashMap<i32, String>,
+    bundle_ids: &HashMap<i32, String>,
     query: Option<&str>,
 ) {
     let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
@@ -84,15 +110,8 @@ fn rank_explicit_query_candidates(
     let ranks: HashMap<i32, u8> = names
         .iter()
         .map(|(&pid, name)| {
-            let name = name.to_lowercase();
-            let rank = if name == query {
-                0
-            } else if name.contains(&query) {
-                1
-            } else {
-                2
-            };
-            (pid, rank)
+            let bundle_id = bundle_ids.get(&pid).map_or("", String::as_str);
+            (pid, app_query_rank(name, bundle_id, &query))
         })
         .collect();
     candidate_pids.sort_by_key(|pid| ranks.get(pid).copied().unwrap_or(2));
@@ -210,6 +229,7 @@ fn app_windows(app: &AXUIElement, deadline: Instant) -> Result<Vec<AXUIElement>,
 fn target_from_app(
     pid: i32,
     app_name: &str,
+    bundle_id: &str,
     query: Option<&str>,
     deadline: Instant,
 ) -> Result<Option<UiTarget>, UiReadError> {
@@ -224,7 +244,7 @@ fn target_from_app(
     let query_lower = query.map(str::to_lowercase);
     let app_matches = query_lower
         .as_ref()
-        .is_some_and(|query| app_name.to_lowercase().contains(query));
+        .is_some_and(|query| app_query_rank(app_name, bundle_id, query) < 2);
 
     let mut candidates: Vec<WindowCandidate> = windows
         .into_iter()
@@ -336,6 +356,10 @@ pub(super) fn resolve_target(
         .iter()
         .map(|app| (app.pid, app.name.clone()))
         .collect();
+    let bundle_ids: HashMap<i32, String> = applications
+        .iter()
+        .map(|app| (app.pid, app.bundle_id.clone()))
+        .collect();
     let mut candidate_pids = Vec::new();
     if let Some(pid) = preferred_pid.filter(|pid| names.contains_key(pid)) {
         candidate_pids.push(pid);
@@ -347,7 +371,7 @@ pub(super) fn resolve_target(
         candidate_pids.push(app.pid);
     }
     candidate_pids.extend(applications.iter().map(|app| app.pid));
-    rank_explicit_query_candidates(&mut candidate_pids, &names, query);
+    rank_explicit_query_candidates(&mut candidate_pids, &names, &bundle_ids, query);
 
     let mut seen = HashSet::new();
     for pid in candidate_pids {
@@ -362,7 +386,8 @@ pub(super) fn resolve_target(
             .cloned()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| app_name_fallback(pid));
-        if let Some(target) = target_from_app(pid, &app_name, query, deadline)? {
+        let bundle_id = bundle_ids.get(&pid).map_or("", String::as_str);
+        if let Some(target) = target_from_app(pid, &app_name, bundle_id, query, deadline)? {
             return Ok(target);
         }
     }
@@ -378,21 +403,30 @@ pub(super) fn resolve_target(
 
 #[cfg(test)]
 mod tests {
-    use super::rank_explicit_query_candidates;
+    use super::{app_query_rank, rank_explicit_query_candidates};
     use std::collections::HashMap;
 
     #[test]
-    fn exact_app_name_beats_earlier_background_helper_substring() {
+    fn locale_independent_bundle_alias_beats_background_helper_substring() {
         let names = HashMap::from([
             (10, "Setapp Finder Integration".to_string()),
             (20, "Terminal".to_string()),
-            (30, "Finder".to_string()),
+            (30, "访达".to_string()),
+        ]);
+        let bundle_ids = HashMap::from([
+            (
+                10,
+                "com.setapp.DesktopClient.SetappAgent.FinderSyncExt".to_string(),
+            ),
+            (20, "com.apple.Terminal".to_string()),
+            (30, "com.apple.finder".to_string()),
         ]);
         let mut candidates = vec![10, 20, 30];
 
-        rank_explicit_query_candidates(&mut candidates, &names, Some("finder"));
+        rank_explicit_query_candidates(&mut candidates, &names, &bundle_ids, Some("finder"));
 
         assert_eq!(candidates, vec![30, 10, 20]);
+        assert_eq!(app_query_rank("访达", "com.apple.finder", "finder"), 0);
     }
 
     #[test]
@@ -402,9 +436,10 @@ mod tests {
             (20, "Terminal".to_string()),
             (30, "iBoysoft Finder Integration".to_string()),
         ]);
+        let bundle_ids = HashMap::new();
         let mut candidates = vec![30, 20, 10];
 
-        rank_explicit_query_candidates(&mut candidates, &names, Some("Finder"));
+        rank_explicit_query_candidates(&mut candidates, &names, &bundle_ids, Some("Finder"));
 
         assert_eq!(candidates, vec![30, 10, 20]);
     }
@@ -412,10 +447,11 @@ mod tests {
     #[test]
     fn absent_or_blank_query_preserves_focus_order() {
         let names = HashMap::from([(10, "Finder".to_string()), (20, "Terminal".to_string())]);
+        let bundle_ids = HashMap::new();
 
         for query in [None, Some("  ")] {
             let mut candidates = vec![20, 10];
-            rank_explicit_query_candidates(&mut candidates, &names, query);
+            rank_explicit_query_candidates(&mut candidates, &names, &bundle_ids, query);
             assert_eq!(candidates, vec![20, 10]);
         }
     }
