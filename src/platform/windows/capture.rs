@@ -239,7 +239,7 @@ fn read_bitmap_rgb(dc: HDC, bmp: HBITMAP, w: i32, h: i32) -> Result<image::RgbIm
         return Err("GetDIBits copied 0 scanlines".to_string());
     }
     let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
-    for px in buf.chunks_exact(4) {
+    for px in buf.as_chunks::<4>().0 {
         rgb.push(px[2]); // R
         rgb.push(px[1]); // G
         rgb.push(px[0]); // B
@@ -923,7 +923,7 @@ mod wgc {
             for row in 0..h as usize {
                 let row_ptr = base.add(row * mapped.RowPitch as usize);
                 let row_slice = std::slice::from_raw_parts(row_ptr, w as usize * 4);
-                for px in row_slice.chunks_exact(4) {
+                for px in row_slice.as_chunks::<4>().0 {
                     // B8G8R8A8UIntNormalized -> RGB (same BGRA byte order as
                     // GDI's 32bpp DIB — see `read_bitmap_rgb` in this file).
                     rgb.push(px[2]);
