@@ -22,32 +22,45 @@ stdio or Streamable HTTP.
 | `ax_activate` | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
 | `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
-| `ocr` | Recognize on-screen text via Apple Vision (on-device, no model files). Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. CJK + Latin. |
+| `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. |
 | `click_mark` | Compatibility action for the latest numbered mark; prefer generation-safe `ax_activate`. |
-| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` / `cursor_position` | Pointer input and cursor query, in the pixel space of the last screenshot. |
+| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input in the pixel space of the last screenshot. |
+| `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
 | `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
 | `read_clipboard` / `write_clipboard` | Clipboard access. |
-| `ax_click` / `ax_set_value` / `ax_focus` / `dump_ax` | Drive controls by Accessibility role/label. |
+| `ax_click` / `ax_set_value` / `ax_focus` | Drive controls by Accessibility role/label. |
+| `dump_ax` | Read the raw AX/UIA tree for diagnostics and coverage debugging. |
 | `batch_actions` | Run a sequence of input actions in one call. |
 | `wait` | Pause for a specified number of seconds. |
 
 ## Requirements
 
-- **macOS 15+** (a transitive dependency, `apple-metal`, needs the macOS 15 SDK / Xcode 16+).
-- **Screen Recording** permission — for `screenshot` / `ocr` / `list_windows`.
-- **Accessibility** permission — for `ax_read`, semantic activation, and input.
+- **macOS 14+** for the macOS desktop backend. The release archive is universal
+  and runs on Apple Silicon and Intel Macs.
+- **Windows x86_64 or ARM64** for the Windows desktop backend. GitHub Releases
+  provide a native archive for each architecture.
+- On Windows, `ocr` uses installed Windows OCR language packs. Use
+  `nova --ocr-langs` to inspect available languages; install the needed pack if
+  recognition reports that it is unavailable.
+- Building on macOS requires the macOS 15 SDK / Xcode 16+ because of a
+  transitive `apple-metal` build dependency; that is a build-time requirement,
+  not Nova's minimum macOS runtime version.
+- On macOS, **Screen Recording** permission is required for `screenshot`, `ocr`,
+  and `list_windows`; **Accessibility** is required for `ax_read`, semantic
+  activation, and input.
 
-> Both are granted to the **nova binary itself**, not the app that launches it —
-> see [Permissions & code signing](#permissions--code-signing-macos). On a dev
-> build you must also sign nova, or the grant breaks on every rebuild.
+> macOS grants these permissions to the process it identifies as responsible
+> for Nova. For stdio/plugin use that is usually the host app or terminal; for a
+> directly launched Nova process it can be the binary itself. See
+> [Permissions & code signing](#permissions--code-signing-macos).
 
 ## Run
 
 ```sh
 cargo run                      # stdio transport (default)
 cargo run -- --http            # Streamable HTTP on 127.0.0.1:3100
-cargo run -- --http --addr 0.0.0.0:8080
+cargo run -- --http --addr 127.0.0.1:8080
 ```
 
 > The Swift runtime that ScreenCaptureKit links is located via an `LC_RPATH`
@@ -56,86 +69,114 @@ cargo run -- --http --addr 0.0.0.0:8080
 
 ## Install
 
-macOS 14+ (Apple Silicon or Intel — the release is a universal binary). Pick one:
+The supported public installation paths are a source build and the verified
+prebuilt archives on the [`v0.2.1` GitHub
+Release](https://github.com/bigduu/Nova/releases/tag/v0.2.1). That release
+provides:
+
+| Platform | Archive |
+| --- | --- |
+| macOS, Apple Silicon + Intel | `nova-v<version>-universal-apple-darwin.tar.gz` |
+| Windows x86_64 | `nova-v<version>-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `nova-v<version>-aarch64-pc-windows-msvc.zip` |
+
+Download the matching `.sha256` file from the same release and verify the
+archive before extracting it. On macOS:
 
 ```sh
-# Homebrew (recommended) — puts `nova` on your PATH
-brew install bigduu/tap/nova
-
-# npx — no install; great for MCP configs
-npx -y @bigduu/nova --version
-
-# Prebuilt tarball — download, unquarantine, drop on PATH
-curl -fsSLO https://github.com/bigduu/Nova/releases/latest/download/nova-vX.Y.Z-universal-apple-darwin.tar.gz
-tar xzf nova-*.tar.gz
-xattr -dr com.apple.quarantine ./nova   # only needed for the raw download
-sudo mv nova /usr/local/bin/
-
-# From source
-cargo build --release      # produces target/release/nova
+tar -xzf nova-v*-universal-apple-darwin.tar.gz
+xattr -dr com.apple.quarantine ./nova  # only if Gatekeeper blocks the download
+sudo install -m 0755 nova /usr/local/bin/nova
 ```
 
-> The release binary is **ad-hoc signed**, not notarized. Homebrew and npm
-> install it without a Gatekeeper prompt; only the raw tarball download needs
-> the one-time `xattr -dr com.apple.quarantine` above.
+On Windows, extract the archive for the machine's architecture and invoke
+`nova.exe` directly or place its directory on `PATH`. The Windows binaries are
+not Authenticode-signed, so SmartScreen may warn on first run.
+
+> `v0.2.1` predates the current AX-first tools (`ax_read`, `read_ui`, and
+> `ax_activate`). Its archives provide the earlier screenshot/mark/input tool
+> set. Build the current source below when using the AX-first workflow in this
+> README; do not expect those tool names from the `v0.2.1` binaries.
+
+To build from source:
+
+```sh
+git clone https://github.com/bigduu/Nova.git
+cd Nova
+cargo build --release --locked
+```
+
+The result is `target/release/nova` on macOS or
+`target/release/nova.exe` on Windows. The macOS release binary is ad-hoc signed,
+not notarized.
 
 ## Use it from an MCP client
 
 **Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
-config. For Claude Desktop that's
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+config. Claude Desktop uses
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS and
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows:
 
 ```json
 {
   "mcpServers": {
-    "nova": { "command": "npx", "args": ["-y", "@bigduu/nova"] }
+    "nova": { "command": "/absolute/path/to/nova" }
   }
 }
 ```
 
-With `brew install` (or a binary on PATH) the command is simply `"nova"`; from
-source, use the absolute path to `target/release/nova`.
+Use the absolute path to the extracted release binary or the source-build
+output. On Windows, use an escaped executable path such as
+`"C:\\absolute\\path\\nova.exe"`. Use the source-build output for the
+AX-first workflow below. If its directory is already on `PATH`, the command can
+be `"nova"`.
 
-Restart the client; the Nova tools then appear to the agent. Grant **Screen
-Recording** and **Accessibility** — see
-[Permissions & code signing](#permissions--code-signing-macos) (as a subprocess,
-the responsible process is usually the **host app or your terminal**, so grant
-that, not only the binary).
+Restart the client; the Nova tools then appear to the agent. On macOS, grant
+**Screen Recording** and **Accessibility** — see
+[Permissions & code signing](#permissions--code-signing-macos). For stdio MCP,
+grant the responsible host (Claude Desktop, Bamboo, or the terminal) first; add
+the Nova binary only if macOS treats it as the permission subject or the host
+grant does not take effect.
 
 **HTTP clients** — run Nova as a server and connect over Streamable HTTP:
 
 ```sh
 nova --http                       # 127.0.0.1:3100/mcp
-nova --http --addr 0.0.0.0:8080   # reachable on the LAN
+nova --http --addr 127.0.0.1:8080 # custom loopback port
 ```
 
-**First calls.** Call `ax_read` (optionally
+HTTP mode is currently a local transport: it keeps rmcp's default loopback
+Host allowlist and does not configure remote-access authentication. Binding all
+interfaces is not a supported LAN setup.
+
+**First calls (current source build).** Call `ax_read` (optionally
 `ax_read(window="<name>", mode="all")`) for semantic content and controls, then
 `ax_activate(snapshot_id, node_id)` on an exact actionable node. Re-run
 `ax_read` after the action to verify semantic state. If AX/UIA coverage is
 absent or partial, use focused-window `ocr` for rendered text; use
 `screenshot(window=...)` / `zoom_region` only when pixels are necessary
 (layout, icon, color, image, canvas, or visual verification). All pointer tools
-use the pixel space of the most recent screenshot.
+use the pixel space of the most recent screenshot; `cursor_position` instead
+reports OS-global logical coordinates.
 
 ## Permissions & code signing (macOS)
 
 Two non-obvious things about how macOS grants Nova its **Screen Recording** and
 **Accessibility** permissions:
 
-**Nova is its own permission subject — grant the *nova binary*, not the launcher.**
-As a standalone CLI (not inside an `.app` bundle), Nova does **not** inherit the
-Screen Recording grant of its parent process (your terminal, Claude Desktop, or a
-host app). Add the binary itself: *System Settings → Privacy & Security → Screen
-Recording* (and *Accessibility*) → `+` → ⌘⇧G → enter the path to
-`target/release/nova`, then enable it. A headless subprocess can't trigger the
-permission prompt, so adding it by path is the reliable way.
+**Grant the responsible process for the way Nova is launched.** macOS TCC may
+attribute a child process to its responsible parent app. For stdio MCP or the
+Bamboo plugin, grant Claude Desktop, Bamboo, or the terminal/IDE that launches
+Nova. For a directly launched CLI/HTTP process, macOS may instead use the Nova
+binary. If granting the expected host does not work, add the installed `nova`
+binary (or `target/release/nova`) as a fallback under *System Settings → Privacy
+& Security → Screen Recording* and *Accessibility*.
 
-**Sign it, or the grant breaks on every rebuild.** `cargo build` produces an
-ad-hoc, *linker-signed* binary whose code-signing identity is a content hash
-(`nova-<hash>`) — it changes every build, so macOS treats each rebuild as a brand-
-new app and the grant stops applying. Sign with a stable self-signed identity so
-the grant persists:
+**Keep the identity of whichever process receives the grant stable.** If Nova
+itself is the permission subject, `cargo build` produces an ad-hoc,
+*linker-signed* binary whose code-signing identity is a content hash
+(`nova-<hash>`). It changes every build, so a direct binary grant stops applying.
+Sign Nova with a stable self-signed identity when developing in that mode:
 
 ```sh
 cargo build --release
@@ -144,8 +185,9 @@ cargo build --release
 
 The first run creates a `Zenith Nova Code Signing` identity in your login keychain
 (click **Always Allow** once if codesign prompts) and signs the binary with a
-fixed identifier (`com.zenith.nova`). Grant the two permissions once (above);
-later rebuilds, re-signed with the same cert, keep the grant.
+fixed identifier (`com.zenith.nova`). A direct Nova grant then survives rebuilds
+that are re-signed with the same certificate. Host-app grants likewise depend on
+the host keeping a stable signing identity.
 
 > **Troubleshooting — `screenshot` fails with a "wedged" / "busy" capture error.**
 > All captures (and window enumeration) run in ONE shared per-user daemon
@@ -219,7 +261,8 @@ Runs everything that has no side effects and needs no special permission:
   `CGDisplay`, no permission needed) and a **non-destructive** clipboard
   round-trip (snapshots and restores the clipboard).
 
-This is what CI runs (see `.github/workflows/ci.yml`, macOS runner).
+This is what the macOS `test` job runs in CI (see `.github/workflows/ci.yml`;
+the workflow also has Windows cross-check and Linux headless jobs).
 
 ### End-to-end tests (`#[ignore]`d)
 
@@ -247,15 +290,17 @@ cargo test --test e2e_input mouse_move_roundtrips_through_cursor_position -- --i
 | `list_windows_returns…` (`e2e_input`) | Enumerates on-screen windows | Screen Recording |
 | `e2e_capture_display_returns_valid_jpeg` (`e2e_screenshot`) | Captures the display, checks the JPEG | Screen Recording |
 | `e2e_capture_dims_match_target_dims_contract` (`e2e_screenshot`) | Asserts capture dims match the click-coordinate mapping | Screen Recording |
+| `e2e_window_screenshot_produces_view_frame` (`e2e_screenshot`) | Captures a window and validates its view-frame metadata | Screen Recording |
 | `ocr_recognizes_text_on_the_display` (`e2e_ocr`) | Runs Apple Vision OCR on a live capture; asserts text + in-bounds line centers | Screen Recording |
 | `daemon_*` / `client_*` / `concurrent_*` (`e2e_capture_worker`) | Shared capture daemon: capture, kill→respawn recovery, concurrent clients, clean-error survival | Screen Recording |
 | `legacy_pipe_protocol_still_served` (`e2e_worker`) | Old `--capture-worker` pipe protocol, proxied into the daemon | Screen Recording |
-| `stdio_protocol` (`e2e_stdio`) | Exercises the stdio (JSON-RPC) transport end-to-end | — |
-| `safari_google_search` (`e2e_safari_google`) | Launches Safari, searches Google, asserts results — full browser automation flow | Accessibility |
+| `stdio_server_completes_handshake_and_lists_tools` (`e2e_stdio`) | Exercises the stdio (JSON-RPC) transport end-to-end | — |
+| `safari_opens_google_and_nova_reads_the_homepage` (`e2e_safari_google`) | Launches Safari, opens Google, and reads the page through Nova | Network + Screen Recording + Accessibility |
 
-> `mouse_move_roundtrips…` is the strongest input check: it proves events
-> actually reach the window server *and* that the screenshot→logical coordinate
-> conversion is correct, all click paths share the same posting mechanism.
+> `mouse_move_roundtrips…` proves the macOS pointer post and cursor read-back
+> round-trip using logical coordinates. The non-ignored interaction test covers
+> screenshot→logical coordinate arithmetic, while the live screenshot tests
+> cover captured-dimension contracts.
 >
 > Run `e2e_capture_worker` **single-threaded** (`-- --ignored --test-threads=1`):
 > the tests share one daemon/socket.
@@ -273,25 +318,11 @@ cargo clippy --all-targets
 ## Releasing (maintainers)
 
 A version tag drives everything via `.github/workflows/release.yml`: it builds
-the universal binary (arm64 + x86_64, ad-hoc signed), smoke-tests it, and
-attaches it to a GitHub Release. When their secrets are present it also updates
-the Homebrew tap and publishes the npm wrapper; without them those steps skip,
-so the GitHub Release still ships.
-
-```sh
-# bump the version, then tag it (the tag must match Cargo.toml)
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-One-time setup for the optional channels:
-
-- **Homebrew** — `gh repo create bigduu/homebrew-tap --public`, then add a
-  fine-grained PAT with **Contents: write** on that repo as the nova-repo secret
-  `HOMEBREW_TAP_TOKEN`. (`packaging/homebrew/nova.rb` is the formula template.)
-- **npm** — publish under the `@bigduu` scope; add an npm automation token as the
-  secret `NPM_TOKEN`. The package (`npm/`) downloads the matching release binary
-  on install.
+and smoke-tests the universal macOS binary plus native Windows x86_64 and ARM64
+binaries, then attaches the archives and checksums to a GitHub Release. It also
+publishes the Bamboo plugin manifest and bundle. The tag version must match
+`Cargo.toml`; verify the resulting Release assets before treating the release as
+available.
 
 ## License
 
