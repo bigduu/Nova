@@ -20,8 +20,9 @@ with a screenshot fallback.
 ## What's in this bundle
 
 - `plugin.json` — the manifest bamboo's plugin installer reads. Declares the
-  `nova` MCP server (stdio, launching the per-platform binary bamboo places
-  under `bin/<platform>/nova[.exe]`), the `nova-grounding` skill, and a
+  enabled `nova` desktop MCP server plus the disabled-by-default
+  `nova-chrome-devtools` sidecar (both launch the per-platform binary bamboo
+  places under `bin/<platform>/nova[.exe]`), the `nova-grounding` skill, and a
   `nova_desktop` prompt preset.
 - `skills/nova-grounding/SKILL.md` — the AX-first read/action and ordered
   OCR/screenshot fallback workflow.
@@ -30,6 +31,42 @@ The `nova` binary itself is **not** in this bundle. `plugin.json`'s
 `artifacts` point at the platform archives published alongside Nova's
 GitHub Releases (built by `.github/workflows/release.yml`); the installer
 downloads, sha256-verifies, and unpacks the one matching your OS.
+
+## Optional Chrome DevTools server
+
+`nova-chrome-devtools` runs `nova chrome-devtools`, which transparently
+launches the pinned official `chrome-devtools-mcp@1.8.0` package. It is disabled
+by default because it requires npm/`npx`, Node.js `^20.19.0`, `^22.12.0`, or
+`>=23`, and current stable Chrome (or newer) on the host, and grants a much
+broader Chrome debugging capability than Nova's desktop tools. Enable it only
+when browser automation or DevTools inspection is wanted. URL allow patterns
+require Chrome 149+; experimental WebMCP requires Chrome 150+. The URL patterns
+guard only attached DevTools targets, not the host's complete network; use an
+OS/VM sandbox for a true network boundary.
+
+If Bamboo's GUI process cannot resolve `npx`, override the optional server's
+transport arguments with the absolute path reported by `command -v npx`:
+
+```json
+"args": ["chrome-devtools", "--npx", "/absolute/path/to/npx"]
+```
+
+If the installed Bamboo version does not expose a server-argument override,
+launch Bamboo with the Node/npm bin directory on `PATH` instead.
+
+The default sidecar creates an isolated temporary Chrome profile and disables
+usage collection, update checks, CrUX URL lookups, and unredacted sensitive
+network headers. Attaching to the user's signed-in profile is an explicit
+`--profile existing` choice and requires remote debugging to be enabled at
+`chrome://inspect/#remote-debugging`; that mode can access all open windows in
+the selected profile. It requires Chrome 144+, and Chrome chooses its default
+profile when several are active. Nova's separately installed Secure Chrome
+Bridge remains the least-privilege choice for an explicitly paired page.
+
+The sidecar still runs as an `npx` process launched from Bamboo's process
+chain. Nova dispatches it before calling Nova's desktop APIs; this is not a
+promise about macOS responsible-process attribution for arbitrary child
+processes.
 
 This bundle is what a release actually publishes as
 `nova-plugin-v<version>.tar.gz` (see the `plugin-manifest` job in

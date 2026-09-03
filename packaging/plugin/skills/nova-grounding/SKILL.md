@@ -9,6 +9,16 @@ Nova controls macOS and Windows. Treat `ax_read` as the first-class
 `ax:read` capability. It reads Accessibility/UIA directly and does not take
 a screenshot. `read_ui` is a compatibility alias.
 
+## Chrome routing
+
+When the separately enabled `nova-chrome-devtools` server is available, use
+its official Chrome DevTools tools for routine web-page automation, DOM and
+network inspection, and performance debugging. Use Nova for browser chrome,
+permission dialogs, other desktop apps, and pixel fallback. If the user needs
+least-privilege access to one explicitly paired page, prefer Nova's separately
+installed Secure Chrome Bridge instead of broad existing-profile DevTools
+access.
+
 ## Read in this order
 
 1. Call `ax_read(window?, mode="all")` first for labels, controls, fields,

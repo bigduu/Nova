@@ -22,7 +22,7 @@ stdio or Streamable HTTP.
 | `ax_activate` | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
 | `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
-| `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. Returns each text line with a clickable center — read *and* click text on canvas/Electron/game surfaces where marks are empty. |
+| `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. `mode=auto` uses Fast first with confidence-based Accurate fallback; `mode=fast\|accurate` forces either policy. An optional strict `roi={x,y,width,height}` re-captures a rectangle from the current image through the native region path. Returns each line with a clickable center. |
 | `click_mark` | Compatibility action for the latest numbered mark; prefer generation-safe `ax_activate`. |
 | `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input in the pixel space of the last screenshot. |
 | `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
@@ -110,6 +110,34 @@ The result is `target/release/nova` on macOS or
 `target/release/nova.exe` on Windows. The macOS release binary is ad-hoc signed,
 not notarized.
 
+### Nova.app development preview
+
+Releases cut from a revision containing the app packaging workflow also attach:
+
+`nova-v<version>-universal-apple-darwin-development-app.zip`
+
+This archive contains a universal `Nova.app` that runs Nova's per-user app
+service without a Dock icon. It gives Screen Recording and Accessibility a Nova
+application identity instead of making the MCP host (for example, Bodhi) the
+permission subject. Install and start it with:
+
+```sh
+shasum -a 256 -c nova-v*-universal-apple-darwin-development-app.zip.sha256
+unzip nova-v*-universal-apple-darwin-development-app.zip
+ditto Nova.app /Applications/Nova.app
+open -gj -b com.zenith.nova
+```
+
+Configure a stdio MCP client with the bundled executable and `--connect`, as
+shown in [Use it from an MCP client](#use-it-from-an-mcp-client) below.
+
+> [!WARNING]
+> The app archive is **DEVELOPMENT ONLY**. It is ad-hoc signed, not Developer ID
+> signed, not notarized, and not stapled. Gatekeeper can block it, and replacing
+> it with a differently signed build can require granting TCC permissions again.
+> The existing universal CLI `.tar.gz` remains the supported artifact consumed
+> by Homebrew, npm, and Bamboo; the app `.zip` does not replace it.
+
 ## Use it from an MCP client
 
 **Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
@@ -125,18 +153,116 @@ config. Claude Desktop uses
 }
 ```
 
+On macOS, the recommended setup is the independent `Nova.app`. Put the app in
+`/Applications`, open it once, grant **Screen Recording** and **Accessibility**
+to Nova, and configure the bundled executable as a connector:
+
+```json
+{
+  "mcpServers": {
+    "nova": {
+      "command": "/Applications/Nova.app/Contents/MacOS/nova",
+      "args": ["--connect"]
+    }
+  }
+}
+```
+
+`--connect` carries MCP bytes over a private per-user Unix socket and starts the
+app through LaunchServices when necessary. It does not call desktop APIs itself;
+the app process owns the MCP handlers and TCC responsibility. The socket lives
+under `/tmp/nova-app-<uid>/` with a mode-0700 directory, mode-0600 socket, and a
+same-UID peer check.
+
+### Chrome DevTools MCP sidecar
+
+For routine Chrome page automation and debugging, Nova can launch the official
+[Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
+next to the desktop server. This is a transparent stdio sidecar, not a second
+browser implementation inside Nova. It requires npm/`npx`, Node.js
+`^20.19.0`, `^22.12.0`, or `>=23`, and current stable Chrome (or newer). Nova
+pins the reviewed upstream package to `chrome-devtools-mcp@1.8.0`.
+
+On macOS, a recommended two-server configuration is:
+
+```json
+{
+  "mcpServers": {
+    "nova": {
+      "command": "/Applications/Nova.app/Contents/MacOS/nova",
+      "args": ["--connect"]
+    },
+    "nova-chrome-devtools": {
+      "command": "/Applications/Nova.app/Contents/MacOS/nova",
+      "args": ["chrome-devtools"]
+    }
+  }
+}
+```
+
+For a standalone source/release binary, use the same binary path and
+`["chrome-devtools"]`. If a GUI client cannot find `npx`, add
+`"--npx", "/absolute/path/to/npx"` after the subcommand.
+
+The default launches a new temporary, isolated Chrome profile. Usage
+statistics, package update checks, CrUX URL lookups, and sensitive network
+headers are disabled/redacted by default. Requests made by attached DevTools
+targets can be guarded by repeating `--allowed-url-pattern`, for example:
+
+```json
+"args": [
+  "chrome-devtools",
+  "--allowed-url-pattern", "https://example.com/*",
+  "--allowed-url-pattern", "https://*.example.net/*"
+]
+```
+
+URL allow patterns require Chrome 149+. They apply only to DevTools targets
+while the MCP server is attached and are not a complete network sandbox; use
+an OS/VM sandbox when full network isolation is required, as described by the
+[upstream security policy](https://github.com/ChromeDevTools/chrome-devtools-mcp/security/policy).
+
+To work with an already running signed-in Chrome profile instead, first open
+`chrome://inspect/#remote-debugging` in Chrome and enable remote debugging,
+then configure:
+
+```json
+"args": ["chrome-devtools", "--profile", "existing"]
+```
+
+Automatic connection requires Chrome 144+. If several Chrome profiles are
+active, Chrome chooses the profile it considers the default; select and verify
+the connected pages before acting.
+
+> [!WARNING]
+> Existing-profile mode can inspect and control every open window in the
+> selected Chrome profile, including authenticated pages. Enable it only for a
+> trusted local MCP client, and disable remote debugging when finished.
+
+Use `--enable-webmcp` to expose upstream's experimental WebMCP tools. Nova adds
+Chrome's required `--enable-features=WebMCP` launch argument in isolated mode;
+for an existing profile, Chrome itself must already have been started with that
+feature enabled. WebMCP requires Chrome 150+. `--expose-network-headers` and
+`--enable-performance-crux` are explicit privacy opt-ins. The pinned 1.8.0
+package does not support a
+`--disable-javascript-evaluation` option, so Nova does not advertise or pass it.
+
+The sidecar and Nova's optional [Secure Chrome Bridge](chrome/README.md) serve
+different trust models: DevTools MCP is the broad, full-featured choice for
+normal browser automation, DOM/network inspection, and performance debugging;
+the Secure Chrome Bridge requires explicit per-page pairing and is preferable
+when least-privilege page scoping matters. Nova's desktop tools remain the path
+for browser chrome, native dialogs, and non-web UI.
+
 Use the absolute path to the extracted release binary or the source-build
 output. On Windows, use an escaped executable path such as
 `"C:\\absolute\\path\\nova.exe"`. Use the source-build output for the
 AX-first workflow below. If its directory is already on `PATH`, the command can
 be `"nova"`.
 
-Restart the client; the Nova tools then appear to the agent. On macOS, grant
-**Screen Recording** and **Accessibility** — see
-[Permissions & code signing](#permissions--code-signing-macos). For stdio MCP,
-grant the responsible host (Claude Desktop, Bamboo, or the terminal) first; add
-the Nova binary only if macOS treats it as the permission subject or the host
-grant does not take effect.
+Restart the client; the Nova tools then appear to the agent. See
+[Permissions & code signing](#permissions--code-signing-macos) for legacy
+direct-stdio and development-binary cases.
 
 **HTTP clients** — run Nova as a server and connect over Streamable HTTP:
 
@@ -161,8 +287,13 @@ reports OS-global logical coordinates.
 
 ## Permissions & code signing (macOS)
 
-Two non-obvious things about how macOS grants Nova its **Screen Recording** and
-**Accessibility** permissions:
+The independent app transport is the preferred permission model: grant
+**Screen Recording** and **Accessibility** to `Nova.app`, then use
+`nova --connect`. The connector never initializes CoreGraphics or
+Accessibility, so Bamboo, Claude Desktop, and terminals no longer need Nova's
+desktop permissions.
+
+Two details still matter for direct stdio/HTTP and source-development modes:
 
 **Grant the responsible process for the way Nova is launched.** macOS TCC may
 attribute a child process to its responsible parent app. For stdio MCP or the
@@ -317,12 +448,42 @@ cargo clippy --all-targets
 
 ## Releasing (maintainers)
 
-A version tag drives everything via `.github/workflows/release.yml`: it builds
-and smoke-tests the universal macOS binary plus native Windows x86_64 and ARM64
-binaries, then attaches the archives and checksums to a GitHub Release. It also
-publishes the Bamboo plugin manifest and bundle. The tag version must match
-`Cargo.toml`; verify the resulting Release assets before treating the release as
-available.
+A version tag drives everything via `.github/workflows/release.yml`. The
+workflow resolves the tag once, verifies it against `Cargo.toml` and the event
+commit, and makes every source-building job check out that immutable commit. It
+builds and smoke-tests the universal macOS CLI and development-only Nova.app,
+creates the Release with those assets, then sequenced jobs attach native Windows
+x86_64/ARM64 archives and the Bamboo plugin bundle. The CLI `.tar.gz` name and
+checksum outputs stay unchanged for Homebrew, npm, and the Bamboo plugin
+manifest.
+
+Run the hermetic release checks before tagging:
+
+```sh
+scripts/test-release-workflow.sh
+```
+
+The current crate version is already published as `v0.2.1`; bump it before
+creating the next release tag. Release tags must be protected from force updates;
+the workflow also serializes runs by tag and re-verifies the tag before its first
+upload. The Nova.app asset must remain labeled
+**DEVELOPMENT ONLY** until all production distribution gates are complete:
+
+- sign nested code and the outer app, in that order, with a Developer ID
+  Application identity and the hardened runtime;
+- submit the distribution artifact to Apple's notary service and verify the
+  accepted ticket;
+- staple the ticket to the app and validate it with `codesign` and `spctl`;
+- authenticate local MCP and Chrome bridge peers with macOS audit tokens and
+  designated code requirements, rather than relying on same-UID sockets alone;
+- run the packaged native host and extension against a real Chrome install,
+  including pairing, navigation revocation, stale snapshots, and disconnects;
+- pin third-party GitHub Actions by full commit SHA before treating the release
+  workflow as a production supply-chain boundary;
+- smoke-test launch, upgrade, `nova --connect`, Screen Recording, and
+  Accessibility grants on clean Apple Silicon and Intel macOS 14+ machines.
+
+Do not describe the ad-hoc-signed app preview as a production-ready macOS app.
 
 ## License
 

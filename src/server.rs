@@ -1,6 +1,5 @@
 /// MCP server lifecycle — tool registration, transport dispatch, and handler routing.
 use anyhow::{Context, Result};
-use base64::Engine;
 use rmcp::ServiceExt;
 
 // ── MCP tool result helpers ─────────────────────────────────────────
@@ -18,6 +17,26 @@ pub fn err_result(msg: &str) -> rmcp::model::CallToolResult {
 /// Create a successful image result with proper MCP ImageContent.
 pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::success(vec![rmcp::model::Content::image(base64_data, mime_type)])
+}
+
+const CHROME_APP_SERVICE_ONLY: &str = "Chrome semantic bridge is available only through the independent Nova.app service; configure the Nova.app connector and install the native host";
+
+fn chrome_call_result(result: Result<serde_json::Value>) -> rmcp::model::CallToolResult {
+    match result {
+        Ok(value) => match serde_json::to_string_pretty(&value) {
+            Ok(json) if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") => {
+                ok_text(json)
+            }
+            // Keep the complete terminal envelope available for diagnostics,
+            // but preserve MCP's failure bit so a client cannot mistake a
+            // denied, stale, or ambiguous Chrome operation for success.
+            Ok(json) => err_result(&json),
+            Err(error) => err_result(&format!(
+                "Chrome bridge result serialization failed: {error}"
+            )),
+        },
+        Err(error) => err_result(&error.to_string()),
+    }
 }
 
 // ── Server state ────────────────────────────────────────────────────
@@ -47,6 +66,10 @@ pub struct NovaServer {
     /// phase of an action attempt. Provider dispatch deliberately runs after
     /// releasing this gate so a wedged AX/UIA RPC cannot block future reads.
     interaction_action_gate: std::sync::Arc<std::sync::Mutex<()>>,
+    /// App-owned, least-privilege semantic channel to one explicitly paired
+    /// Chrome document. Ordinary stdio/HTTP sessions deliberately leave this
+    /// unset; only the independent Nova.app service injects it.
+    chrome_bridge: Option<nova_chrome_bridge::ChromeBridge>,
 }
 
 #[derive(Debug, Default)]
@@ -145,9 +168,56 @@ fn capture_permission_diag() -> String {
 /// lock, making the disconnect() below a guaranteed no-op).
 const CAPTURE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// Vision can consume substantial CPU/GPU and memory. Bound in-flight OCR so
+/// concurrent MCP sessions cannot create an unbounded `spawn_blocking` backlog.
+/// A timed-out task keeps its owned permit until the underlying synchronous
+/// recognizer actually returns.
+const OCR_MAX_CONCURRENT: usize = 2;
+const OCR_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OCR_ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn ocr_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(OCR_MAX_CONCURRENT)))
+        .clone()
+}
+
+fn ocr_run_timeout(mode: crate::platform::OcrMode) -> std::time::Duration {
+    match mode {
+        crate::platform::OcrMode::Fast => std::time::Duration::from_secs(10),
+        crate::platform::OcrMode::Accurate => std::time::Duration::from_secs(20),
+        // Auto may legitimately perform both passes.
+        crate::platform::OcrMode::Auto => std::time::Duration::from_secs(28),
+    }
+}
+
 impl NovaServer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the app-owned Secure Chrome Bridge to this MCP session.
+    pub fn with_chrome_bridge(mut self, chrome_bridge: nova_chrome_bridge::ChromeBridge) -> Self {
+        self.chrome_bridge = Some(chrome_bridge);
+        self
+    }
+
+    /// Run a synchronous Chrome bridge operation without blocking the async MCP
+    /// transport. Sessions not hosted by Nova.app fail with one stable message
+    /// rather than attempting to discover or open the privileged socket.
+    async fn run_chrome_action<F>(&self, action: F) -> rmcp::model::CallToolResult
+    where
+        F: FnOnce(&nova_chrome_bridge::ChromeBridge) -> Result<serde_json::Value> + Send + 'static,
+    {
+        let Some(chrome_bridge) = self.chrome_bridge.clone() else {
+            return err_result(CHROME_APP_SERVICE_ONLY);
+        };
+        let result = tokio::task::spawn_blocking(move || action(&chrome_bridge)).await;
+        match result {
+            Ok(result) => chrome_call_result(result),
+            Err(error) => err_result(&format!("Chrome bridge task failed: {error}")),
+        }
     }
 
     /// Record the coordinate frame of the screenshot just returned.
@@ -597,30 +667,22 @@ impl NovaServer {
         ))
     }
 
-    /// Run the requested capture, isolating the hang-prone ScreenCaptureKit call.
+    /// Acquire unannotated pixels, isolating the hang-prone platform capture.
     ///
-    /// Phase 1 — the raw pixel capture runs behind [`crate::platform::ScreenCapture`]
+    /// The raw pixel capture runs behind [`crate::platform::ScreenCapture`]
     /// (on macOS: the SHARED capture daemon, one per user, all nova processes;
     /// see [`crate::platform::mac::capture::broker`] for why two same-binary
     /// ScreenCaptureKit clients wedge each other). The client call below
     /// already contains the whole recovery ladder — daemon watchdog,
     /// kill+respawn, stray-process sweep, `killall -9 replayd` — so by the time
     /// it returns an error, recovery has genuinely been attempted; the outer
-    /// timeout here is only a backstop. Phase 2 — overlays + the Set-of-Mark
-    /// Accessibility walk run in THIS process (the cached AX handles can't
-    /// cross a process boundary), on a blocking thread with its own timeout.
-    async fn acquire_capture(
+    /// timeout here is only a backstop.
+    async fn acquire_raw_capture(
         &self,
-        plan: &CapturePlan,
-    ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
-        let region = plan.region;
-        let window = plan.window.clone();
-        let opts = crate::capture::screenshot::CaptureOptions {
-            grid: plan.grid,
-            marks: plan.marks,
-        };
-
-        // Phase 1: capture via `crate::platform::screen_capture()`. `preflight`
+        region: Option<(f64, f64, f64, f64)>,
+        window: Option<String>,
+    ) -> Result<crate::capture::screenshot::RawCapture, String> {
+        // Capture via `crate::platform::screen_capture()`. `preflight`
         // in the error distinguishes a real Screen-Recording denial (fix the
         // responsible `parent=` process) from a capture-stack failure.
         let diag = capture_permission_diag();
@@ -642,26 +704,38 @@ impl NovaServer {
                 (None, None) => sc.capture_display(),
             }
         });
-        let raw = match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
-            Ok(Ok(Ok(raw))) => raw,
-            Ok(Ok(Err(e))) => {
-                return Err(format!("screenshot capture failed: {e} [{diag}]"));
-            }
-            Ok(Err(join_err)) => {
-                return Err(format!("capture task failed: {join_err} [{diag}]"));
-            }
+        match tokio::time::timeout(CAPTURE_BACKSTOP, task).await {
+            Ok(Ok(Ok(raw))) => Ok(raw),
+            Ok(Ok(Err(e))) => Err(format!("screenshot capture failed: {e} [{diag}]")),
+            Ok(Err(join_err)) => Err(format!("capture task failed: {join_err} [{diag}]")),
             Err(_) => {
                 reset_capture_connection();
-                return Err(format!(
+                Err(format!(
                     "capture of {desc} did not return within {CAPTURE_BACKSTOP:?} — \
                      the recovery ladder itself is stuck (preflight below: \
                      preflight=false ⇒ Screen Recording not granted to the responsible \
                      `parent=` process). [{diag}]"
-                ));
+                ))
             }
+        }
+    }
+
+    /// Run the requested screenshot capture. Raw acquisition is shared with
+    /// OCR; only this path performs overlays/marks and base64 MCP rendering.
+    async fn acquire_capture(
+        &self,
+        plan: &CapturePlan,
+    ) -> Result<crate::tools::screenshot::ScreenshotImage, String> {
+        let raw = self
+            .acquire_raw_capture(plan.region, plan.window.clone())
+            .await?;
+        let opts = crate::capture::screenshot::CaptureOptions {
+            grid: plan.grid,
+            marks: plan.marks,
         };
 
-        // Phase 2: overlays + marks (Accessibility) + encode, in-process.
+        // Overlays + marks (Accessibility) + encode, in-process. The cached AX
+        // handles cannot cross the capture-daemon process boundary.
         let finish = tokio::task::spawn_blocking(move || {
             crate::capture::screenshot::finish_capture(raw, opts)
                 .map(crate::tools::screenshot::ScreenshotImage::from)
@@ -1383,6 +1457,20 @@ capability and the FIRST operation for labels, controls, fields, structured text
 semantic state. It reads Accessibility/UIA directly without a screenshot; `read_ui` is \
 only a compatibility alias.
 
+For routine Chrome page automation and debugging, prefer the official Chrome DevTools MCP \
+server when it is connected. Use Nova for browser chrome, permission dialogs, other desktop \
+apps, and visual fallback. Nova's separately installed Secure Chrome Bridge remains the \
+least-privilege option when a user explicitly pairs one page and broad profile access is \
+not acceptable.
+
+When using the Secure Chrome Bridge, first call `chrome_status`. When the user has \
+explicitly paired the active page, prefer `chrome_read` and the exact `chrome_activate`, \
+`chrome_focus`, `chrome_set_value`, or `chrome_scroll` tools over browser AX and pixels. Pairing is bound \
+to one tab/document/page nonce/epoch and is revoked by navigation or disconnect. Run a \
+fresh `chrome_read` immediately before every mutation; Chrome semantic tools never accept \
+or fall back to screen coordinates. If unpaired, call `chrome_pair` and ask the user to \
+confirm the origin in the Nova extension popup within 30 seconds.
+
 READ in this order:
 1. Call `ax_read(window?, mode=\"all\")`. Respect its coverage/status. \
 `permission_denied` means grant Accessibility and retry — do NOT hide it with OCR or a \
@@ -1610,6 +1698,39 @@ pub struct AxActivateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrModeParam {
+    /// Fast first; retry accurately only for empty/low-confidence Vision output.
+    Auto,
+    /// Lowest latency, potentially lower recognition quality.
+    Fast,
+    /// Highest quality, potentially slower.
+    Accurate,
+}
+
+impl From<OcrModeParam> for crate::platform::OcrMode {
+    fn from(value: OcrModeParam) -> Self {
+        match value {
+            OcrModeParam::Auto => Self::Auto,
+            OcrModeParam::Fast => Self::Fast,
+            OcrModeParam::Accurate => Self::Accurate,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OcrRoiParams {
+    /// Left edge in the CURRENT image's pixel space.
+    pub x: f64,
+    /// Top edge in the CURRENT image's pixel space.
+    pub y: f64,
+    /// ROI width in current-image pixels; must be finite and > 0.
+    pub width: f64,
+    /// ROI height in current-image pixels; must be finite and > 0.
+    pub height: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OcrParams {
     /// Capture only a single on-screen window (case-insensitive substring of its
     /// title or app name) instead of the whole display. Smaller, sharper image
@@ -1620,6 +1741,20 @@ pub struct OcrParams {
     /// Omitted, defaults to Simplified Chinese + English.
     #[serde(default)]
     pub languages: Option<Vec<String>>,
+    /// Recognition latency/quality policy. `auto` (default) starts with the
+    /// fast Apple Vision recognizer and falls back to accurate only for empty
+    /// or low-confidence output. On engines without a native mode knob the
+    /// setting preserves that engine's normal behavior.
+    #[serde(default)]
+    pub mode: Option<OcrModeParam>,
+    /// Optional strict region of interest in the CURRENT image's pixel space.
+    /// Nova maps it back to global logical coordinates and re-captures through
+    /// the platform's native region path before JPEG encoding/OCR. It is never
+    /// cropped from an already-downscaled JPEG. Every value must be finite, the
+    /// size positive, and the entire rectangle in bounds. Mutually exclusive
+    /// with `window`.
+    #[serde(default)]
+    pub roi: Option<OcrRoiParams>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1649,6 +1784,86 @@ pub struct ReadUiParams {
     /// `truncated=true` and `partial_reason=character_limit` are returned.
     #[serde(default)]
     pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChromeReadParams {
+    /// Maximum semantic nodes returned by the extension (default 500, hard
+    /// capped by the content script at 1000).
+    #[serde(default)]
+    pub max_nodes: Option<u64>,
+    /// Maximum Unicode-character budget (default 100000, hard capped at
+    /// 500000). The result reports truncation rather than silently omitting it.
+    #[serde(default)]
+    pub max_chars: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChromeNodeParams {
+    /// Ephemeral snapshot returned by the immediately preceding chrome_read.
+    pub snapshot_id: String,
+    /// Exact snapshot-local semantic node id.
+    pub node_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChromeSetValueParams {
+    /// Ephemeral snapshot returned by the immediately preceding chrome_read.
+    pub snapshot_id: String,
+    /// Exact snapshot-local semantic node id for a non-sensitive text control.
+    pub node_id: String,
+    /// New field value. Nova never logs or echoes this plaintext; the result
+    /// contains only its UTF-8 length and SHA-256 digest.
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl ChromeScrollDirection {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeScrollAmount {
+    Line,
+    HalfPage,
+    Page,
+}
+
+impl ChromeScrollAmount {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::HalfPage => "half_page",
+            Self::Page => "page",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChromeScrollParams {
+    /// Ephemeral snapshot returned by the immediately preceding chrome_read.
+    pub snapshot_id: String,
+    /// Exact snapshot-local semantic node id, or `root` when exposed by the
+    /// document snapshot.
+    pub node_id: String,
+    pub direction: ChromeScrollDirection,
+    pub amount: ChromeScrollAmount,
 }
 
 #[tool_router]
@@ -1758,75 +1973,145 @@ impl NovaServer {
                        canvas, games, image-rendered or custom-drawn views — or to grab a lot of \
                        text at once without parsing a screenshot. For native/web UI with an \
                        Accessibility/UIA tree, ax_read + ax_activate is still more precise. \
+                       mode=auto (default) tries fast recognition first and only falls back to \
+                       accurate for empty/low-confidence output; mode=fast minimizes latency and \
+                       mode=accurate forces maximum quality. roi={x,y,width,height} scopes OCR in \
+                       the CURRENT image's pixels: the rectangle is strictly validated, mapped to \
+                       the desktop, and re-captured through the native region path (never cropped \
+                       from a downscaled JPEG). roi and window are mutually exclusive. \
                        Languages default to Simplified Chinese + English; pass languages=[...] (BCP-47) \
                        to override."
     )]
-    #[tracing::instrument(skip_all, fields(window = ?p.window, languages = ?p.languages), level = "info")]
+    #[tracing::instrument(skip_all, fields(window = ?p.window, roi = ?p.roi, mode = ?p.mode, languages = ?p.languages), level = "info")]
     async fn ocr(&self, Parameters(p): Parameters<OcrParams>) -> rmcp::model::CallToolResult {
-        // Capture a clean image (no overlays), record its frame so the recognized
-        // centers are clickable, and route input like a window/display capture.
-        let plan = CapturePlan {
-            region: None,
-            window: p.window.clone(),
-            grid: false,
-            marks: false,
-        };
-        let img = match self.acquire_capture(&plan).await {
-            Ok(img) => img,
-            Err(e) => return err_result(&e),
-        };
-        self.set_view(img.view);
-        if p.window.is_some() {
-            self.set_target_pid(img.target_pid);
-        } else {
-            self.set_target_pid(None);
+        if p.window.is_some() && p.roi.is_some() {
+            return err_result("ocr window and roi are mutually exclusive; pass only one");
         }
 
-        let jpeg = match base64::engine::general_purpose::STANDARD.decode(&img.base64_data) {
-            Ok(bytes) => bytes,
-            Err(e) => return err_result(&format!("failed to decode captured image: {e}")),
+        // A ROI is expressed against the current image, exactly like
+        // `zoom_region`, but is stricter: never clamp it. Native region capture
+        // retains text detail that post-cropping the already-downscaled display
+        // JPEG would irreversibly lose.
+        let native_roi = match &p.roi {
+            Some(roi) => match self
+                .current_view()
+                .resolve_strict_region(roi.x, roi.y, roi.width, roi.height)
+            {
+                Ok(rect) => Some(rect),
+                Err(error) => return err_result(&format!("invalid OCR ROI: {error}")),
+            },
+            None => None,
         };
-        let (w, h) = (img.width, img.height);
+
+        let raw = match self.acquire_raw_capture(native_roi, p.window.clone()).await {
+            Ok(raw) => raw,
+            Err(e) => return err_result(&e),
+        };
+
+        // Encode once straight from the raw capture. The old path built an MCP
+        // base64 screenshot and immediately decoded it back to JPEG here.
+        let encode = tokio::task::spawn_blocking(move || {
+            crate::capture::screenshot::encode_raw_capture(raw)
+        });
+        let encoded = match tokio::time::timeout(OCR_ENCODE_TIMEOUT, encode).await {
+            Ok(Ok(Ok(encoded))) => encoded,
+            Ok(Ok(Err(error))) => {
+                return err_result(&format!("failed to encode OCR capture: {error}"));
+            }
+            Ok(Err(join_error)) => {
+                return err_result(&format!("OCR encode task failed: {join_error}"));
+            }
+            Err(_) => return err_result("OCR JPEG encoding timed out after 10s"),
+        };
+
+        let encoded_view = encoded.view;
+        let encoded_target_pid = encoded.target_pid;
+        let (jpeg, w, h) = (encoded.jpeg, encoded.width, encoded.height);
         let languages = p
             .languages
             .clone()
             .unwrap_or_else(|| vec!["zh-Hans".to_string(), "en-US".to_string()]);
+        let mode: crate::platform::OcrMode = p.mode.unwrap_or(OcrModeParam::Auto).into();
 
-        // Vision recognition is blocking; run it off the async runtime with a
-        // hard timeout so a stuck recognizer can't starve the server.
+        // Bound admission as well as execution. Most importantly, move the
+        // owned permit into the blocking closure: Tokio cannot cancel Apple's
+        // synchronous Vision call, so an outer timeout must not release the
+        // slot while that call is still consuming resources in the background.
+        let permit = match tokio::time::timeout(OCR_QUEUE_TIMEOUT, ocr_gate().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => return err_result(&format!("OCR concurrency gate closed: {error}")),
+            Err(_) => {
+                return err_result(
+                    "OCR is busy: both recognition slots remained occupied for 5s; retry shortly",
+                );
+            }
+        };
+
+        // Recognition is blocking; run it off the async runtime with a mode-
+        // aware hard timeout so a stuck recognizer cannot starve the server.
         let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let lang_refs: Vec<&str> = languages.iter().map(String::as_str).collect();
-            crate::platform::ocr().recognize(&jpeg, w, h, &lang_refs)
+            crate::platform::ocr().recognize_with_mode(&jpeg, w, h, &lang_refs, mode)
         });
-        let lines = match tokio::time::timeout(std::time::Duration::from_secs(20), task).await {
+        let run_timeout = ocr_run_timeout(mode);
+        let lines = match tokio::time::timeout(run_timeout, task).await {
             Ok(Ok(Ok(lines))) => lines,
             Ok(Ok(Err(e))) => return err_result(&format!("OCR failed: {e}")),
             Ok(Err(join_err)) => return err_result(&format!("OCR task failed: {join_err}")),
-            Err(_) => return err_result("OCR timed out after 20s"),
+            Err(_) => {
+                return err_result(&format!(
+                    "OCR mode={} timed out after {run_timeout:?}; its bounded worker slot will \
+                     remain reserved until the synchronous platform recognizer exits",
+                    mode.as_str()
+                ));
+            }
         };
 
-        let subject = match &p.window {
-            Some(q) => format!("window matching {q:?}"),
-            None => "the main display".to_string(),
+        // Commit the new coordinate frame only after recognition succeeds. A
+        // busy gate, timeout, or platform error must not silently replace the
+        // current view with an image/ROI the caller never received coordinates
+        // for.
+        self.set_view(encoded_view);
+        if p.roi.is_some() {
+            // A ROI refines the existing view; preserve its input target, just
+            // like zoom_region does.
+        } else if p.window.is_some() {
+            self.set_target_pid(encoded_target_pid);
+        } else {
+            self.set_target_pid(None);
+        }
+
+        let subject = match (&p.window, &p.roi) {
+            (Some(q), _) => format!("window matching {q:?}"),
+            (_, Some(roi)) => format!(
+                "ROI ({}, {}, {}, {}) of the previous view",
+                roi.x, roi.y, roi.width, roi.height
+            ),
+            _ => "the main display".to_string(),
         };
         if lines.is_empty() {
             return ok_text(format!(
-                "OCR of {subject} ({w}x{h} px): no text recognized."
+                "OCR of {subject} ({w}x{h} px, mode={}): no text recognized.",
+                mode.as_str()
             ));
         }
         let mut note = format!(
-            "OCR of {subject} ({w}x{h} px), {n} text lines. Coordinates are in this image's pixel \
-             space (same as a screenshot) — click a line by its center with \
+            "OCR of {subject} ({w}x{h} px, mode={mode}), {n} text lines. Coordinates are in this \
+             OCR view's pixel space (now the current image space) — click a line by its center with \
              left_click(x, y, source=\"ocr_center\").\n",
+            mode = mode.as_str(),
             n = lines.len(),
         );
         for (i, line) in lines.iter().enumerate() {
             note.push_str(&format!(
-                "  [{}] {:?} — ({:.0}, {:.0})\n",
+                "  [{}] {:?} — ({:.0}, {:.0}), confidence={:.2}\n",
                 i + 1,
                 line.text,
                 line.center.0,
                 line.center.1,
+                line.confidence,
             ));
         }
         note.push_str("\nFull text:\n");
@@ -2314,6 +2599,102 @@ impl NovaServer {
     ) -> rmcp::model::CallToolResult {
         self.run_ax_read(p).await
     }
+
+    #[tool(
+        name = "chrome_status",
+        description = "Report whether Nova.app's Chrome Native Messaging host is connected and whether one exact top-level document is currently paired. Call this before Chrome semantic work; it never inspects page content."
+    )]
+    #[tracing::instrument(skip_all, level = "info")]
+    async fn chrome_status(&self) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(|bridge| bridge.status()).await
+    }
+
+    #[tool(
+        name = "chrome_pair",
+        description = "Begin an explicit 30-second pairing request for the active Chrome page. The user must inspect the origin and click Pair in the Nova extension popup. Success binds the exact tab, documentId, page nonce, and new epoch; it never grants access to another tab or later navigation."
+    )]
+    #[tracing::instrument(skip_all, level = "info")]
+    async fn chrome_pair(&self) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(|bridge| bridge.pair()).await
+    }
+
+    #[tool(
+        name = "chrome_read",
+        description = "Read a bounded semantic DOM snapshot from the exact paired Chrome document. Sensitive fields and invalid/presentation ARIA nodes are excluded. Returns an ephemeral snapshotId and exact nodeIds; run this immediately before every Chrome mutation. No screenshot or coordinates are used."
+    )]
+    #[tracing::instrument(skip_all, fields(max_nodes = ?p.max_nodes, max_chars = ?p.max_chars), level = "info")]
+    async fn chrome_read(
+        &self,
+        Parameters(p): Parameters<ChromeReadParams>,
+    ) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(move |bridge| bridge.read(p.max_nodes, p.max_chars))
+            .await
+    }
+
+    #[tool(
+        name = "chrome_activate",
+        description = "Semantically activate one exact actionable node from the immediately preceding chrome_read snapshot. Fails closed on stale snapshot, route, capability, or DOM identity; coordinate fallback is forbidden."
+    )]
+    #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id), level = "info")]
+    async fn chrome_activate(
+        &self,
+        Parameters(p): Parameters<ChromeNodeParams>,
+    ) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(move |bridge| bridge.activate(&p.snapshot_id, &p.node_id))
+            .await
+    }
+
+    #[tool(
+        name = "chrome_focus",
+        description = "Focus one exact focus-capable node from the immediately preceding chrome_read snapshot. Fails closed instead of guessing or clicking."
+    )]
+    #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id), level = "info")]
+    async fn chrome_focus(
+        &self,
+        Parameters(p): Parameters<ChromeNodeParams>,
+    ) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(move |bridge| bridge.focus(&p.snapshot_id, &p.node_id))
+            .await
+    }
+
+    #[tool(
+        name = "chrome_set_value",
+        description = "Set one exact non-sensitive text control from the immediately preceding chrome_read snapshot. Password, payment, OTP, file, hidden, and explicitly sensitive controls are unavailable. Plaintext is never logged or echoed; success returns only UTF-8 byte length and SHA-256."
+    )]
+    #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id), level = "info")]
+    async fn chrome_set_value(
+        &self,
+        Parameters(p): Parameters<ChromeSetValueParams>,
+    ) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(move |bridge| bridge.set_value(&p.snapshot_id, &p.node_id, &p.value))
+            .await
+    }
+
+    #[tool(
+        name = "chrome_scroll",
+        description = "Semantically scroll one exact scroll-capable node (including root when exposed) from the immediately preceding chrome_read snapshot. Direction is up/down/left/right and amount is line/half_page/page; no coordinates."
+    )]
+    #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id, direction = ?p.direction, amount = ?p.amount), level = "info")]
+    async fn chrome_scroll(
+        &self,
+        Parameters(p): Parameters<ChromeScrollParams>,
+    ) -> rmcp::model::CallToolResult {
+        let direction = p.direction.as_str();
+        let amount = p.amount.as_str();
+        self.run_chrome_action(move |bridge| {
+            bridge.scroll(&p.snapshot_id, &p.node_id, direction, amount)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "chrome_release",
+        description = "Explicitly release the currently paired Chrome document, revoke its epoch, in-flight requests, and unexpired receipts."
+    )]
+    #[tracing::instrument(skip_all, level = "info")]
+    async fn chrome_release(&self) -> rmcp::model::CallToolResult {
+        self.run_chrome_action(|bridge| bridge.release()).await
+    }
 }
 
 // `#[tool_handler]` wires up call_tool/list_tools from the `tool_router()` above.
@@ -2349,6 +2730,45 @@ pub async fn run_stdio() -> Result<()> {
     let quit_reason = service.waiting().await.context("stdio server error")?;
     tracing::info!("Nova MCP server stopped: {quit_reason:?}");
 
+    Ok(())
+}
+
+/// Run one MCP session over an authenticated Unix stream accepted by the
+/// app-owned service.  The listener and peer-credential policy live in
+/// `app_service`; this function only adapts the byte stream to rmcp's NDJSON
+/// async read/write transport.
+#[cfg(unix)]
+pub async fn run_unix_stream(stream: tokio::net::UnixStream) -> Result<()> {
+    run_unix_stream_with_server(stream, NovaServer::new()).await
+}
+
+/// Run one app-service MCP session with the app-owned Secure Chrome Bridge.
+/// The bridge is injected explicitly so ordinary transports cannot acquire its
+/// pairing authority by merely discovering the native-host socket.
+#[cfg(unix)]
+pub async fn run_unix_stream_with_chrome(
+    stream: tokio::net::UnixStream,
+    chrome_bridge: nova_chrome_bridge::ChromeBridge,
+) -> Result<()> {
+    run_unix_stream_with_server(stream, NovaServer::new().with_chrome_bridge(chrome_bridge)).await
+}
+
+#[cfg(unix)]
+async fn run_unix_stream_with_server(
+    stream: tokio::net::UnixStream,
+    server: NovaServer,
+) -> Result<()> {
+    let (reader, writer) = stream.into_split();
+    let service = server
+        .serve((reader, writer))
+        .await
+        .context("app-service MCP session failed to initialize")?;
+
+    let quit_reason = service
+        .waiting()
+        .await
+        .context("app-service MCP session error")?;
+    tracing::info!(?quit_reason, "Nova app-service MCP session stopped");
     Ok(())
 }
 
@@ -2421,6 +2841,14 @@ mod tests {
             "ax_read",
             "read_ui",
             "dump_ax",
+            "chrome_status",
+            "chrome_pair",
+            "chrome_read",
+            "chrome_activate",
+            "chrome_focus",
+            "chrome_set_value",
+            "chrome_scroll",
+            "chrome_release",
         ];
         for name in expected {
             assert!(router.has_route(name), "tool not registered: {name}");
@@ -2446,6 +2874,27 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = result.content[0].as_text().expect("text content");
         assert_eq!(text.text, "boom");
+    }
+
+    #[test]
+    fn chrome_terminal_status_controls_the_mcp_error_flag() {
+        for (status, expected_error) in [("ok", false), ("error", true), ("ambiguous", true)] {
+            let result = chrome_call_result(Ok(serde_json::json!({
+                "kind": "result",
+                "status": status,
+                "requestId": "app-1",
+            })));
+            assert_eq!(
+                result.is_error,
+                Some(expected_error),
+                "unexpected MCP failure bit for Chrome status {status}"
+            );
+            let text = result.content[0].as_text().expect("Chrome JSON text");
+            assert!(text.text.contains(&format!("\"status\": \"{status}\"")));
+        }
+
+        let malformed = chrome_call_result(Ok(serde_json::json!({ "kind": "result" })));
+        assert_eq!(malformed.is_error, Some(true));
     }
 
     #[test]
@@ -3422,5 +3871,45 @@ mod tests {
             }))
             .await;
         assert_eq!(negative.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn ocr_rejects_window_and_roi_before_capture() {
+        let server = NovaServer::new();
+        let result = server
+            .ocr(Parameters(OcrParams {
+                window: Some("Safari".to_string()),
+                languages: None,
+                mode: Some(OcrModeParam::Auto),
+                roi: Some(OcrRoiParams {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                }),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text error").text;
+        assert!(text.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn ocr_modes_deserialize_and_have_bounded_budgets() {
+        let fast: OcrParams = serde_json::from_value(serde_json::json!({
+            "mode": "fast"
+        }))
+        .expect("deserialize fast OCR mode");
+        assert!(matches!(fast.mode, Some(OcrModeParam::Fast)));
+
+        assert!(
+            ocr_run_timeout(crate::platform::OcrMode::Fast)
+                < ocr_run_timeout(crate::platform::OcrMode::Accurate)
+        );
+        assert!(
+            ocr_run_timeout(crate::platform::OcrMode::Accurate)
+                < ocr_run_timeout(crate::platform::OcrMode::Auto)
+        );
+        assert_eq!(OCR_MAX_CONCURRENT, 2);
     }
 }

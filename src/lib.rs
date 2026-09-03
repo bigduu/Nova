@@ -10,7 +10,9 @@
 //! The canonical grounding ladder is `ax_read` → focused OCR → focused pixel
 //! capture, with screenshots reserved for genuinely visual information.
 
+pub mod app_service;
 pub mod capture;
+pub mod chrome_devtools;
 pub mod display;
 pub mod error;
 pub mod platform;

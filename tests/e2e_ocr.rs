@@ -7,10 +7,9 @@
 //! a P2/P3 stub, see `platform::windows::ocr`).
 #![cfg(target_os = "macos")]
 
-use base64::Engine;
-use nova::capture::screenshot::{finish_capture, CaptureOptions};
+use nova::capture::screenshot::encode_raw_capture;
 use nova::platform::mac::capture::stream::StreamCapturer;
-use nova::tools::screenshot::ScreenshotImage;
+use nova::platform::OcrMode;
 
 mod common;
 use common::with_timeout;
@@ -24,33 +23,24 @@ fn ocr_recognizes_text_on_the_display() {
         StreamCapturer::new().capture_display()
     })
     .expect("capture display");
-    let shot: ScreenshotImage = with_timeout(15, "finish_capture", move || {
-        finish_capture(
-            raw,
-            CaptureOptions {
-                grid: false,
-                marks: false,
-            },
-        )
-    })
-    .expect("finish_capture")
-    .into();
-    let jpeg = base64::engine::general_purpose::STANDARD
-        .decode(&shot.base64_data)
-        .expect("decode jpeg");
+    // OCR's production path encodes the clean raw frame exactly once; it does
+    // not create an MCP base64 screenshot and decode it again.
+    let shot = with_timeout(15, "encode_raw_capture", move || encode_raw_capture(raw))
+        .expect("encode raw OCR capture");
 
-    let (w, h) = (shot.width, shot.height);
-    let lines = with_timeout(20, "Vision OCR", move || {
-        nova::platform::mac::ocr::recognize(&jpeg, w, h, &["zh-Hans", "en-US"])
+    let (w, h, jpeg) = (shot.width, shot.height, shot.jpeg);
+    let lines = with_timeout(35, "Vision OCR Auto", move || {
+        nova::platform::mac::ocr::recognize_with_mode(
+            &jpeg,
+            w,
+            h,
+            &["zh-Hans", "en-US"],
+            OcrMode::Auto,
+        )
     })
     .expect("OCR should not error");
 
-    eprintln!(
-        "OCR found {} lines on a {}x{} capture",
-        lines.len(),
-        shot.width,
-        shot.height
-    );
+    eprintln!("OCR found {} lines on a {}x{} capture", lines.len(), w, h);
     for l in lines.iter().take(15) {
         eprintln!(
             "  {:?} @ ({:.0}, {:.0}) conf={:.2}",
@@ -68,13 +58,13 @@ fn ocr_recognizes_text_on_the_display() {
     for l in &lines {
         assert!(
             l.center.0 >= 0.0
-                && l.center.0 <= shot.width as f64
+                && l.center.0 <= w as f64
                 && l.center.1 >= 0.0
-                && l.center.1 <= shot.height as f64,
+                && l.center.1 <= h as f64,
             "line center {:?} outside the {}x{} image",
             l.center,
-            shot.width,
-            shot.height
+            w,
+            h
         );
     }
 }

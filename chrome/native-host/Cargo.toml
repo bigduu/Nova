@@ -1,0 +1,21 @@
+[package]
+name = "nova-chrome-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Private Chrome Native Messaging bridge for Nova.app"
+license = "MIT"
+publish = false
+
+[lib]
+name = "nova_chrome_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-chrome-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde_json = "1"
+sha2 = "0.10"

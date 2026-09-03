@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nova</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span class="mark" aria-hidden="true">N</span>
+      <div>
+        <h1>Nova</h1>
+        <p id="connection">Checking bridge…</p>
+      </div>
+    </header>
+    <main>
+      <section id="pending" hidden>
+        <p class="eyebrow">Pair request</p>
+        <p id="page-title" class="title"></p>
+        <p id="page-origin" class="origin"></p>
+        <p id="countdown" class="countdown"></p>
+        <button id="pair" type="button">Pair this page</button>
+        <button id="deny" class="secondary" type="button">Deny</button>
+      </section>
+      <section id="paired" hidden>
+        <p class="eyebrow">Paired</p>
+        <p id="paired-origin" class="origin"></p>
+        <p>Only this exact document can receive semantic actions.</p>
+        <button id="release" class="danger" type="button">Release access</button>
+      </section>
+      <section id="idle" hidden>
+        <p>No live pairing request.</p>
+        <p class="hint">Ask Nova to pair, then return here within 30 seconds.</p>
+      </section>
+      <p id="error" role="alert" hidden></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

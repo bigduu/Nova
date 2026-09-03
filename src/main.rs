@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Nova — Computer Use MCP Server
@@ -7,11 +7,26 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// A macOS + Windows desktop control MCP server that gives LLMs the ability to
 /// capture screenshots, control mouse/keyboard, manage windows, and introspect apps.
 #[derive(Parser, Debug)]
-#[command(name = "nova", version, about)]
+#[command(name = "nova", version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Run in Streamable HTTP mode (default: stdio)
     #[arg(long)]
     http: bool,
+
+    /// Connect stdio to the independently launched Nova.app service. The CLI
+    /// is only a byte proxy; desktop APIs and macOS permission checks stay in
+    /// the app process.
+    #[arg(long, conflicts_with = "http")]
+    connect: bool,
+
+    /// INTERNAL: run the app-owned MCP listener. LaunchServices selects this
+    /// automatically when it starts the executable inside Nova.app with no
+    /// arguments; the flag exists for transport tests and diagnostics.
+    #[arg(long, hide = true, conflicts_with_all = ["http", "connect"])]
+    app_service: bool,
 
     /// HTTP listen address (default: 127.0.0.1:3100)
     #[arg(long, default_value = "127.0.0.1:3100")]
@@ -130,6 +145,17 @@ struct Cli {
     ocr_probe: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the pinned official Chrome DevTools MCP server over transparent
+    /// stdio, with Nova's privacy-oriented defaults.
+    ///
+    /// Requires npm and Node.js ^20.19.0, ^22.12.0, or >=23. Use current stable
+    /// Chrome; URL allow patterns require Chrome 149+, and WebMCP requires
+    /// Chrome 150+.
+    ChromeDevtools(nova::chrome_devtools::ChromeDevtoolsArgs),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Init logging — MUST go to stderr. In stdio transport, stdout is the
@@ -140,7 +166,50 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let cli = Cli::parse();
+    // Some LaunchServices versions append a legacy `-psn_...` process serial
+    // argument. It is not a Nova option; ignore only that exact platform
+    // marker while retaining clap's strict handling for every real CLI arg.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let launch_services_args_only = raw_args
+        .iter()
+        .skip(1)
+        .all(|argument| argument.to_string_lossy().starts_with("-psn_"));
+    let cli = Cli::parse_from(
+        raw_args
+            .iter()
+            .filter(|argument| !argument.to_string_lossy().starts_with("-psn_"))
+            .cloned(),
+    );
+
+    // The sidecar code path does not call Nova's desktop APIs: dispatch it
+    // before CoreGraphics, UI Automation, or permission diagnostics. This
+    // keeps those APIs out of the launcher path, but macOS ultimately decides
+    // responsible-process and TCC attribution for the processes involved.
+    if let Some(Commands::ChromeDevtools(options)) = cli.command.as_ref() {
+        return nova::chrome_devtools::run(options);
+    }
+
+    // The connector must remain a pure transport proxy. In particular, do
+    // this before CoreGraphics initialization so TCC/Desktop responsibility
+    // belongs to Nova.app, never Bamboo/Claude/the terminal that spawned the
+    // connector.
+    if cli.connect {
+        tracing::info!("Transport: Nova.app private Unix socket");
+        return nova::app_service::connect_stdio().await;
+    }
+
+    // LaunchServices invokes an application bundle's main executable without
+    // arguments. Preserve the historical no-argument stdio behavior for an
+    // unbundled CLI while making a real Nova.app independently resident.
+    let app_service = cli.app_service
+        || (launch_services_args_only && nova::app_service::is_bundled_executable());
+
+    // Enforce the stable application identity before even bootstrapping
+    // CoreGraphics. A production macOS binary may not host this endpoint from
+    // an unbundled terminal/Bodhi responsibility chain.
+    if app_service {
+        nova::app_service::ensure_service_identity()?;
+    }
 
     // Per-OS one-time process bootstrap that must run before any capture/
     // window/input call: macOS needs the CoreGraphics window-server connection
@@ -159,8 +228,22 @@ async fn main() -> Result<()> {
     );
     tracing::info!(
         "Transport: {}",
-        if cli.http { "Streamable HTTP" } else { "stdio" }
+        if app_service {
+            "Nova.app private Unix socket"
+        } else if cli.http {
+            "Streamable HTTP"
+        } else {
+            "stdio"
+        }
     );
+
+    if app_service {
+        // Permission diagnostics execute in this stable app identity. The
+        // app-service listener then creates an independent MCP session for
+        // every authenticated same-UID connector.
+        log_platform_permissions();
+        return nova::app_service::run().await;
+    }
 
     if cli.selftest_direct {
         run_selftest_direct().await;

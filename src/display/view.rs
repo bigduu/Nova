@@ -44,6 +44,71 @@ impl ViewFrame {
             (ly - self.origin.1) / self.region.1 * self.screenshot.1,
         )
     }
+
+    /// Resolve a rectangle in this image's pixel space into a global-logical
+    /// capture rectangle, rejecting every invalid/out-of-bounds input.
+    ///
+    /// This is intentionally stricter than clipping. Native region capture
+    /// changes the coordinate frame returned to an OCR caller; silently
+    /// clipping even one edge would therefore make its reported text centers
+    /// target different pixels than the caller requested.
+    pub fn resolve_strict_region(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<(f64, f64, f64, f64), String> {
+        if ![x, y, width, height].iter().all(|value| value.is_finite()) {
+            return Err("ROI coordinates must all be finite".to_string());
+        }
+        if x < 0.0 || y < 0.0 || width <= 0.0 || height <= 0.0 {
+            return Err("ROI must have a non-negative origin and positive size".to_string());
+        }
+        if ![
+            self.origin.0,
+            self.origin.1,
+            self.region.0,
+            self.region.1,
+            self.screenshot.0,
+            self.screenshot.1,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            || self.region.0 <= 0.0
+            || self.region.1 <= 0.0
+            || self.screenshot.0 <= 0.0
+            || self.screenshot.1 <= 0.0
+        {
+            return Err("cannot resolve an ROI against an invalid current view".to_string());
+        }
+
+        let right = x + width;
+        let bottom = y + height;
+        if !right.is_finite()
+            || !bottom.is_finite()
+            || right > self.screenshot.0
+            || bottom > self.screenshot.1
+        {
+            return Err(format!(
+                "ROI ({x}, {y}, {width}, {height}) lies outside the current {}x{} image",
+                self.screenshot.0, self.screenshot.1
+            ));
+        }
+
+        let (left, top) = self.to_logical(x, y);
+        let (right, bottom) = self.to_logical(right, bottom);
+        let resolved = (left, top, right - left, bottom - top);
+        if ![resolved.0, resolved.1, resolved.2, resolved.3]
+            .iter()
+            .all(|value| value.is_finite())
+            || resolved.2 <= 0.0
+            || resolved.3 <= 0.0
+        {
+            return Err("ROI resolved to an invalid native capture rectangle".to_string());
+        }
+        Ok(resolved)
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +183,41 @@ mod tests {
         let (x, y) = f.to_logical(5.0, 5.0);
         assert!(x.is_finite() && y.is_finite());
         assert_eq!((x, y), (15.0, 25.0));
+    }
+
+    #[test]
+    fn strict_region_maps_current_pixels_without_clipping() {
+        let f = ViewFrame {
+            origin: (1000.0, 200.0),
+            region: (800.0, 600.0),
+            screenshot: (1600.0, 1200.0),
+        };
+        assert_eq!(
+            f.resolve_strict_region(200.0, 100.0, 400.0, 300.0),
+            Ok((1100.0, 250.0, 200.0, 150.0))
+        );
+        // An exact edge is valid; it must not be rounded or inset.
+        assert_eq!(
+            f.resolve_strict_region(1200.0, 900.0, 400.0, 300.0),
+            Ok((1600.0, 650.0, 200.0, 150.0))
+        );
+    }
+
+    #[test]
+    fn strict_region_rejects_nonfinite_nonpositive_and_out_of_bounds() {
+        let f = ViewFrame {
+            origin: (0.0, 0.0),
+            region: (1280.0, 720.0),
+            screenshot: (1280.0, 720.0),
+        };
+        for result in [
+            f.resolve_strict_region(f64::NAN, 0.0, 10.0, 10.0),
+            f.resolve_strict_region(0.0, 0.0, 0.0, 10.0),
+            f.resolve_strict_region(-1.0, 0.0, 10.0, 10.0),
+            f.resolve_strict_region(1270.0, 0.0, 11.0, 10.0),
+            f.resolve_strict_region(0.0, 710.0, 10.0, 11.0),
+        ] {
+            assert!(result.is_err());
+        }
     }
 }

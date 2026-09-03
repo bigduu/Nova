@@ -1,14 +1,13 @@
 name: Release
 
-# Publish a Nova release on a version tag. Produces a single UNIVERSAL macOS
-# binary (arm64 + x86_64), ad-hoc signed, attached to a GitHub Release; then
-# (optionally, when the corresponding secrets exist) updates the Homebrew tap
-# and publishes the npm wrapper so people can install Nova as an MCP server
-# without building from source. In parallel, it also builds real (linked, not
-# just checked) Windows exes for x86_64 + aarch64 and attaches those to the
-# same Release as .zip + .sha256 — see the `build-windows`/`release-windows`
-# jobs below. Windows has no Homebrew/npm equivalent here; it is
-# release-artifact-only (consumed by URL+checksum, e.g. by a plugin manifest).
+# Publish a Nova release from one immutable, verified version tag. Produces the
+# existing universal macOS CLI archive (the contract consumed by Homebrew, npm,
+# and Bamboo) plus an explicitly DEVELOPMENT-ONLY Nova.app preview built from
+# the same arm64 + x86_64 binary. In parallel, it also builds real (linked, not
+# just checked) Windows exes for x86_64 + aarch64 and attaches those to the same
+# Release as .zip + .sha256 — see the `build-windows`/`release-windows` jobs
+# below. Windows has no Homebrew/npm equivalent here; it is release-artifact-
+# only (consumed by URL+checksum, e.g. by a plugin manifest).
 # Finally, `plugin-manifest` fills in the committed `packaging/plugin/plugin.json`
 # template with this release's real version + archive checksums and publishes
 # it (bare, and as a `nova-plugin-v<ver>.tar.gz` bundle with the `skills/`
@@ -32,31 +31,51 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Do not let two manual reruns (or a tag event and a rerun) race while updating
+# the same GitHub Release. Jobs build in parallel inside one workflow run.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  # ── Build the universal binary + GitHub Release ──────────────────────
-  build:
-    runs-on: macos-15 # macOS 15 SDK required (apple-metal Swift bridge); matches CI
+  # Resolve the requested tag exactly once, prove that checkout HEAD and the
+  # push event (when applicable) resolve to the same commit, and pass that
+  # immutable commit to every source-building job. In particular, a manual
+  # re-release can never accidentally build the moving default branch.
+  release-meta:
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      commit: ${{ steps.meta.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify and pin release tag
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RELEASE_EVENT_OBJECT: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: scripts/verify-release-tag.sh "$RELEASE_TAG" "$RELEASE_EVENT_OBJECT"
+
+  # ── Build the universal CLI, app preview, and GitHub Release ──────────
+  build:
+    needs: release-meta
+    runs-on: macos-15 # macOS 15 SDK required (apple-metal Swift bridge); matches CI
+    outputs:
+      version: ${{ needs.release-meta.outputs.version }}
+      tag: ${{ needs.release-meta.outputs.tag }}
+      commit: ${{ needs.release-meta.outputs.commit }}
       sha256: ${{ steps.pkg.outputs.sha256 }}
       asset: ${{ steps.pkg.outputs.asset }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve version from tag
-        id: meta
-        run: |
-          REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
-          VERSION="${REF#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$REF" >> "$GITHUB_OUTPUT"
-          # Guard: the tag must match Cargo.toml so npm/brew never ship a
-          # version that doesn't exist as a release asset.
-          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::tag $REF (=$VERSION) != Cargo.toml version $CARGO_VERSION — bump Cargo.toml or fix the tag"
-            exit 1
-          fi
+        with:
+          ref: ${{ needs.release-meta.outputs.commit }}
+          fetch-depth: 0
 
       - name: Select latest Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -103,7 +122,7 @@ jobs:
       - name: Package tarball + checksum
         id: pkg
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
+          VERSION="${{ needs.release-meta.outputs.version }}"
           ASSET="nova-v${VERSION}-universal-apple-darwin.tar.gz"
           tar -czf "$ASSET" nova
           SHA="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
@@ -112,43 +131,42 @@ jobs:
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
           echo "Built $ASSET — sha256 $SHA"
 
+      - name: Package Nova.app development preview
+        id: app_pkg
+        run: |
+          VERSION="${{ needs.release-meta.outputs.version }}"
+          APP_ASSET="nova-v${VERSION}-universal-apple-darwin-development-app.zip"
+          packaging/macos/package-development-app.sh nova "$VERSION" app-dist
+          echo "asset=app-dist/$APP_ASSET" >> "$GITHUB_OUTPUT"
+
+      # A force-moved tag between release-meta and this fresh full checkout is
+      # rejected before any public Release or package-manager update occurs.
+      # Repository policy must additionally protect release tags from force
+      # updates during/after this job.
+      - name: Re-verify tag immediately before publishing
+        env:
+          RELEASE_TAG: ${{ needs.release-meta.outputs.tag }}
+          RELEASE_VERIFY_REMOTE: origin
+        run: scripts/verify-release-tag.sh "$RELEASE_TAG"
+
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: Nova ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.release-meta.outputs.tag }}
+          name: Nova ${{ needs.release-meta.outputs.tag }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            > [!WARNING]
+            > `nova-v${{ needs.release-meta.outputs.version }}-universal-apple-darwin-development-app.zip`
+            > is a **DEVELOPMENT ONLY** preview. It is ad-hoc signed and is not
+            > Developer ID signed, notarized, or stapled. Expect Gatekeeper/TCC
+            > friction; do not treat this app archive as a production release.
           files: |
             ${{ steps.pkg.outputs.asset }}
             ${{ steps.pkg.outputs.asset }}.sha256
-
-  # ── Resolve version/tag for the Windows jobs below ────────────────────
-  # The mac `build` job above computes the identical thing inline (kept
-  # untouched); duplicated here as its own tiny job — rather than threading
-  # it through `build`'s outputs — so the Windows path has zero coupling to
-  # the mac job and can genuinely run in parallel with it.
-  windows-meta:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      tag: ${{ steps.meta.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version from tag
-        id: meta
-        run: |
-          REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
-          VERSION="${REF#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$REF" >> "$GITHUB_OUTPUT"
-          # Same guard as the mac job: never publish a Windows asset labeled
-          # with a version that doesn't match what's actually built.
-          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::tag $REF (=$VERSION) != Cargo.toml version $CARGO_VERSION — bump Cargo.toml or fix the tag"
-            exit 1
-          fi
+            ${{ steps.app_pkg.outputs.asset }}
+            ${{ steps.app_pkg.outputs.asset }}.sha256
 
   # ── Build real Windows exes (LINKED, not the CI cross-check) ──────────
   # `ci.yml`'s `windows-cross-check` job only `cargo check`/`clippy`'s the
@@ -171,7 +189,7 @@ jobs:
   #     `--help` correctly. `fail-fast: false` so a hiccup on the newer arm64
   #     runner can't take down the x64 artifact.
   build-windows:
-    needs: windows-meta
+    needs: release-meta
     strategy:
       fail-fast: false
       matrix:
@@ -183,6 +201,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-meta.outputs.commit }}
 
       - name: Install Rust toolchain (${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -221,7 +241,7 @@ jobs:
         id: pkg
         shell: pwsh
         run: |
-          $version = "${{ needs.windows-meta.outputs.version }}"
+          $version = "${{ needs.release-meta.outputs.version }}"
           $target  = "${{ matrix.target }}"
           $asset   = "nova-v$version-$target.zip"
           Copy-Item "target/$target/release/nova.exe" -Destination "nova.exe"
@@ -252,8 +272,8 @@ jobs:
   # get uploaded — matches the "ship x86_64 for sure" fallback.
   release-windows:
     runs-on: ubuntu-latest
-    needs: [build, build-windows, windows-meta]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.windows-meta.result == 'success' }}
+    needs: [build, build-windows, release-meta]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.release-meta.result == 'success' }}
     steps:
       - name: Download Windows build artifacts
         uses: actions/download-artifact@v4
@@ -263,16 +283,16 @@ jobs:
           path: dist
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          tag_name: ${{ needs.release-meta.outputs.tag }}
           # Fail loudly if BOTH build-windows legs failed (this job isn't gated on
           # build-windows so a total-failure would otherwise attach nothing and
           # still go green). A partial matrix success still ships the arch that built.
           fail_on_unmatched_files: true
           files: |
-            dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip
-            dist/nova-v${{ needs.windows-meta.outputs.version }}-*.zip.sha256
+            dist/nova-v${{ needs.release-meta.outputs.version }}-*.zip
+            dist/nova-v${{ needs.release-meta.outputs.version }}-*.zip.sha256
 
   # ── Generate + publish the nova bamboo-plugin bundle ──────────────────
   # `packaging/plugin/plugin.json` is committed as a TEMPLATE (a valid-shaped
@@ -300,10 +320,12 @@ jobs:
   # documents for its ordering after `build`.
   plugin-manifest:
     runs-on: ubuntu-latest
-    needs: [build, build-windows, windows-meta, release-windows]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.windows-meta.result == 'success' && needs.release-windows.result == 'success' }}
+    needs: [build, build-windows, release-meta, release-windows]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.release-meta.result == 'success' && needs.release-windows.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-meta.outputs.commit }}
 
       - name: Download Windows build artifacts (for the .sha256 sidecar)
         uses: actions/download-artifact@v4
@@ -424,9 +446,9 @@ jobs:
           echo "Self-verify OK: bundle signature matches packaging/plugin/signing-key.pub"
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          tag_name: ${{ needs.release-meta.outputs.tag }}
           fail_on_unmatched_files: true
           files: |
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz
@@ -441,9 +463,9 @@ jobs:
       # step right above, both do this already).
       - name: Attach plugin signature to GitHub Release
         if: steps.sign.outputs.signed == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.windows-meta.outputs.tag }}
+          tag_name: ${{ needs.release-meta.outputs.tag }}
           fail_on_unmatched_files: true
           files: |
             dist/nova-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sig
@@ -517,10 +539,12 @@ jobs:
   # ── Publish the npm wrapper (downloads the release binary on install) ─
   npm:
     runs-on: ubuntu-latest
-    needs: [build, gate]
+    needs: [build, gate, release-meta]
     if: needs.gate.outputs.npm == 'true'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-meta.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"

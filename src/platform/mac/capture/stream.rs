@@ -564,21 +564,26 @@ fn resolve_display() -> Result<Resolved, String> {
 /// model budget) — replaces the one-shot source-rect path.
 fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
     let (x, y, w, h) = rect;
-    if w <= 0.0 || h <= 0.0 {
-        return Err("region has zero size".to_string());
+    if ![x, y, w, h].iter().all(|value| value.is_finite()) {
+        return Err("region coordinates must all be finite".to_string());
+    }
+    if x < 0.0 || y < 0.0 || w <= 0.0 || h <= 0.0 {
+        return Err("region must have a non-negative origin and positive size".to_string());
     }
     let main = core_graphics::display::CGDisplay::main();
     let logical = main.bounds().size;
     if logical.width <= 0.0 || logical.height <= 0.0 {
         return Err("main display has no geometry".to_string());
     }
-    // Clamp the rect into the display so the source rect stays in-bounds.
-    let x = x.clamp(0.0, logical.width);
-    let y = y.clamp(0.0, logical.height);
-    let w = w.min(logical.width - x);
-    let h = h.min(logical.height - y);
-    if w <= 0.0 || h <= 0.0 {
-        return Err("region lies outside the display".to_string());
+    let right = x + w;
+    let bottom = y + h;
+    if !right.is_finite() || !bottom.is_finite() || right > logical.width || bottom > logical.height
+    {
+        return Err(format!(
+            "region ({x}, {y}, {w}, {h}) lies outside the main display ({}x{}); \
+             refusing to clamp because that would invalidate OCR/click coordinates",
+            logical.width, logical.height
+        ));
     }
     let scale = main.pixels_wide() as f64 / logical.width;
     let region_native_w = (w * scale).round().max(1.0) as u32;
