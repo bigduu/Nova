@@ -1,0 +1,10 @@
+{
+  "name": "nova-chrome-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check service-worker.js && node --check content-script.js && node --check popup.js && node --check lib/protocol.js && node --check lib/router-state.js && node --check lib/semantic-runtime.js"
+  }
+}

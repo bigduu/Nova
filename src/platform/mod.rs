@@ -78,6 +78,34 @@ pub struct OcrLine {
     pub center: (f64, f64),
 }
 
+/// Speed/quality policy for OCR engines that expose such a tradeoff.
+///
+/// Apple Vision has distinct fast and accurate recognizers. Other platform
+/// engines may implement both modes identically; the default trait method
+/// below preserves that compatibility while allowing macOS to optimize the
+/// common path without leaking Vision framework types across this boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OcrMode {
+    /// Try the fast recognizer first and retry accurately only when the fast
+    /// result is empty or low-confidence.
+    #[default]
+    Auto,
+    /// Prioritize latency over recognition quality.
+    Fast,
+    /// Prioritize recognition quality over latency.
+    Accurate,
+}
+
+impl OcrMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Accurate => "accurate",
+        }
+    }
+}
+
 /// One on-screen window's metadata, frontmost-first.
 ///
 /// Deliberately richer than the MCP-facing `crate::types::WindowInfo` (which
@@ -565,6 +593,19 @@ pub trait OcrEngine: Send + Sync {
         img_h: u32,
         languages: &[&str],
     ) -> Result<Vec<OcrLine>, String>;
+
+    /// Recognize using an explicit speed/quality policy. Engines without a
+    /// native policy knob retain their existing behavior through this default.
+    fn recognize_with_mode(
+        &self,
+        image: &[u8],
+        img_w: u32,
+        img_h: u32,
+        languages: &[&str],
+        _mode: OcrMode,
+    ) -> Result<Vec<OcrLine>, String> {
+        self.recognize(image, img_w, img_h, languages)
+    }
 }
 
 // ── Facade ────────────────────────────────────────────────────────────

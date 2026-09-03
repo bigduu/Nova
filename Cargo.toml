@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP protocol
-rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-async-rw", "transport-streamable-http-server", "macros"] }
 
 # HTTP server (for Streamable HTTP transport)
 axum = "0.8"
@@ -24,7 +24,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio = { version = "1", features = ["full"] }
 
 # Image processing
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # Encoding
 base64 = "0.22"
@@ -49,6 +49,11 @@ clap = { version = "4", features = ["derive"] }
 
 # Error helpers
 anyhow = "1"
+
+# App-owned Chrome Native Messaging bridge. The crate provides a safe
+# unsupported-platform stub off Unix so the MCP tool contract stays stable on
+# every Nova build.
+nova-chrome-bridge = { path = "chrome/native-host" }
 
 # ── Platform-specific (macOS) ────────────────────────────────────────
 # Everything below is Apple-framework-only and belongs exclusively to

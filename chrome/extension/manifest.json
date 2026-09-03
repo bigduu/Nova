@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Nova Developer Bridge",
+  "description": "Explicitly pair Nova with one Chrome document for semantic browser automation.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "106",
+  "permissions": [
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Nova",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["lib/semantic-runtime.js", "content-script.js"],
+      "all_frames": false,
+      "match_about_blank": false,
+      "run_at": "document_start"
+    }
+  ]
+}

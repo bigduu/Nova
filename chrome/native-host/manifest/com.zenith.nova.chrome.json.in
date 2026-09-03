@@ -1,0 +1,9 @@
+{
+  "name": "com.zenith.nova.chrome",
+  "description": "Nova developer bridge for exact semantic Chrome automation",
+  "path": "__NOVA_CHROME_HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__NOVA_EXTENSION_ID__/"
+  ]
+}

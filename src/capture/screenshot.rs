@@ -104,6 +104,44 @@ pub struct RawCapture {
     pub window_pid: Option<i32>,
 }
 
+/// A clean capture encoded for OCR without going through the MCP/base64 image
+/// representation first.
+///
+/// OCR used to call [`finish_capture`], base64-encode its JPEG for an MCP image,
+/// then immediately decode that base64 back into the same JPEG bytes for the
+/// platform recognizer. Keeping this small intermediate lets the OCR path do
+/// exactly one raw capture and one JPEG encode while preserving the coordinate
+/// frame and input-routing metadata that recognized centers depend on.
+pub struct EncodedCapture {
+    pub jpeg: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub view: ViewFrame,
+    pub target_pid: Option<i32>,
+}
+
+/// Encode an unannotated raw capture once for OCR.
+///
+/// Deliberately does not draw a grid or Set-of-Mark boxes: feeding overlays to
+/// Vision both wastes work and creates synthetic glyphs that can be recognized
+/// as screen content.
+pub fn encode_raw_capture(raw: RawCapture) -> Result<EncodedCapture, String> {
+    let RawCapture {
+        image,
+        view,
+        window_pid,
+    } = raw;
+    let (width, height) = image.dimensions();
+    let jpeg = encode_jpeg(&image)?;
+    Ok(EncodedCapture {
+        jpeg,
+        width,
+        height,
+        view,
+        target_pid: window_pid,
+    })
+}
+
 /// Turn a [`RawCapture`] into a finished [`Capture`]: apply overlays, walk the
 /// Set-of-Mark Accessibility tree (in THIS process — the cached handles can't
 /// cross a process boundary), and encode. The marks are walked on the captured
@@ -216,7 +254,7 @@ fn build_marks(
 /// file size, so a higher quality costs ZERO extra tokens — it only adds a little
 /// upload bandwidth. UI screenshots are sharp text + thin mark/grid lines, where
 /// JPEG's ringing artifacts hurt most; 90 keeps glyphs and 1px overlays crisp.
-fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
+fn encode_jpeg(img: &image::RgbImage) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90)
         .encode(
@@ -226,7 +264,12 @@ fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
             image::ExtendedColorType::Rgb8,
         )
         .map_err(|e| format!("encode: {e}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+    Ok(buf)
+}
+
+fn encode_jpeg_base64(img: &image::RgbImage) -> Result<String, String> {
+    let jpeg = encode_jpeg(img)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(jpeg))
 }
 
 /// Convert RGBA raw bytes to RGB (dropping alpha channel). Only macOS's
@@ -271,5 +314,26 @@ mod tests {
         let rgba = vec![10, 20, 30, 40];
         let rgb = rgba_to_rgb(&rgba, 1, 1);
         assert_eq!(rgb, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn encode_raw_capture_preserves_metadata_without_base64_round_trip() {
+        let raw = RawCapture {
+            image: image::RgbImage::from_raw(2, 1, vec![255, 0, 0, 0, 255, 0]).unwrap(),
+            view: ViewFrame {
+                origin: (10.0, 20.0),
+                region: (200.0, 100.0),
+                screenshot: (2.0, 1.0),
+            },
+            window_pid: Some(42),
+        };
+
+        let encoded = encode_raw_capture(raw).expect("encode clean OCR capture");
+        assert_eq!((encoded.width, encoded.height), (2, 1));
+        assert_eq!(encoded.view.origin, (10.0, 20.0));
+        assert_eq!(encoded.target_pid, Some(42));
+        assert!(encoded.jpeg.starts_with(&[0xff, 0xd8]));
+        let decoded = image::load_from_memory(&encoded.jpeg).expect("decode generated JPEG");
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
     }
 }

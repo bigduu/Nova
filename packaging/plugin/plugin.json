@@ -18,6 +18,18 @@
           "command": "${platform_bin}",
           "args": []
         }
+      },
+      {
+        "id": "nova-chrome-devtools",
+        "name": "Chrome DevTools via Nova",
+        "enabled": false,
+        "transport": {
+          "type": "stdio",
+          "command": "${platform_bin}",
+          "args": [
+            "chrome-devtools"
+          ]
+        }
       }
     ],
     "skills": [
@@ -28,7 +40,7 @@
         "id": "nova_desktop",
         "name": "Nova Desktop Automation",
         "description": "AX-first preset for semantic desktop reading and grounded activation through Nova, with OCR and focused screenshots as ordered fallbacks.",
-        "content": "Use Nova's canonical `ax_read` (`ax:read`) capability FIRST for labels, controls, fields, structured text, values, actions, and semantic state. `read_ui` is only a compatibility alias.\n\nREAD priority:\n1. `ax_read(window?, mode=\"all\")` through macOS Accessibility or Windows UIA; inspect its coverage/status.\n2. If coverage is absent/partial and needed information is rendered text, use focused-window `ocr`.\n3. Use focused `screenshot(window=...)` / `zoom_region` only for layout, icons, colors, images, canvas, or visual verification. Raw coordinates are last.\n\nACT priority:\n1. Immediately before acting, run a fresh `ax_read`, then call `ax_activate(snapshot_id,node_id)` on the exact actionable node. Every activation attempt consumes that generation before provider dispatch, so read again after any result.\n2. Let Nova try route=ax|uia|web_dom, then its freshly verified route=element_center fallback. For AX-less text use the OCR center with `left_click(...,source=\"ocr_center\")`.\n3. Only then click coordinates read from a focused screenshot/zoom (`source=\"visual_coordinate\"`). `click_mark` remains compatibility-only; legacy substring AX actions reject ambiguous matches.\n\nVERIFY after every action. Prefer `ax_read` for semantic outcomes and screenshots only for genuinely visual outcomes. `permission_denied` means grant Accessibility and retry; do not hide it with OCR/screenshots. All pointer coordinates use the MOST RECENT screenshot's pixel space. See the nova-grounding skill for details."
+        "content": "Use Nova's canonical `ax_read` (`ax:read`) capability FIRST for labels, controls, fields, structured text, values, actions, and semantic state. `read_ui` is only a compatibility alias.\n\nWhen the separately enabled `nova-chrome-devtools` server is available, prefer its official Chrome DevTools tools for routine Chrome page automation, DOM/network inspection, and performance debugging. Use Nova for browser chrome, native dialogs, other apps, and visual fallback. Use the separately installed Secure Chrome Bridge when explicit per-page pairing is required instead of broad profile access.\n\nREAD priority:\n1. `ax_read(window?, mode=\"all\")` through macOS Accessibility or Windows UIA; inspect its coverage/status.\n2. If coverage is absent/partial and needed information is rendered text, use focused-window `ocr`.\n3. Use focused `screenshot(window=...)` / `zoom_region` only for layout, icons, colors, images, canvas, or visual verification. Raw coordinates are last.\n\nACT priority:\n1. Immediately before acting, run a fresh `ax_read`, then call `ax_activate(snapshot_id,node_id)` on the exact actionable node. Every activation attempt consumes that generation before provider dispatch, so read again after any result.\n2. Let Nova try route=ax|uia|web_dom, then its freshly verified route=element_center fallback. For AX-less text use the OCR center with `left_click(...,source=\"ocr_center\")`.\n3. Only then click coordinates read from a focused screenshot/zoom (`source=\"visual_coordinate\"`). `click_mark` remains compatibility-only; legacy substring AX actions reject ambiguous matches.\n\nVERIFY after every action. Prefer `ax_read` for semantic outcomes and screenshots only for genuinely visual outcomes. `permission_denied` means grant Accessibility and retry; do not hide it with OCR/screenshots. All pointer coordinates use the MOST RECENT screenshot's pixel space. See the nova-grounding skill for details."
       }
     ],
     "workflows": []
