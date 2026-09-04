@@ -3,6 +3,12 @@
   "name": "Nova Developer Bridge",
   "description": "Explicitly pair Nova with one Chrome document for semantic browser automation.",
   "version": "0.1.0",
+  "icons": {
+    "16": "icons/nova-16.png",
+    "32": "icons/nova-32.png",
+    "48": "icons/nova-48.png",
+    "128": "icons/nova-128.png"
+  },
   "minimum_chrome_version": "106",
   "permissions": [
     "nativeMessaging"
@@ -12,6 +18,11 @@
     "type": "module"
   },
   "action": {
+    "default_icon": {
+      "16": "icons/nova-16.png",
+      "24": "icons/nova-24.png",
+      "32": "icons/nova-32.png"
+    },
     "default_title": "Nova",
     "default_popup": "popup.html"
   },

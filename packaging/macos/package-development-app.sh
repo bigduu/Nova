@@ -30,7 +30,7 @@ OUTPUT_DIRECTORY="${3:-dist}"
   exit 1
 }
 
-for command_name in lipo codesign plutil ditto unzip shasum; do
+for command_name in lipo codesign plutil ditto unzip shasum sips iconutil; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "error: required command is unavailable: $command_name" >&2
     exit 1
@@ -39,8 +39,13 @@ done
 
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_TEMPLATE="$SCRIPT_DIRECTORY/Info.plist"
+ICON_SOURCE="$SCRIPT_DIRECTORY/../../assets/nova-app-icon.png"
 [[ -f "$PLIST_TEMPLATE" ]] || {
   echo "error: missing Info.plist template: $PLIST_TEMPLATE" >&2
+  exit 1
+}
+[[ -s "$ICON_SOURCE" ]] || {
+  echo "error: missing Nova app icon source: $ICON_SOURCE" >&2
   exit 1
 }
 
@@ -48,6 +53,7 @@ mkdir -p "$OUTPUT_DIRECTORY"
 OUTPUT_DIRECTORY="$(cd "$OUTPUT_DIRECTORY" && pwd)"
 APP="$OUTPUT_DIRECTORY/Nova.app"
 APP_BINARY="$APP/Contents/MacOS/nova"
+APP_ICON="$APP/Contents/Resources/Nova.icns"
 ASSET_NAME="nova-v${VERSION}-universal-apple-darwin-development-app.zip"
 ASSET="$OUTPUT_DIRECTORY/$ASSET_NAME"
 
@@ -59,10 +65,40 @@ if [[ "$APP" != */Nova.app || "$APP" == /Nova.app ]]; then
 fi
 rm -rf "$APP"
 rm -f "$ASSET" "$ASSET.sha256"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$SOURCE_BINARY" "$APP_BINARY"
 chmod 0755 "$APP_BINARY"
+
+# Build the standard macOS icon representations from the committed 1024px
+# source. Keep the intermediate iconset outside the bundle so only Nova.icns is
+# sealed into the final app signature and archive.
+ICON_WORK_DIRECTORY="$(mktemp -d "$OUTPUT_DIRECTORY/.nova-icon.XXXXXX")"
+trap 'rm -rf "$ICON_WORK_DIRECTORY"' EXIT
+ICONSET_DIRECTORY="$ICON_WORK_DIRECTORY/Nova.iconset"
+mkdir -p "$ICONSET_DIRECTORY"
+
+while read -r pixel_size icon_name; do
+  sips -z "$pixel_size" "$pixel_size" "$ICON_SOURCE" \
+    --out "$ICONSET_DIRECTORY/$icon_name" >/dev/null
+done <<'ICON_SIZES'
+16 icon_16x16.png
+32 icon_16x16@2x.png
+32 icon_32x32.png
+64 icon_32x32@2x.png
+128 icon_128x128.png
+256 icon_128x128@2x.png
+256 icon_256x256.png
+512 icon_256x256@2x.png
+512 icon_512x512.png
+1024 icon_512x512@2x.png
+ICON_SIZES
+
+iconutil -c icns -o "$APP_ICON" "$ICONSET_DIRECTORY"
+[[ -s "$APP_ICON" ]] || {
+  echo "error: iconutil did not produce a non-empty app icon: $APP_ICON" >&2
+  exit 1
+}
 
 BUNDLE_VERSION="${VERSION%%[-+]*}"
 sed \
@@ -102,6 +138,10 @@ unzip -Z1 "$ASSET" | grep -Fx 'Nova.app/Contents/MacOS/nova' >/dev/null || {
 }
 unzip -Z1 "$ASSET" | grep -Fx 'Nova.app/Contents/Info.plist' >/dev/null || {
   echo "error: archive does not contain Nova.app/Contents/Info.plist" >&2
+  exit 1
+}
+unzip -Z1 "$ASSET" | grep -Fx 'Nova.app/Contents/Resources/Nova.icns' >/dev/null || {
+  echo "error: archive does not contain Nova.app/Contents/Resources/Nova.icns" >&2
   exit 1
 }
 
