@@ -10,6 +10,8 @@
     <string>nova</string>
     <key>CFBundleIdentifier</key>
     <string>com.zenith.nova</string>
+    <key>CFBundleIconFile</key>
+    <string>Nova.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

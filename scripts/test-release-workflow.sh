@@ -13,6 +13,28 @@ bash -n \
   "$ROOT/packaging/macos/package-development-app.sh" \
   "$ROOT/scripts/verify-release-tag.sh"
 
+# Keep the committed master artwork suitable for the largest macOS icon
+# representation without depending on Pillow or ImageMagick in CI.
+python3 - "$ROOT/assets/nova-app-icon.png" <<'PY'
+import pathlib
+import struct
+import sys
+
+icon_path = pathlib.Path(sys.argv[1])
+data = icon_path.read_bytes()
+if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+    raise SystemExit("Nova app icon is not a valid PNG with an IHDR header")
+width, height, bit_depth, color_type = struct.unpack(">IIBB", data[16:26])
+if (width, height) != (1024, 1024):
+    raise SystemExit(f"Nova app icon must be 1024x1024, got {width}x{height}")
+if (bit_depth, color_type) != (8, 6):
+    raise SystemExit(
+        "Nova app icon must be an 8-bit RGBA PNG, "
+        f"got bit depth {bit_depth}, color type {color_type}"
+    )
+print("Nova app icon PNG checks passed")
+PY
+
 python3 - "$WORKFLOW" <<'PY'
 import pathlib
 import subprocess
@@ -273,6 +295,7 @@ MOCK_BIN="$TEST_DIRECTORY/mock-bin"
 APP_OUTPUT="$TEST_DIRECTORY/app-output"
 MOCK_SOURCE="$TEST_DIRECTORY/nova"
 MOCK_CODESIGN_LOG="$TEST_DIRECTORY/codesign.log"
+MOCK_SIPS_LOG="$TEST_DIRECTORY/sips.log"
 mkdir -p "$MOCK_BIN"
 
 printf '%s\n' \
@@ -300,17 +323,38 @@ printf '%s\n' \
   'parent="$(dirname "$source_path")"' \
   'name="$(basename "$source_path")"' \
   '(cd "$parent" && zip -qry "$destination" "$name")' > "$MOCK_BIN/ditto"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[[ $# -eq 6 ]]' \
+  '[[ "$1" == "-z" && "$2" == "$3" && "$5" == "--out" ]]' \
+  '[[ -s "$4" ]]' \
+  'printf "%s %s\n" "$2" "$(basename "$6")" >> "$MOCK_SIPS_LOG"' \
+  'printf "mock png %s\n" "$2" > "$6"' > "$MOCK_BIN/sips"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[[ $# -eq 5 ]]' \
+  '[[ "$1" == "-c" && "$2" == "icns" && "$3" == "-o" ]]' \
+  'output="$4"' \
+  'iconset="$5"' \
+  'for icon_name in icon_16x16.png icon_16x16@2x.png icon_32x32.png icon_32x32@2x.png icon_128x128.png icon_128x128@2x.png icon_256x256.png icon_256x256@2x.png icon_512x512.png icon_512x512@2x.png; do' \
+  '  [[ -s "$iconset/$icon_name" ]]' \
+  'done' \
+  'printf "mock icns\n" > "$output"' > "$MOCK_BIN/iconutil"
 chmod +x "$MOCK_SOURCE" "$MOCK_BIN"/*
 
 PATH="$MOCK_BIN:$PATH" \
 MOCK_NOVA_VERSION="1.2.3-beta.1+build.7" \
 MOCK_CODESIGN_LOG="$MOCK_CODESIGN_LOG" \
+MOCK_SIPS_LOG="$MOCK_SIPS_LOG" \
   "$ROOT/packaging/macos/package-development-app.sh" \
   "$MOCK_SOURCE" 1.2.3-beta.1+build.7 "$APP_OUTPUT" >/dev/null
 
 APP="$APP_OUTPUT/Nova.app"
 ASSET="$APP_OUTPUT/nova-v1.2.3-beta.1+build.7-universal-apple-darwin-development-app.zip"
 [[ -x "$APP/Contents/MacOS/nova" ]]
+[[ -s "$APP/Contents/Resources/Nova.icns" ]]
 python3 - "$APP/Contents/Info.plist" <<'PY'
 import pathlib
 import plistlib
@@ -320,6 +364,7 @@ with pathlib.Path(sys.argv[1]).open("rb") as stream:
     info = plistlib.load(stream)
 expected = {
     "CFBundleExecutable": "nova",
+    "CFBundleIconFile": "Nova.icns",
     "CFBundleIdentifier": "com.zenith.nova",
     "CFBundlePackageType": "APPL",
     "CFBundleShortVersionString": "1.2.3",
@@ -338,6 +383,7 @@ if info.get("NovaReleaseVersion") != "1.2.3-beta.1+build.7":
 PY
 grep -A1 '<key>CFBundleIdentifier</key>' "$APP/Contents/Info.plist" | grep -F '<string>com.zenith.nova</string>' >/dev/null
 grep -A1 '<key>CFBundleExecutable</key>' "$APP/Contents/Info.plist" | grep -F '<string>nova</string>' >/dev/null
+grep -A1 '<key>CFBundleIconFile</key>' "$APP/Contents/Info.plist" | grep -F '<string>Nova.icns</string>' >/dev/null
 grep -A1 '<key>LSMinimumSystemVersion</key>' "$APP/Contents/Info.plist" | grep -F '<string>14.0</string>' >/dev/null
 grep -A1 '<key>LSMultipleInstancesProhibited</key>' "$APP/Contents/Info.plist" | grep -F '<true/>' >/dev/null
 grep -A1 '<key>LSUIElement</key>' "$APP/Contents/Info.plist" | grep -F '<true/>' >/dev/null
@@ -345,6 +391,22 @@ grep -A1 '<key>NSAppleEventsUsageDescription</key>' "$APP/Contents/Info.plist" |
 ! grep -F '@VERSION@' "$APP/Contents/Info.plist" >/dev/null
 [[ -f "$ASSET" && -f "$ASSET.sha256" ]]
 (cd "$APP_OUTPUT" && shasum -a 256 -c "$(basename "$ASSET").sha256" >/dev/null)
+unzip -Z1 "$ASSET" | grep -Fx 'Nova.app/Contents/Resources/Nova.icns' >/dev/null
+[[ "$(unzip -p "$ASSET" 'Nova.app/Contents/Resources/Nova.icns')" == "mock icns" ]]
+
+EXPECTED_SIPS_LOG="$TEST_DIRECTORY/expected-sips.log"
+printf '%s\n' \
+  '16 icon_16x16.png' \
+  '32 icon_16x16@2x.png' \
+  '32 icon_32x32.png' \
+  '64 icon_32x32@2x.png' \
+  '128 icon_128x128.png' \
+  '256 icon_128x128@2x.png' \
+  '256 icon_256x256.png' \
+  '512 icon_256x256@2x.png' \
+  '512 icon_512x512.png' \
+  '1024 icon_512x512@2x.png' > "$EXPECTED_SIPS_LOG"
+diff -u "$EXPECTED_SIPS_LOG" "$MOCK_SIPS_LOG"
 
 CODESIGN_CALL_COUNT="$(wc -l < "$MOCK_CODESIGN_LOG" | tr -d ' ')"
 CODESIGN_CALL_1="$(sed -n '1p' "$MOCK_CODESIGN_LOG")"

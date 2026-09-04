@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
-const popupSource = await readFile(new URL("../popup.js", import.meta.url), "utf8");
+const [popupSource, popupMarkup] = await Promise.all([
+  readFile(new URL("../popup.js", import.meta.url), "utf8"),
+  readFile(new URL("../popup.html", import.meta.url), "utf8"),
+]);
 const ids = [
   "connection",
   "pending",
@@ -58,6 +61,14 @@ async function renderPopup(response) {
   await new Promise((resolve) => setImmediate(resolve));
   return { elements, sent };
 }
+
+test("popup displays the Nova icon instead of the temporary letter mark", () => {
+  assert.match(
+    popupMarkup,
+    /<img class="mark" src="icons\/nova-128\.png" width="38" height="38" alt="" \/>/,
+  );
+  assert.doesNotMatch(popupMarkup, /<span class="mark"[^>]*>\s*N\s*<\/span>/);
+});
 
 test("paired view displays the actual paired origin, never the active tab", async () => {
   const { elements, sent } = await renderPopup({

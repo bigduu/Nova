@@ -19,13 +19,10 @@ header {
 }
 
 .mark {
-  display: grid;
+  display: block;
+  flex: 0 0 38px;
   width: 38px;
   height: 38px;
-  place-items: center;
-  border-radius: 12px;
-  background: #795cff;
-  font-weight: 750;
 }
 
 h1,
