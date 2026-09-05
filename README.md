@@ -198,6 +198,21 @@ host. `NOVA_APP_SOCKET` is for isolated development/tests; when set it disables
 automatic app launch. Unset it for the normal installed-app setup. Unbundled
 `nova` with no arguments still offers the legacy direct stdio mode.
 
+When the app service closes its connection, the CLI connector finishes
+forwarding responses and exits even if the host keeps its stdin pipe open.
+Closing host stdin normally still half-closes the request stream and drains
+the service's final response, including its last buffered bytes. Standard
+stdout backpressure still applies: the host must keep reading responses.
+Reconnect only the Nova MCP server after replacing/restarting the service;
+Bodhi can stay open. No interrupted request is replayed and no replacement
+MCP session is created automatically.
+
+This exit behavior is specific to the terminating CLI connector process.
+Its dedicated runtime is released after forwarding completes, and process
+exit reclaims an outstanding blocking stdin read. It does not make the
+`connect_stdio` library function's stdin cancellable inside a resident or
+embedded runtime.
+
 ### Chrome DevTools MCP sidecar
 
 For routine Chrome page automation and debugging, Nova can launch the official

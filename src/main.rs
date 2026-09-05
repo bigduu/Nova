@@ -201,13 +201,11 @@ fn main() -> Result<()> {
     // return before ANY desktop bootstrap or permission diagnostics: changing
     // the MCP host must not move desktop work back into its TCC chain.
     if cfg!(target_os = "macos") && matches!(cli.command, Some(Commands::Mcp)) {
-        return runtime
-            .block_on(nova::app_service::connect_stdio())
-            .context(
-                "Nova MCP requires the independent Nova.app service. Install Nova.app in \
+        return run_connector(runtime).context(
+            "Nova MCP requires the independent Nova.app service. Install Nova.app in \
              /Applications or ~/Applications and open it once, then reconnect only the \
              Nova MCP server; Bodhi can remain open. Grant desktop permissions to Nova.app",
-            );
+        );
     }
 
     // The connector must remain a pure transport proxy. In particular, do
@@ -216,7 +214,7 @@ fn main() -> Result<()> {
     // connector.
     if cli.connect {
         tracing::info!("Transport: Nova.app private Unix socket");
-        return runtime.block_on(nova::app_service::connect_stdio());
+        return run_connector(runtime);
     }
 
     // LaunchServices invokes an application bundle's main executable without
@@ -376,6 +374,19 @@ fn main() -> Result<()> {
             nova::server::run_stdio().await
         }
     })
+}
+
+/// Only for the pure connector's final return from main. Forwarding has
+/// finished (including successful stdout flush) before this consumes its
+/// dedicated runtime. Tokio's blocking stdin read cannot be cancelled while
+/// the host keeps the pipe open; waiting for it here would hide service EOF.
+/// The process exits immediately after returning this result and the OS
+/// reclaims that remaining read/thread. Never reuse this for a resident server
+/// or an embedded runtime: background shutdown alone does not cancel stdin.
+fn run_connector(runtime: tokio::runtime::Runtime) -> Result<()> {
+    let result = runtime.block_on(nova::app_service::connect_stdio());
+    runtime.shutdown_background();
+    result
 }
 
 /// Desktop servers remain live while macOS delivers application inventory
