@@ -98,6 +98,10 @@ impl Connector {
 
     fn finish(&mut self) -> std::process::ExitStatus {
         drop(self.input.take());
+        self.wait_for_exit()
+    }
+
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + DEADLINE;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -173,7 +177,7 @@ mod unix {
     }
 
     struct TestService {
-        fixture: Fixture,
+        fixture: Arc<Fixture>,
         accepted: Arc<AtomicUsize>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -181,7 +185,10 @@ mod unix {
 
     impl TestService {
         fn start() -> Self {
-            let fixture = Fixture::new();
+            Self::start_at(Arc::new(Fixture::new()))
+        }
+
+        fn start_at(fixture: Arc<Fixture>) -> Self {
             let listener = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
             std::fs::set_permissions(fixture.socket(), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
@@ -236,6 +243,195 @@ mod unix {
         connector.handshake_and_ping();
         assert!(connector.finish().success());
         assert_eq!(service.accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn service_eof_exits_while_host_stdin_stays_open() {
+        let modes: &[&[&str]] = &[
+            &["--connect"],
+            #[cfg(target_os = "macos")]
+            &["mcp"],
+        ];
+        for arguments in modes {
+            let service = TestService::start();
+            let mut connector = Connector::spawn(arguments, &service.fixture.socket());
+            connector.handshake_and_ping();
+            drop(service);
+            assert!(connector.wait_for_exit().success());
+            assert!(
+                connector.input.is_some(),
+                "host stdin must remain open throughout EOF"
+            );
+        }
+    }
+
+    fn accept_connector(
+        listener: &std::os::unix::net::UnixListener,
+    ) -> std::os::unix::net::UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(DEADLINE)).unwrap();
+                    stream.set_write_timeout(Some(DEADLINE)).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "connector did not connect");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept test-owned connection: {error}"),
+            }
+        }
+    }
+
+    fn raw_listener(fixture: &Fixture) -> std::os::unix::net::UnixListener {
+        let listener = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+        std::fs::set_permissions(fixture.socket(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
+    #[test]
+    fn service_disconnect_exits_during_backpressured_upload() {
+        let fixture = Fixture::new();
+        let listener = raw_listener(&fixture);
+        let mut connector = Connector::spawn(&["--connect"], &fixture.socket());
+        let stream = accept_connector(&listener);
+        // The fixture intentionally does not read requests, so both the Unix
+        // socket and the host's input pipe eventually exert backpressure.
+        let uploaded = Arc::new(AtomicUsize::new(0));
+        let count = uploaded.clone();
+        let mut input = connector.input.take().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let chunk = [b'x'; 16 * 1024];
+            let result = (|| {
+                for _ in 0..4096 {
+                    input.write_all(&chunk)?;
+                    count.fetch_add(chunk.len(), Ordering::SeqCst);
+                }
+                Ok::<(), std::io::Error>(())
+            })();
+            let _ = done_tx.send(result);
+            // Keep the host's write end alive until the process-exit check;
+            // closing it must not be what releases the connector's stdin read.
+            let _ = release_rx.recv_timeout(DEADLINE);
+            drop(input);
+        });
+        let deadline = Instant::now() + DEADLINE;
+        while uploaded.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "upload did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut previous = uploaded.load(Ordering::SeqCst);
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let current = uploaded.load(Ordering::SeqCst);
+            if current == previous {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "upload never encountered backpressure"
+            );
+            previous = current;
+        }
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(stream);
+        // A reset may be reported as an I/O error; the contract is prompt
+        // process exit, not success after undeliverable request bytes.
+        connector.wait_for_exit();
+        assert!(done_rx.recv_timeout(DEADLINE).unwrap().is_err());
+        let _ = release_tx.send(());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn final_responses_are_drained_on_client_or_service_eof() {
+        for client_eof in [true, false] {
+            assert_final_response(client_eof);
+        }
+    }
+
+    fn assert_final_response(client_eof: bool) {
+        use std::io::Read;
+        let fixture = Fixture::new();
+        let listener = raw_listener(&fixture);
+        let mut connector = Connector::spawn(&["--connect"], &fixture.socket());
+        let mut stream = accept_connector(&listener);
+        let request = json!({"jsonrpc":"2.0", "id":41, "method":"fixture", "params":{"text":"q".repeat(96 * 1024)}});
+        let expected_request = format!("{request}\n");
+        let response = json!({"jsonrpc":"2.0", "id":41, "result":"r".repeat(128 * 1024)});
+        let expected_response = response.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = String::new();
+            if client_eof {
+                stream.read_to_string(&mut requests).unwrap();
+            } else {
+                BufReader::new(&mut stream)
+                    .read_line(&mut requests)
+                    .unwrap();
+            }
+            assert_eq!(
+                requests, expected_request,
+                "request bytes must be forwarded exactly once"
+            );
+            writeln!(stream, "{response}").unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({"jsonrpc":"2.0", "id":42, "result":"final tail"})
+            )
+            .unwrap();
+        });
+        connector.send(request);
+        let status = if client_eof {
+            connector.finish()
+        } else {
+            connector.wait_for_exit()
+        };
+        assert!(status.success());
+        assert_eq!(connector.input.is_some(), !client_eof);
+        assert_eq!(connector.response(41), expected_response);
+        assert_eq!(connector.response(42)["result"], "final tail");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fresh_connector_reconnects_after_only_fixture_service_is_replaced() {
+        let fixture = Arc::new(Fixture::new());
+        let service = TestService::start_at(fixture.clone());
+        let mut old_connector = Connector::spawn(&["--connect"], &fixture.socket());
+        old_connector.handshake_and_ping();
+        drop(service);
+        assert!(old_connector.wait_for_exit().success());
+        assert!(old_connector.input.is_some());
+        std::fs::remove_file(fixture.socket()).unwrap();
+        let replacement = TestService::start_at(fixture.clone());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            replacement.accepted.load(Ordering::SeqCst),
+            0,
+            "no automatic session or replay"
+        );
+        let mut fresh_connector = Connector::spawn(&["--connect"], &fixture.socket());
+        assert_ne!(old_connector.child.id(), fresh_connector.child.id());
+        fresh_connector.handshake_and_ping();
+        assert_eq!(replacement.accepted.load(Ordering::SeqCst), 1);
+        assert!(fresh_connector.finish().success());
+    }
+
+    #[test]
+    fn unavailable_explicit_connector_exits_without_waiting_for_stdin() {
+        let fixture = Fixture::new();
+        let mut connector = Connector::spawn(&["--connect"], &fixture.socket());
+        assert!(!connector.wait_for_exit().success());
+        assert!(connector.input.is_some());
+        assert!(connector.output.try_iter().next().is_none());
     }
 
     #[cfg(target_os = "macos")]
