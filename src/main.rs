@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -147,6 +147,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Start the managed MCP transport. On macOS, connect to the independent
+    /// Nova.app (install it separately); on Windows/Linux, serve over stdio.
+    Mcp,
+
     /// Run the pinned official Chrome DevTools MCP server over transparent
     /// stdio, with Nova's privacy-oriented defaults.
     ///
@@ -187,6 +191,17 @@ async fn main() -> Result<()> {
     // responsible-process and TCC attribution for the processes involved.
     if let Some(Commands::ChromeDevtools(options)) = cli.command.as_ref() {
         return nova::chrome_devtools::run(options);
+    }
+
+    // Managed clients share one cross-platform command. On macOS this must
+    // return before ANY desktop bootstrap or permission diagnostics: changing
+    // the MCP host must not move desktop work back into its TCC chain.
+    if cfg!(target_os = "macos") && matches!(cli.command, Some(Commands::Mcp)) {
+        return nova::app_service::connect_stdio().await.context(
+            "Nova MCP requires the independent Nova.app service. Install Nova.app in \
+             /Applications or ~/Applications and open it once, then reconnect only the \
+             Nova MCP server; Bodhi can remain open. Grant desktop permissions to Nova.app",
+        );
     }
 
     // The connector must remain a pure transport proxy. In particular, do
@@ -967,4 +982,48 @@ fn run_capture_probe(_app: &str) -> Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn log_platform_permissions() {
     tracing::info!("{}", HEADLESS_DIAG);
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn managed_mcp_is_an_explicit_subcommand() {
+        let cli = Cli::try_parse_from(["nova", "mcp"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Mcp)));
+        assert!(!cli.http && !cli.connect && !cli.app_service);
+    }
+
+    #[test]
+    fn managed_mcp_rejects_other_transport_and_desktop_modes() {
+        for arguments in [
+            vec!["nova", "--http", "mcp"],
+            vec!["nova", "--connect", "mcp"],
+            vec!["nova", "--app-service", "mcp"],
+            vec!["nova", "--capture-daemon", "mcp"],
+            vec!["nova", "--selftest", "mcp"],
+            vec!["nova", "mcp", "--http"],
+            vec!["nova", "mcp", "--connect"],
+            vec!["nova", "mcp", "--capture-daemon"],
+            vec!["nova", "mcp", "chrome-devtools"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn existing_cli_modes_keep_their_meaning() {
+        assert!(Cli::try_parse_from(["nova"]).unwrap().command.is_none());
+        assert!(Cli::try_parse_from(["nova", "--connect"]).unwrap().connect);
+        let http = Cli::try_parse_from(["nova", "--http", "--addr", "127.0.0.1:3210"]).unwrap();
+        assert!(http.http);
+        assert_eq!(http.addr, "127.0.0.1:3210");
+        assert!(matches!(
+            Cli::try_parse_from(["nova", "chrome-devtools"])
+                .unwrap()
+                .command,
+            Some(Commands::ChromeDevtools(_))
+        ));
+    }
 }

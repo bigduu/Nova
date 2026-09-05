@@ -2,7 +2,7 @@
   "id": "nova",
   "name": "Nova Desktop Automation",
   "version": "0.0.0",
-  "description": "Nova is an AX-first Computer Use MCP server for macOS and Windows: semantic Accessibility/UIA reads and actions, mouse/keyboard, focused screenshots, and OCR fallbacks. On macOS, Accessibility is sufficient for ax_read; Screen Recording is only needed for capture/OCR. Grants commonly attach to the launching Bamboo process; see README.md for details.",
+  "description": "Nova is an AX-first Computer Use MCP server for macOS and Windows: semantic Accessibility/UIA reads and actions, mouse/keyboard, focused screenshots, and OCR fallbacks. On macOS, install Nova.app separately and grant desktop permissions to Nova; the plugin connects to its independent service. Windows uses the packaged stdio server. See README.md for setup.",
   "platforms": [
     "macos",
     "windows"
@@ -16,7 +16,7 @@
         "transport": {
           "type": "stdio",
           "command": "${platform_bin}",
-          "args": []
+          "args": ["mcp"]
         }
       },
       {
