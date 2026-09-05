@@ -28,6 +28,7 @@ stdio or Streamable HTTP.
 | `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
 | `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
+| `inspect_app` | Optional macOS app capability discovery. Accepts an app name/bundle ID, or discovers running Chromium candidates when omitted; no caller-supplied port or permission prompt. |
 | `read_clipboard` / `write_clipboard` | Clipboard access. |
 | `ax_click` / `ax_set_value` / `ax_focus` | Drive controls by Accessibility role/label. |
 | `dump_ax` | Read the raw AX/UIA tree for diagnostics and coverage debugging. |
@@ -310,6 +311,77 @@ use the pixel space of the most recent screenshot; `cursor_position` instead
 reports OS-global logical coordinates.
 
 ## Permissions & code signing (macOS)
+
+### Inspect an application's interaction options
+
+Use `inspect_app` when setting up an application or checking which interaction
+route is available. It is optional; ordinary native interaction still starts
+with `ax_read`.
+
+```json
+{"app": "Slack"}
+```
+
+The selector accepts a running application's name or bundle identifier. Exact
+matches take priority over partial matches. Omit `app` to discover running
+Electron, Chromium, and CEF candidates, including applications with no discovered
+debugging connection. Names alone do not confirm a runtime: Nova checks known
+framework containers and their executable evidence. Unknown or unreadable
+bundles remain unknown.
+
+The default result contains application identity, runtime, inspection status,
+the currently available native route, and a next step. Nova finds process-owned
+local connection candidates internally; callers do not need to find or supply
+ports. For diagnostics only, use:
+
+```json
+{"app": "com.example.application", "details": true}
+```
+
+Detailed output includes bundle/runtime evidence, process start identities,
+endpoint provenance, and metadata verification. Nova checks the selected app's
+owned listeners, recognized debugging flags, and the exact `DevToolsActivePort`
+file only when a `--user-data-dir` flag evidences the profile location. It does
+not scan profile contents or return full arguments/environment. Programmatically
+enabled ports can be discovered through listener ownership even when a flag is
+absent from the OS argument list.
+
+`browser_endpoint_available` means a metadata-only browser handshake succeeded;
+it does **not** attach browser tools, grant authorization, or verify the full
+Chrome DevTools MCP toolset. Native `ax_read` still uses Accessibility, and the
+result reports when that permission is needed. Node inspector endpoints,
+incompatible endpoints, stale evidence, and incomplete inspection remain
+distinct. No discovered port is not proof that debugging is disabled. Enablement
+and whether a particular application can support a restart-based change remain
+unknown until verified for that application.
+
+Discovery does not launch, focus, quit, or restart applications, request
+permissions, modify bundles/arguments, or open a debugging service. Network
+requests stay on verified process-owned loopback sockets: `/json/version`,
+`Browser.getVersion`, and `Target.getBrowserContexts` only. There is no page
+enumeration, script evaluation, input, or `Browser.close`. HTTP proxies and
+redirects are disabled; advertised WebSockets must keep the same owned address
+and port. Ownership/start identity is checked before and after probing.
+
+An investigation allows 8 seconds overall, 16 result apps, 32 processes per app,
+4 helper generations, 8 endpoint probes per app, and 2 evidenced profiles. Each
+metadata probe has a 900 ms deadline; HTTP bodies and WebSocket messages are
+limited to 32 KiB, the WebSocket exchange to 128 KiB and 16 frames per reply.
+Framework lookup is limited to 64 entries in an app's `Contents/Frameworks`,
+plus at most four version directories in each recognized framework. Limits
+or unavailable evidence are reported as incomplete, rather than silently
+claiming that an application has no debugging support. Concurrent calls receive
+a busy result. Windows/Linux return an explicit unsupported result; their
+existing native tools are unchanged.
+
+The automated tests use fake bundles, process records, and loopback services.
+The ignored `own_listener_and_process_start_identity_match` test inspects only
+its own process/listener. The ignored `e2e_app_inspection` acceptance test requires
+an explicitly prepared app with a `dev.nova.acceptance.*` bundle identifier and
+`NOVA_TEST_APP_BUNDLE_ID`; it never defaults to inspecting the user's running
+applications.
+
+### Permission ownership
 
 The independent app transport is the preferred permission model: grant
 **Screen Recording** and **Accessibility** to `Nova.app`, then use

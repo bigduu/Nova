@@ -6,6 +6,7 @@
 //! submodule below implements exactly one `crate::platform` trait for one
 //! subsystem.
 
+pub(crate) mod app_inspection;
 pub mod capture;
 pub mod clipboard;
 pub mod elements;
