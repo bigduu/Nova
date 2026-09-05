@@ -160,8 +160,7 @@ enum Commands {
     ChromeDevtools(nova::chrome_devtools::ChromeDevtoolsArgs),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Init logging — MUST go to stderr. In stdio transport, stdout is the
     // JSON-RPC channel; any log line written there corrupts the protocol stream
     // and makes clients (e.g. when RUST_LOG is set) hang waiting for a response.
@@ -193,15 +192,22 @@ async fn main() -> Result<()> {
         return nova::chrome_devtools::run(options);
     }
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create Nova async runtime")?;
+
     // Managed clients share one cross-platform command. On macOS this must
     // return before ANY desktop bootstrap or permission diagnostics: changing
     // the MCP host must not move desktop work back into its TCC chain.
     if cfg!(target_os = "macos") && matches!(cli.command, Some(Commands::Mcp)) {
-        return nova::app_service::connect_stdio().await.context(
-            "Nova MCP requires the independent Nova.app service. Install Nova.app in \
+        return runtime
+            .block_on(nova::app_service::connect_stdio())
+            .context(
+                "Nova MCP requires the independent Nova.app service. Install Nova.app in \
              /Applications or ~/Applications and open it once, then reconnect only the \
              Nova MCP server; Bodhi can remain open. Grant desktop permissions to Nova.app",
-        );
+            );
     }
 
     // The connector must remain a pure transport proxy. In particular, do
@@ -210,7 +216,7 @@ async fn main() -> Result<()> {
     // connector.
     if cli.connect {
         tracing::info!("Transport: Nova.app private Unix socket");
-        return nova::app_service::connect_stdio().await;
+        return runtime.block_on(nova::app_service::connect_stdio());
     }
 
     // LaunchServices invokes an application bundle's main executable without
@@ -257,15 +263,15 @@ async fn main() -> Result<()> {
         // app-service listener then creates an independent MCP session for
         // every authenticated same-UID connector.
         log_platform_permissions();
-        return nova::app_service::run().await;
+        return run_desktop_service(&runtime, nova::app_service::run());
     }
 
     if cli.selftest_direct {
-        run_selftest_direct().await;
+        runtime.block_on(run_selftest_direct());
     }
 
     if cli.selftest {
-        return run_selftest().await;
+        return runtime.block_on(run_selftest());
     }
 
     // ── DEBUG CLI subcommands (no MCP) ──────────────────────────────
@@ -363,10 +369,28 @@ async fn main() -> Result<()> {
     // Per-OS permission/capability diagnostics, logged once before serving.
     log_platform_permissions();
 
-    if cli.http {
-        nova::server::run_http(&cli.addr).await
-    } else {
-        nova::server::run_stdio().await
+    run_desktop_service(&runtime, async move {
+        if cli.http {
+            nova::server::run_http(&cli.addr).await
+        } else {
+            nova::server::run_stdio().await
+        }
+    })
+}
+
+/// Desktop servers remain live while macOS delivers application inventory
+/// changes on its main run loop. Pure connectors never enter this path.
+fn run_desktop_service(
+    runtime: &tokio::runtime::Runtime,
+    service: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        nova::platform::mac::event_loop::run(runtime, service)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime.block_on(service)
     }
 }
 

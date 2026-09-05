@@ -374,12 +374,30 @@ claiming that an application has no debugging support. Concurrent calls receive
 a busy result. Windows/Linux return an explicit unsupported result; their
 existing native tools are unchanged.
 
+On macOS, resident desktop transports keep the process main run loop active,
+so applications launched or quit after the first inspection appear or disappear
+without restarting Nova or its MCP host. Relaunching an application triggers
+fresh process/start-time and endpoint ownership checks. This inventory refresh
+does not require Screen Recording or Accessibility permission. The `mcp` and
+`--connect` byte proxies return before this desktop event loop and bootstrap.
+
 The automated tests use fake bundles, process records, and loopback services.
 The ignored `own_listener_and_process_start_identity_match` test inspects only
 its own process/listener. The ignored `e2e_app_inspection` acceptance test requires
 an explicitly prepared app with a `dev.nova.acceptance.*` bundle identifier and
 `NOVA_TEST_APP_BUNDLE_ID`; it never defaults to inspecting the user's running
 applications.
+
+`cargo test --test e2e_resident_app_inspection` runs a separate macOS regression
+whose test binary owns the real process main thread. In one resident process it
+seeds discovery, launches a unique temporary AppKit app, checks appearance,
+quits it, checks disappearance, and checks a new process identity on relaunch.
+It repeats this with an internally allocated random listener that simulates
+the narrow CDP handshake; the fixture is not Chromium and is reported as an
+unknown runtime. It creates no windows and requests no permissions. Real
+Electron/Chromium lifecycle acceptance remains a separate check. The test-only
+`--without-main-loop` argument is a negative control that reproduces the old
+stale-inventory failure; it is expected to fail.
 
 ### Permission ownership
 

@@ -10,6 +10,7 @@ pub(crate) mod app_inspection;
 pub mod capture;
 pub mod clipboard;
 pub mod elements;
+pub mod event_loop;
 pub mod geometry;
 pub mod input;
 pub mod ocr;

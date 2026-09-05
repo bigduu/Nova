@@ -12,6 +12,16 @@ categories = ["command-line-utilities", "os::macos-apis"]
 name = "nova"
 path = "src/main.rs"
 
+# libtest runs #[test] bodies on worker threads. This regression must own the
+# real process main thread to exercise AppKit notification delivery.
+[[test]]
+name = "e2e_resident_app_inspection"
+path = "tests/e2e_resident_app_inspection.rs"
+harness = false
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
+
 [dependencies]
 # MCP protocol
 rmcp = { version = "1.7", features = ["server", "transport-io", "transport-async-rw", "transport-streamable-http-server", "macros"] }
