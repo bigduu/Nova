@@ -1787,6 +1787,17 @@ pub struct ReadUiParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InspectAppParams {
+    /// Running application name or bundle identifier. Omit to discover Chromium apps.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Include bounded technical diagnostics. Default output is a concise summary.
+    #[serde(default)]
+    pub details: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ChromeReadParams {
     /// Maximum semantic nodes returned by the extension (default 500, hard
     /// capped by the content script at 1000).
@@ -2601,6 +2612,49 @@ impl NovaServer {
     }
 
     #[tool(
+        name = "inspect_app",
+        description = "Inspect a running macOS application's interaction options, or discover running Chromium applications when app is omitted. Returns a concise identity, status, native route and next step; details=true adds diagnostics. Read-only: no app launch, focus, permission request, page content, or browser attachment. Use optionally for setup/discovery; ordinary native interaction still starts with ax_read."
+    )]
+    #[tracing::instrument(skip_all, level = "info")]
+    async fn inspect_app(
+        &self,
+        Parameters(p): Parameters<InspectAppParams>,
+    ) -> rmcp::model::CallToolResult {
+        if p.app
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 256 || s.contains('\0'))
+        {
+            return err_result(
+                "app must be a non-empty application name or bundle identifier of at most 256 bytes; omit app to discover running Chromium candidates",
+            );
+        }
+        static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let Ok(permit) = SLOT.try_acquire() else {
+            return err_result("Application inspection is running; retry shortly.");
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::app_inspection::inspect(p.app.as_deref(), p.details)
+        });
+        match tokio::time::timeout(
+            crate::app_inspection::TOTAL_BUDGET + std::time::Duration::from_secs(1),
+            task,
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
+                ok_text(serde_json::to_string(&result).expect("inspection is serializable"))
+            }
+            Ok(Err(_)) => err_result(
+                "Application inspection could not finish; retry with one exact application.",
+            ),
+            Err(_) => err_result(
+                "Application inspection exceeded its deadline; retry with one exact application.",
+            ),
+        }
+    }
+
+    #[tool(
         name = "chrome_status",
         description = "Report whether Nova.app's Chrome Native Messaging host is connected and whether one exact top-level document is currently paired. Call this before Chrome semantic work; it never inspects page content."
     )]
@@ -2808,6 +2862,31 @@ pub async fn run_http(addr: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn app_inspection_parameters_are_optional_and_reject_typos() {
+        let params: InspectAppParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(params.app.is_none());
+        assert!(!params.details);
+        assert!(serde_json::from_value::<InspectAppParams>(
+            serde_json::json!({"application": "Slack"})
+        )
+        .is_err());
+        assert!(
+            serde_json::from_value::<InspectAppParams>(serde_json::json!({"port": 9222})).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_inspection_rejects_blank_selector_without_discovery() {
+        let result = NovaServer::new()
+            .inspect_app(Parameters(InspectAppParams {
+                app: Some("  ".into()),
+                details: false,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+    }
+
     /// Every tool the agent depends on must be registered. This is a hermetic
     /// check (no system APIs) that guards against a handler being renamed,
     /// dropped, or a new one being added without updating the contract.
@@ -2828,6 +2907,7 @@ mod tests {
             "cursor_position",
             "list_windows",
             "list_applications",
+            "inspect_app",
             "open_application",
             "read_clipboard",
             "write_clipboard",

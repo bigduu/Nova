@@ -183,3 +183,6 @@ jobs:
 
       - name: Stdio handshake smoke test (headless build)
         run: cargo test --test e2e_stdio --test e2e_managed_mcp --verbose
+
+      - name: Application discovery fixture contracts (headless build)
+        run: cargo test --lib app_inspection --verbose
