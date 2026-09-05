@@ -227,8 +227,14 @@ if transport != {
 desktop = servers.get("nova")
 if desktop is None or desktop.get("enabled") is not True:
     raise SystemExit("the primary Nova desktop server must remain enabled")
+if desktop.get("transport") != {
+    "type": "stdio",
+    "command": "${platform_bin}",
+    "args": ["mcp"],
+}:
+    raise SystemExit("the primary Nova server must use the managed cross-platform mcp entrypoint")
 
-print("Bamboo Chrome DevTools opt-in launcher contract checks passed")
+print("Bamboo managed MCP and Chrome DevTools opt-in launcher contract checks passed")
 PY
 
 TEST_DIRECTORY="$(mktemp -d)"

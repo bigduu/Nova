@@ -32,6 +32,11 @@ The `nova` binary itself is **not** in this bundle. `plugin.json`'s
 GitHub Releases (built by `.github/workflows/release.yml`); the installer
 downloads, sha256-verifies, and unpacks the one matching your OS.
 
+The enabled desktop server runs `nova mcp`. On macOS this binary is only a
+connector to the separately installed **Nova.app**; on Windows it runs the
+ordinary stdio server. The optional Chrome DevTools server keeps its separate
+`chrome-devtools` entrypoint.
+
 ## Optional Chrome DevTools server
 
 `nova-chrome-devtools` runs `nova chrome-devtools`, which transparently
@@ -77,6 +82,24 @@ checksums of that release's archives by
 `packaging/plugin/generate-manifest.sh` at tag time.
 
 ## Installing
+
+On macOS, first install the matching Nova.app development preview independently
+of Bodhi and this plugin, at `/Applications/Nova.app` or
+`~/Applications/Nova.app`, and open it once. See
+[Nova.app installation](https://github.com/bigduu/Nova#novaapp-development-preview)
+for checksum verification and installation. The app archive is
+`nova-v<version>-universal-apple-darwin-development-app.zip`; the plugin installer
+downloads the CLI archive only and does **not** install or update the app.
+Keep the app outside Bodhi.app and the plugin directory so a Bodhi/plugin update
+does not replace Nova's permission-bearing application.
+
+Use a plugin, CLI, and app from the same current version. `v0.2.1` predates both
+the managed `mcp` command and the app package; the current source/development
+preview is needed until a release containing them is published. These plugin
+defaults apply to the next release containing this change, and do not modify
+an already installed `v0.2.1` plugin. An unavailable app causes a clear
+connection error, with no fallback to running desktop tools inside Bamboo/Bodhi.
+Windows needs no separate Nova.app installation.
 
 A URL install is verified against the bundle's checksum by default — grab the
 `.sha256` published next to the bundle on the release page and pass it:
@@ -132,29 +155,33 @@ Nova needs two TCC-gated macOS permissions:
 - **Screen Recording** — for `screenshot`, `ocr`, `list_windows`.
 - **Accessibility** — for `ax_read`, semantic activation, and input.
 
-`ax_read` does not require Screen Recording. Grant Screen Recording only when
-the workflow reaches capture/OCR.
+`ax_read` does not require Screen Recording. The current app preview can
+request Screen Recording when it starts; granting it is needed for the capture
+tools above. A future permission UI can make that request more contextual.
 
-Nova runs as an unbundled subprocess of bamboo (stdio MCP transport), so the
-permission prompt and grant attach to the **launching process — Bamboo**,
-not to this plugin's `nova` binary. The plugin system has no post-install
-hook to request this today, so:
+Grant these permissions to **Nova.app**, which runs independently through macOS
+LaunchServices. The plugin's `nova mcp` process only forwards MCP bytes; it does
+not initialize desktop APIs or request permissions in Bamboo/Bodhi's process
+chain.
 
-1. The first time a nova tool actually needs the permission, macOS should
-   prompt. Grant it, then retry the tool call.
-2. If the prompt never appears, or capture keeps failing/returning empty,
-   add Bamboo manually: **System Settings → Privacy & Security → Screen
-   Recording** (and **Accessibility**) → `+` → find Bamboo (or ⌘⇧G to enter
-   its path) → enable it. A headless/backgrounded subprocess often can't
-   trigger the prompt on its own.
-3. If granting Bamboo still doesn't help, add the `nova` binary itself as a
-   fallback: it lives at `bin/macos/nova` inside this plugin's install
-   directory (`~/.bamboo/plugins/nova/bin/macos/nova`) once installed —
-   add that path the same way.
-4. The grant is keyed to Bamboo's **code-signing identity**, not just "the
-   app." If Bamboo is rebuilt/re-signed (dev builds, ad-hoc/unsigned) the
-   grant can silently stop persisting — if permissions mysteriously stop
-   working after updating Bamboo, re-grant it.
+1. Open **System Settings → Privacy & Security → Accessibility**, add the
+   installed Nova.app if needed, and enable it. Do the same under **Screen
+   Recording** when using capture tools.
+2. Retry the Nova tool. If macOS requires the application to restart, quit and
+   reopen **Nova.app**, then reconnect/reload only the **Nova MCP server** in
+   the client. **Bodhi's main window can stay open.** Interrupted MCP requests
+   are not replayed automatically.
+3. If the app cannot be found, check its installation path and open it once.
+   Remove a development `NOVA_APP_SOCKET` override for normal use; an override
+   deliberately disables automatic app launch. Do not switch the plugin back
+   to empty arguments or grant permissions to the plugin connector as a repair.
+
+Upgrading only Bodhi or the plugin leaves the independently installed Nova.app
+as the desktop permission subject. This change establishes that process
+boundary; real signed-upgrade/TCC acceptance remains release work. The app
+preview is ad-hoc signed, not notarized: replacing or re-signing Nova.app itself
+can still require granting permissions again. Developer ID signing and stable
+Nova updates are separate prerequisites for a production upgrade experience.
 
 Windows currently ships no Nova-side automation permission model equivalent
 to macOS TCC; the Windows binary is otherwise unsigned (no Authenticode

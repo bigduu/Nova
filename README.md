@@ -51,14 +51,16 @@ stdio or Streamable HTTP.
   activation, and input.
 
 > macOS grants these permissions to the process it identifies as responsible
-> for Nova. For stdio/plugin use that is usually the host app or terminal; for a
-> directly launched Nova process it can be the binary itself. See
+> for Nova. The managed `nova mcp` entrypoint and Bamboo plugin use the independent
+> Nova.app on macOS. Legacy direct stdio/HTTP can use the host app, terminal, or
+> directly launched binary as the permission subject. See
 > [Permissions & code signing](#permissions--code-signing-macos).
 
 ## Run
 
 ```sh
 cargo run                      # stdio transport (default)
+cargo run -- mcp                # managed MCP: Nova.app on macOS, stdio elsewhere
 cargo run -- --http            # Streamable HTTP on 127.0.0.1:3100
 cargo run -- --http --addr 127.0.0.1:8080
 ```
@@ -94,9 +96,9 @@ On Windows, extract the archive for the machine's architecture and invoke
 not Authenticode-signed, so SmartScreen may warn on first run.
 
 > `v0.2.1` predates the current AX-first tools (`ax_read`, `read_ui`, and
-> `ax_activate`). Its archives provide the earlier screenshot/mark/input tool
-> set. Build the current source below when using the AX-first workflow in this
-> README; do not expect those tool names from the `v0.2.1` binaries.
+> `ax_activate`), the managed `mcp` command, and Nova.app. Its archives provide
+> the earlier screenshot/mark/input tool set. Build the current source below
+> when using this workflow; those features are not in the `v0.2.1` binaries.
 
 To build from source:
 
@@ -128,8 +130,18 @@ ditto Nova.app /Applications/Nova.app
 open -gj -b com.zenith.nova
 ```
 
-Configure a stdio MCP client with the bundled executable and `--connect`, as
-shown in [Use it from an MCP client](#use-it-from-an-mcp-client) below.
+Install the app independently of Bodhi and the plugin's downloaded CLI. Keep it
+at `/Applications/Nova.app` (or `~/Applications/Nova.app`), outside Bodhi.app and
+the plugin directory. The plugin still downloads the CLI archive and uses it
+only as the connector on macOS; installing/updating the plugin does not install
+or update Nova.app. Use a CLI and app built from the same current version.
+
+Configure a stdio MCP client with `nova mcp`, as shown in
+[Use it from an MCP client](#use-it-from-an-mcp-client) below. If no app archive
+has been published for the current code, build both macOS architectures,
+combine them into a universal binary, then assemble the app with
+[`package-development-app.sh`](packaging/macos/package-development-app.sh),
+which requires a universal binary and the matching Cargo version as arguments.
 
 > [!WARNING]
 > The app archive is **DEVELOPMENT ONLY**. It is ad-hoc signed, not Developer ID
@@ -148,31 +160,42 @@ config. Claude Desktop uses
 ```json
 {
   "mcpServers": {
-    "nova": { "command": "/absolute/path/to/nova" }
+    "nova": { "command": "/absolute/path/to/nova", "args": ["mcp"] }
   }
 }
 ```
 
-On macOS, the recommended setup is the independent `Nova.app`. Put the app in
-`/Applications`, open it once, grant **Screen Recording** and **Accessibility**
-to Nova, and configure the bundled executable as a connector:
+`mcp` is the cross-platform managed entrypoint used by the Bamboo plugin.
+Windows and Linux headless builds serve ordinary stdio MCP. On macOS it only
+connects to the independent Nova.app, launching it through LaunchServices when
+needed. Install the app separately, open it once, and grant **Accessibility** to
+Nova; **Screen Recording** is needed for capture, OCR, and `list_windows` (the
+current preview may request it on app startup). The bundled executable can also
+be used as the connector:
 
 ```json
 {
   "mcpServers": {
     "nova": {
       "command": "/Applications/Nova.app/Contents/MacOS/nova",
-      "args": ["--connect"]
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-`--connect` carries MCP bytes over a private per-user Unix socket and starts the
-app through LaunchServices when necessary. It does not call desktop APIs itself;
+The explicit `--connect` command remains supported and uses the same transport
+as macOS `mcp`. It carries MCP bytes over a private per-user Unix socket. The
+connector does not call desktop APIs or request macOS permissions;
 the app process owns the MCP handlers and TCC responsibility. The socket lives
 under `/tmp/nova-app-<uid>/` with a mode-0700 directory, mode-0600 socket, and a
 same-UID peer check.
+
+If Nova.app is unavailable, the managed command exits with installation and
+reconnection guidance. It never falls back to desktop operations inside the MCP
+host. `NOVA_APP_SOCKET` is for isolated development/tests; when set it disables
+automatic app launch. Unset it for the normal installed-app setup. Unbundled
+`nova` with no arguments still offers the legacy direct stdio mode.
 
 ### Chrome DevTools MCP sidecar
 
@@ -260,7 +283,8 @@ output. On Windows, use an escaped executable path such as
 AX-first workflow below. If its directory is already on `PATH`, the command can
 be `"nova"`.
 
-Restart the client; the Nova tools then appear to the agent. See
+Reconnect/reload the Nova MCP server in the client; Bodhi's main window can stay
+open. See
 [Permissions & code signing](#permissions--code-signing-macos) for legacy
 direct-stdio and development-binary cases.
 
@@ -289,16 +313,31 @@ reports OS-global logical coordinates.
 
 The independent app transport is the preferred permission model: grant
 **Screen Recording** and **Accessibility** to `Nova.app`, then use
-`nova --connect`. The connector never initializes CoreGraphics or
-Accessibility, so Bamboo, Claude Desktop, and terminals no longer need Nova's
-desktop permissions.
+`nova mcp` (or explicit `nova --connect`). The connector never initializes
+CoreGraphics or Accessibility, so Bamboo, Claude Desktop, and terminals no
+longer need Nova's desktop permissions.
+
+Keep Nova.app installed independently and unchanged when upgrading Bodhi. The
+new Bodhi/plugin connector connects to the same app-owned service, so its own
+build/signing identity does not become Nova's permission subject. This is an
+architectural guarantee about where desktop calls execute; signed installation
+and real TCC upgrade acceptance remain separate release gates. Replacing Nova.app
+itself, changing its signature, or an OS permission decision can still require
+granting permissions again. The development preview is ad-hoc signed.
+
+After granting Nova permissions in System Settings, retry the tool. If macOS
+requires a restart for the change, quit/reopen **Nova.app**, then reconnect only
+the **Nova MCP server** in the client. Keep Bodhi's main window open. The
+connector does not replay interrupted requests or automatically restore an MCP
+session after Nova exits. Do not remove/re-add Bodhi's grants to repair this
+managed Nova path.
 
 Two details still matter for direct stdio/HTTP and source-development modes:
 
 **Grant the responsible process for the way Nova is launched.** macOS TCC may
-attribute a child process to its responsible parent app. For stdio MCP or the
-Bamboo plugin, grant Claude Desktop, Bamboo, or the terminal/IDE that launches
-Nova. For a directly launched CLI/HTTP process, macOS may instead use the Nova
+attribute a child process to its responsible parent app. For legacy direct
+stdio MCP (an empty argument list), grant Claude Desktop, Bamboo, or the
+terminal/IDE that launches Nova. For a directly launched CLI/HTTP process, macOS may instead use the Nova
 binary. If granting the expected host does not work, add the installed `nova`
 binary (or `target/release/nova`) as a fallback under *System Settings → Privacy
 & Security → Screen Recording* and *Accessibility*.
