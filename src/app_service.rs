@@ -16,6 +16,13 @@ use std::path::{Path, PathBuf};
 pub const BUNDLE_ID: &str = "com.zenith.nova";
 pub const APP_NAME: &str = "Nova";
 
+/// A duplicate launch is a successful no-op, not a failed service to keep in
+/// the menu. The owned listener otherwise runs until cancellation or failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServiceExit {
+    AlreadyRunning,
+}
+
 /// True when `path` has the canonical `*.app/Contents/MacOS/<executable>`
 /// shape used by LaunchServices.
 fn is_bundled_path(path: &Path) -> bool {
@@ -377,10 +384,24 @@ mod unix {
     /// a separate MCP session, but every handler executes in this process (or
     /// its app-owned capture helper) rather than in the stdio host.
     pub async fn run() -> Result<()> {
+        run_with_status(crate::app_status::AppStatus::default())
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn run_with_status(status: crate::app_status::AppStatus) -> Result<ServiceExit> {
+        let result = serve(&status).await;
+        if result.is_err() {
+            status.set_service(crate::app_status::ServiceState::Failed);
+        }
+        result
+    }
+
+    async fn serve(status: &crate::app_status::AppStatus) -> Result<ServiceExit> {
         let socket = socket_path()?;
         let Some((listener, _guard)) = bind_service(&socket)? else {
             tracing::info!(socket = %socket.display(), "Nova app service is already running");
-            return Ok(());
+            return Ok(ServiceExit::AlreadyRunning);
         };
         // The Chrome endpoint is owned by the same independent Nova.app
         // process as the MCP service. Bind it once so every MCP session shares
@@ -388,6 +409,7 @@ mod unix {
         // per-client brokers.
         let chrome_bridge = nova_chrome_bridge::ChromeBridge::bind_default()
             .context("bind Nova.app Chrome semantic bridge")?;
+        status.set_service(crate::app_status::ServiceState::Ready);
         tracing::info!(
             socket = %socket.display(),
             uid = effective_uid(),
@@ -644,7 +666,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{connect_stdio, default_socket_path, run, socket_path};
+pub use unix::{connect_stdio, default_socket_path, run, run_with_status, socket_path};
 
 #[cfg(not(unix))]
 pub fn default_socket_path() -> PathBuf {

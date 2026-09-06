@@ -14,4 +14,6 @@ pub mod event_loop;
 pub mod geometry;
 pub mod input;
 pub mod ocr;
+mod permissions;
+pub mod status_menu;
 pub mod window;

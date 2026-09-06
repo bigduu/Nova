@@ -12,6 +12,7 @@
 
 pub mod app_inspection;
 pub mod app_service;
+pub mod app_status;
 pub mod capture;
 pub mod chrome_devtools;
 pub mod display;
