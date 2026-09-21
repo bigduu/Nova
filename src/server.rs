@@ -6,17 +6,20 @@ use rmcp::ServiceExt;
 
 /// Create a successful text result.
 pub fn ok_text(msg: impl Into<String>) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(msg)])
+    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(msg)])
 }
 
 /// Create an error text result (isError: true).
 pub fn err_result(msg: &str) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(msg)])
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)])
 }
 
 /// Create a successful image result with proper MCP ImageContent.
 pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::success(vec![rmcp::model::Content::image(base64_data, mime_type)])
+    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::image(
+        base64_data,
+        mime_type,
+    )])
 }
 
 const CHROME_APP_SERVICE_ONLY: &str = "Chrome semantic bridge is available only through the independent Nova.app service; configure the Nova.app connector and install the native host";
@@ -794,8 +797,8 @@ impl NovaServer {
         }
         let note = screenshot_note(&img, plan);
         rmcp::model::CallToolResult::success(vec![
-            rmcp::model::Content::text(note),
-            rmcp::model::Content::image(img.base64_data, img.mime_type),
+            rmcp::model::ContentBlock::text(note),
+            rmcp::model::ContentBlock::image(img.base64_data, img.mime_type),
         ])
     }
 }
@@ -2756,8 +2759,8 @@ impl NovaServer {
 // `instructions` (the coordinate-grounding guidance) to the `initialize` result.
 #[tool_handler]
 impl ServerHandler for NovaServer {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
