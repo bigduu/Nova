@@ -8,10 +8,105 @@
 //! Spawns the real binary; needs no Screen Recording permission (handshake +
 //! tools/list only), so it runs in CI.
 
-use std::io::{Read, Write};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+#[test]
+fn stdio_server_keeps_connection_after_bamboo_server_discover() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nova"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nova binary");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let client_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+
+    let send = |stdin: &mut std::process::ChildStdin, message: Value| {
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+    };
+    let response = |stdout: &mut BufReader<_>, id: u64| -> Value {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            stdout.read_line(&mut line).unwrap();
+            assert!(!line.is_empty(), "Nova stdout closed before response {id}");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    };
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 90,
+            "method": "server/discover",
+            "params": {"_meta": client_meta},
+        }),
+    );
+    let discovery = response(&mut stdout, 90);
+    assert_eq!(discovery["result"]["resultType"], "complete");
+    assert!(discovery["result"]["supportedVersions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|version| version == "2026-07-28"));
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "bamboo-discover-regression", "version": "1"},
+            },
+        }),
+    );
+    let initialized = response(&mut stdout, 1);
+    assert!(initialized["result"]["serverInfo"].is_object());
+    assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {"_meta": client_meta},
+        }),
+    );
+    let tools = response(&mut stdout, 2);
+    assert!(tools["result"]["tools"].as_array().unwrap().len() >= 16);
+
+    // tools/list is deliberately the post-initialize liveness probe: Nova's
+    // handler does not expose the optional ping method.
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "discover closed the connection"
+    );
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "server exited unsuccessfully: {status}");
+}
 
 #[test]
 fn stdio_server_completes_handshake_and_lists_tools() {

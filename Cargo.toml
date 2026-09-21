@@ -24,7 +24,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppl
 
 [dependencies]
 # MCP protocol
-rmcp = { version = "1.7", features = ["server", "transport-io", "transport-async-rw", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "=3.4.0", features = ["server", "transport-io", "transport-async-rw", "transport-streamable-http-server", "macros"] }
 
 # HTTP server (for Streamable HTTP transport)
 axum = "0.8"
