@@ -14,6 +14,40 @@ pub fn err_result(msg: &str) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)])
 }
 
+pub(crate) fn ax_set_value_with(
+    ui_tree: &dyn crate::platform::UiTree,
+    pid: i32,
+    query: &str,
+    value: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<String, String> {
+    let metadata = crate::tools::input::input_metadata(value);
+    tracing::info!(
+        query = %query,
+        chars = metadata.chars,
+        bytes = metadata.bytes,
+        "setting native UI value"
+    );
+    ui_tree
+        .ax_set_value(pid, query, value, deadline)
+        .map(|message| {
+            format!(
+                "{} (chars={}, bytes={})",
+                crate::tools::input::redact_diagnostic(value, message),
+                metadata.chars,
+                metadata.bytes
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "{} (chars={}, bytes={})",
+                crate::tools::input::redact_diagnostic(value, error),
+                metadata.chars,
+                metadata.bytes
+            )
+        })
+}
+
 /// Create a successful image result with proper MCP ImageContent.
 pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::image(
@@ -2266,13 +2300,17 @@ impl NovaServer {
         name = "type_text",
         description = "Type a string of text into the currently focused element."
     )]
-    #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
+    #[tracing::instrument(skip_all, fields(chars = p.text.chars().count(), bytes = p.text.len()), level = "info")]
     async fn type_text(
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::platform::input().type_text(&p.text, self.current_target(p.background)) {
-            Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
+        match crate::tools::input::type_text_with(
+            crate::platform::input(),
+            &p.text,
+            self.current_target(p.background),
+        ) {
+            Ok(ack) => ok_text(ack),
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -2356,12 +2394,12 @@ impl NovaServer {
         name = "write_clipboard",
         description = "Write text to the system clipboard."
     )]
-    #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
+    #[tracing::instrument(skip_all, fields(chars = p.text.chars().count(), bytes = p.text.len()), level = "info")]
     async fn write_clipboard(
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::clipboard::write_clipboard(&p.text) {
+        match crate::tools::clipboard::write_clipboard_with(crate::platform::clipboard(), &p.text) {
             Ok(()) => ok_text("written to clipboard"),
             Err(e) => err_result(&e.to_string()),
         }
@@ -2451,7 +2489,7 @@ impl NovaServer {
         let value = p.value;
         let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
         let task = tokio::task::spawn_blocking(move || {
-            crate::platform::ui_tree().ax_set_value(pid, &query, &value, deadline)
+            ax_set_value_with(crate::platform::ui_tree(), pid, &query, &value, deadline)
         });
         match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
             .await
@@ -3994,5 +4032,331 @@ mod tests {
                 < ocr_run_timeout(crate::platform::OcrMode::Auto)
         );
         assert_eq!(OCR_MAX_CONCURRENT, 2);
+    }
+}
+
+#[cfg(test)]
+mod input_redaction_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const SECRET: &str = "pāss🔐word";
+    const QUERY: &str = "Password field";
+
+    #[derive(Clone, Default)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    struct WriterGuard(Arc<Mutex<Vec<u8>>>);
+    impl<'a> MakeWriter<'a> for Writer {
+        type Writer = WriterGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            WriterGuard(self.0.clone())
+        }
+    }
+    impl std::io::Write for WriterGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn trace_capture() -> (Writer, tracing::subscriber::DefaultGuard) {
+        let writer = Writer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+        (writer, tracing::subscriber::set_default(subscriber))
+    }
+    fn trace_text(writer: &Writer) -> String {
+        String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
+    }
+    fn assert_safe(text: &str) {
+        assert!(!text.contains(SECRET), "plaintext leaked: {text}");
+        assert!(
+            text.contains("chars=9"),
+            "character metadata missing: {text}"
+        );
+        assert!(text.contains("bytes=13"), "byte metadata missing: {text}");
+    }
+
+    #[derive(Default)]
+    struct FakeInput {
+        received: Mutex<Option<String>>,
+        fail: bool,
+    }
+    impl crate::platform::InputInjector for FakeInput {
+        fn mouse_move(&self, _: f64, _: f64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn cursor_position(&self) -> crate::error::Result<(f64, f64)> {
+            Ok((0.0, 0.0))
+        }
+        fn left_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn right_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn double_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn scroll_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: i32,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn key_combo(
+            &self,
+            _: &str,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn type_text(
+            &self,
+            text: &str,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            *self.received.lock().unwrap() = Some(text.to_string());
+            if self.fail {
+                Err(crate::error::NovaError::Input(format!(
+                    "input route=hid failed: {SECRET:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeClipboard {
+        received: Mutex<Option<String>>,
+        fail: bool,
+    }
+    impl crate::platform::Clipboard for FakeClipboard {
+        fn read(&self) -> crate::error::Result<String> {
+            Ok(SECRET.to_string())
+        }
+        fn write(&self, text: &str) -> crate::error::Result<()> {
+            *self.received.lock().unwrap() = Some(text.to_string());
+            if self.fail {
+                Err(crate::error::NovaError::Clipboard(format!(
+                    "route=pbcopy failed: {SECRET}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FakeUiTree {
+        received: Mutex<Option<String>>,
+        fail: bool,
+    }
+    impl crate::platform::UiTree for FakeUiTree {
+        fn resolve_target(
+            &self,
+            _: Option<&str>,
+            _: Option<i32>,
+            _: std::time::Instant,
+        ) -> Result<crate::platform::UiTarget, crate::platform::UiReadError> {
+            unreachable!()
+        }
+        fn read_snapshot(
+            &self,
+            _: &crate::platform::UiTarget,
+            _: crate::platform::UiSnapshotOptions,
+        ) -> Result<crate::platform::UiSnapshot, crate::platform::UiReadError> {
+            unreachable!()
+        }
+        fn collect_actionable(
+            &self,
+            _: i32,
+            _: usize,
+            _: Option<(f64, f64, f64, f64)>,
+        ) -> Vec<(
+            crate::tools::elements::UiElement,
+            Box<dyn crate::platform::ElementHandle>,
+        )> {
+            Vec::new()
+        }
+        fn ax_click(&self, _: i32, _: &str, _: std::time::Instant) -> Result<String, String> {
+            unreachable!()
+        }
+        fn ax_set_value(
+            &self,
+            _: i32,
+            _: &str,
+            value: &str,
+            _: std::time::Instant,
+        ) -> Result<String, String> {
+            *self.received.lock().unwrap() = Some(value.to_string());
+            if self.fail {
+                Err(format!("route=uia provider error value={SECRET:?}"))
+            } else {
+                Ok(format!("route=ax provider ack value={SECRET:?}"))
+            }
+        }
+        fn ax_focus(&self, _: i32, _: &str, _: std::time::Instant) -> Result<String, String> {
+            unreachable!()
+        }
+        fn raise_app(&self, _: i32) {}
+        fn dump_tree(&self, _: i32, _: usize) -> String {
+            String::new()
+        }
+        fn keep_warm(&self, _: i32) {}
+        fn clear_warm(&self) {}
+    }
+
+    #[test]
+    fn metadata_distinguishes_unicode_chars_and_bytes() {
+        assert_eq!(
+            crate::tools::input::input_metadata(SECRET),
+            crate::tools::input::InputMetadata {
+                chars: 9,
+                bytes: 13
+            }
+        );
+    }
+
+    #[test]
+    fn type_text_success_and_failure_are_redacted() {
+        let input = FakeInput::default();
+        let (writer, _guard) = trace_capture();
+        let ack = crate::tools::input::type_text_with(
+            &input,
+            SECRET,
+            crate::tools::input::InputTarget::Global,
+        )
+        .unwrap();
+        assert_safe(&ack);
+        assert_eq!(input.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&trace_text(&writer));
+        drop(_guard);
+        let input = FakeInput {
+            received: Mutex::new(None),
+            fail: true,
+        };
+        let (writer, _guard) = trace_capture();
+        let error = crate::tools::input::type_text_with(
+            &input,
+            SECRET,
+            crate::tools::input::InputTarget::Global,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(input.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&error);
+        assert_eq!(error.matches("input event failed:").count(), 1);
+        assert!(error.contains("input route=hid failed"));
+        assert_safe(&trace_text(&writer));
+    }
+
+    #[test]
+    fn clipboard_success_and_failure_are_redacted() {
+        let clipboard = FakeClipboard::default();
+        let (writer, _guard) = trace_capture();
+        assert!(crate::tools::clipboard::write_clipboard_with(&clipboard, SECRET).is_ok());
+        assert_eq!(clipboard.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&trace_text(&writer));
+        drop(_guard);
+        let clipboard = FakeClipboard {
+            received: Mutex::new(None),
+            fail: true,
+        };
+        let (writer, _guard) = trace_capture();
+        let error = crate::tools::clipboard::write_clipboard_with(&clipboard, SECRET)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(clipboard.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&error);
+        assert_eq!(error.matches("clipboard operation failed:").count(), 1);
+        assert!(error.contains("route=pbcopy failed"));
+        assert_safe(&trace_text(&writer));
+    }
+
+    #[tokio::test]
+    async fn batch_type_text_preserves_exact_input_and_redacts_ack() {
+        let input = FakeInput::default();
+        let view = crate::display::view::ViewFrame {
+            origin: (0.0, 0.0),
+            region: (1.0, 1.0),
+            screenshot: (1.0, 1.0),
+        };
+        let output = crate::tools::batch::execute_batch_with(
+            vec![crate::tools::batch::BatchAction::TypeText {
+                text: SECRET.to_string(),
+            }],
+            view,
+            crate::tools::input::InputTarget::Global,
+            &input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(input.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&output[0]);
+    }
+
+    #[test]
+    fn ax_set_value_success_and_failure_are_redacted() {
+        let tree = FakeUiTree {
+            received: Mutex::new(None),
+            fail: false,
+        };
+        let (writer, _guard) = trace_capture();
+        let result =
+            ax_set_value_with(&tree, 42, QUERY, SECRET, std::time::Instant::now()).unwrap();
+        assert_eq!(tree.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&result);
+        assert!(
+            result.contains("route=ax"),
+            "safe provider route lost: {result}"
+        );
+        assert_safe(&trace_text(&writer));
+        drop(_guard);
+        let tree = FakeUiTree {
+            received: Mutex::new(None),
+            fail: true,
+        };
+        let (writer, _guard) = trace_capture();
+        let error =
+            ax_set_value_with(&tree, 42, QUERY, SECRET, std::time::Instant::now()).unwrap_err();
+        assert_eq!(tree.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&error);
+        assert!(
+            error.contains("route=uia"),
+            "safe provider route lost: {error}"
+        );
+        assert_safe(&trace_text(&writer));
+    }
+
+    #[test]
+    fn read_clipboard_remains_plaintext() {
+        assert_eq!(
+            crate::platform::Clipboard::read(&FakeClipboard::default()).unwrap(),
+            SECRET
+        );
     }
 }

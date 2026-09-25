@@ -42,9 +42,18 @@ pub async fn execute_batch(
     view: ViewFrame,
     target: InputTarget,
 ) -> Result<Vec<String>> {
+    execute_batch_with(actions, view, target, crate::platform::input()).await
+}
+
+pub(crate) async fn execute_batch_with(
+    actions: Vec<BatchAction>,
+    view: ViewFrame,
+    target: InputTarget,
+    input: &dyn crate::platform::InputInjector,
+) -> Result<Vec<String>> {
     let mut results = Vec::with_capacity(actions.len());
     for action in actions {
-        results.push(execute_action(action, view, target).await?);
+        results.push(execute_action(action, view, target, input).await?);
     }
     Ok(results)
 }
@@ -53,9 +62,8 @@ async fn execute_action(
     action: BatchAction,
     view: ViewFrame,
     target: InputTarget,
+    input: &dyn crate::platform::InputInjector,
 ) -> Result<String> {
-    let input = crate::platform::input();
-
     match action {
         BatchAction::MouseMove { x, y } => {
             let (lx, ly) = view.to_logical(x, y);
@@ -87,10 +95,7 @@ async fn execute_action(
             input.key_combo(&key, target)?;
             Ok(format!("pressed {key}"))
         }
-        BatchAction::TypeText { text } => {
-            input.type_text(&text, target)?;
-            Ok(format!("typed {text:?}"))
-        }
+        BatchAction::TypeText { text } => crate::tools::input::type_text_with(input, &text, target),
         BatchAction::Wait { ms } => {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             Ok(format!("waited {ms}ms"))

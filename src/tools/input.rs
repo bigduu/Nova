@@ -22,6 +22,75 @@ pub enum InputTarget {
     Pid(i32),
 }
 
+/// Bounded, non-sensitive metadata for caller-provided native input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InputMetadata {
+    pub(crate) chars: usize,
+    pub(crate) bytes: usize,
+}
+
+pub(crate) fn input_metadata(text: &str) -> InputMetadata {
+    InputMetadata {
+        chars: text.chars().count(),
+        bytes: text.len(),
+    }
+}
+
+pub(crate) fn type_text_ack(text: &str) -> String {
+    let metadata = input_metadata(text);
+    format!(
+        "typed input (chars={}, bytes={})",
+        metadata.chars, metadata.bytes
+    )
+}
+
+/// Remove both the complete Rust-debug representation and raw representation
+/// of a submitted value from a diagnostic. Empty values are intentionally left
+/// unchanged so they cannot erase diagnostics; non-empty values are deleted
+/// rather than replaced with a fixed token that could reproduce the input.
+pub(crate) fn redact_diagnostic(submitted: &str, diagnostic: impl Into<String>) -> String {
+    let mut diagnostic = diagnostic.into();
+    if submitted.is_empty() {
+        return diagnostic;
+    }
+    let debug = format!("{submitted:?}");
+    if debug != submitted {
+        diagnostic = diagnostic.replace(&debug, "");
+    }
+    diagnostic.replace(submitted, "")
+}
+
+fn input_error_detail(error: &crate::error::NovaError) -> String {
+    match error {
+        crate::error::NovaError::Input(detail) => detail.clone(),
+        _ => "native input operation failed".to_string(),
+    }
+}
+
+pub(crate) fn type_text_with(
+    input: &dyn crate::platform::InputInjector,
+    text: &str,
+    target: InputTarget,
+) -> crate::error::Result<String> {
+    let metadata = input_metadata(text);
+    tracing::info!(
+        chars = metadata.chars,
+        bytes = metadata.bytes,
+        "typing native input"
+    );
+    input
+        .type_text(text, target)
+        .map(|()| type_text_ack(text))
+        .map_err(|error| {
+            crate::error::NovaError::Input(format!(
+                "{} (chars={}, bytes={})",
+                redact_diagnostic(text, input_error_detail(&error)),
+                metadata.chars,
+                metadata.bytes
+            ))
+        })
+}
+
 impl InputTarget {
     /// Whether this is the global HID stream (which moves the real cursor).
     ///
@@ -46,5 +115,36 @@ mod tests {
     fn input_target_is_global_only_for_global() {
         assert!(InputTarget::Global.is_global());
         assert!(!InputTarget::Pid(123).is_global());
+    }
+
+    #[test]
+    fn redact_diagnostic_removes_literal_and_debug_escaped_secret() {
+        let submitted = "line\n\"quoted\\path";
+        let debug = format!("{submitted:?}");
+        let diagnostic = format!("route=hid detail={debug} suffix=preserved");
+        let redacted = redact_diagnostic(submitted, diagnostic);
+
+        assert!(!redacted.contains(submitted));
+        assert!(!redacted.contains(&debug));
+        assert!(redacted.contains("route=hid"));
+        assert!(redacted.contains("suffix=preserved"));
+    }
+
+    #[test]
+    fn redact_diagnostic_removes_replacement_token_sentinels() {
+        for submitted in ["[REDACTED]", "REDACTED"] {
+            let diagnostic = format!("route=ax detail={submitted} suffix=preserved");
+            let redacted = redact_diagnostic(submitted, diagnostic);
+
+            assert!(!redacted.contains(submitted));
+            assert!(redacted.contains("route=ax"));
+            assert!(redacted.contains("suffix=preserved"));
+        }
+    }
+
+    #[test]
+    fn redact_diagnostic_preserves_empty_submitted_value() {
+        let diagnostic = "route=ax detail=unchanged";
+        assert_eq!(redact_diagnostic("", diagnostic), diagnostic);
     }
 }
