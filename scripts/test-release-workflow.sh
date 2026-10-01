@@ -324,13 +324,13 @@ sed 's/^MOCK_ARCHS=.*/MOCK_ARCHS=arm64/' "$MOCK_SOURCE" > "$THIN_SOURCE"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'if [[ $# -ne 4 ]]; then exit 2; fi' \
+  'if [[ $# -ne 3 ]]; then exit 2; fi' \
   'input="$1"' \
   'if [[ ! -f "$input" ]]; then exit 2; fi' \
-  'if [[ "$2" != "-verify_arch" || "$3" != "arm64" || "$4" != "x86_64" ]]; then exit 2; fi' \
+  'if [[ "$2" != "-verify_arch" || ( "$3" != "arm64" && "$3" != "x86_64" ) ]]; then exit 2; fi' \
   'printf "%s\n" "$*" >> "$MOCK_LIPO_LOG"' \
-  'if ! grep -Fx "MOCK_ARCHS=arm64,x86_64" "$input" >/dev/null; then' \
-  '  echo "error: mock lipo missing required arm64/x86_64 slices: $input" >&2' \
+  'if ! grep -Eq "^MOCK_ARCHS=([^,]+,)*$3(,[^,]+)*$" "$input"; then' \
+  '  echo "error: mock lipo missing required $3 slice: $input" >&2' \
   '  exit 1' \
   'fi' > "$MOCK_BIN/lipo"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$MOCK_BIN/plutil"
@@ -366,8 +366,13 @@ printf '%s\n' \
   'printf "mock icns\n" > "$output"' > "$MOCK_BIN/iconutil"
 chmod +x "$MOCK_SOURCE" "$THIN_SOURCE" "$MOCK_BIN"/*
 
-# Model Xcode's supported grammar closely enough that the historical
-# `lipo -verify_arch arm64 x86_64 <file>` regression cannot pass this suite.
+# Reject both historical combined-architecture spellings. The mock must not
+# make the real toolchain's failure look like a successful universal check.
+if MOCK_LIPO_LOG="$MOCK_LIPO_LOG" \
+  "$MOCK_BIN/lipo" "$MOCK_SOURCE" -verify_arch arm64 x86_64 >/dev/null 2>&1; then
+  echo "error: mock lipo accepted combined architecture verification" >&2
+  exit 1
+fi
 if MOCK_LIPO_LOG="$MOCK_LIPO_LOG" \
   "$MOCK_BIN/lipo" -verify_arch arm64 x86_64 "$MOCK_SOURCE" >/dev/null 2>&1; then
   echo "error: mock lipo accepted the unsupported operation-first argument order" >&2
@@ -428,8 +433,10 @@ unzip -Z1 "$ASSET" | grep -Fx 'Nova.app/Contents/Resources/Nova.icns' >/dev/null
 
 EXPECTED_LIPO_LOG="$TEST_DIRECTORY/expected-lipo.log"
 printf '%s\n' \
-  "$MOCK_SOURCE -verify_arch arm64 x86_64" \
-  "$APP/Contents/MacOS/nova -verify_arch arm64 x86_64" > "$EXPECTED_LIPO_LOG"
+  "$MOCK_SOURCE -verify_arch arm64" \
+  "$APP/Contents/MacOS/nova -verify_arch arm64" \
+  "$MOCK_SOURCE -verify_arch x86_64" \
+  "$APP/Contents/MacOS/nova -verify_arch x86_64" > "$EXPECTED_LIPO_LOG"
 diff -u "$EXPECTED_LIPO_LOG" "$MOCK_LIPO_LOG"
 
 EXPECTED_SIPS_LOG="$TEST_DIRECTORY/expected-sips.log"
@@ -470,8 +477,11 @@ if PATH="$MOCK_BIN:$PATH" \
   echo "error: development app packaging accepted a thin executable" >&2
   exit 1
 fi
-grep -F "missing required arm64/x86_64 slices: $THIN_SOURCE" "$THIN_FAILURE" >/dev/null
-printf '%s\n' "$THIN_SOURCE -verify_arch arm64 x86_64" > "$TEST_DIRECTORY/expected-thin-lipo.log"
+grep -F "missing required x86_64 slice: $THIN_SOURCE" "$THIN_FAILURE" >/dev/null
+printf '%s\n' \
+  "$THIN_SOURCE -verify_arch arm64" \
+  "$THIN_OUTPUT/Nova.app/Contents/MacOS/nova -verify_arch arm64" \
+  "$THIN_SOURCE -verify_arch x86_64" > "$TEST_DIRECTORY/expected-thin-lipo.log"
 diff -u "$TEST_DIRECTORY/expected-thin-lipo.log" "$THIN_LIPO_LOG"
 [[ ! -s "$THIN_CODESIGN_LOG" ]]
 [[ ! -e "$THIN_OUTPUT/nova-v1.2.3-universal-apple-darwin-development-app.zip" ]]
