@@ -325,6 +325,12 @@ absent or partial, use focused-window `ocr` for rendered text; use
 use the pixel space of the most recent screenshot; `cursor_position` instead
 reports OS-global logical coordinates.
 
+Native text writes (`type_text`, `write_clipboard`, batch typing, and
+`ax_set_value`) omit the submitted text from tracing and acknowledgements.
+Write diagnostics retain character/UTF-8 byte counts and native operation
+details without echoing the value. Explicit reads such as `read_clipboard`
+and `ax_read` still return the requested content.
+
 ## Permissions & code signing (macOS)
 
 ### Inspect an application's interaction options

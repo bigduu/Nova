@@ -44,8 +44,8 @@ pub(crate) fn type_text_ack(text: &str) -> String {
     )
 }
 
-/// Remove both the complete Rust-debug representation and raw representation
-/// of a submitted value from a diagnostic. Empty values are intentionally left
+/// Remove raw and Rust-debug representations (standalone or embedded in a
+/// quoted query) of a submitted value from a diagnostic. Empty values are left
 /// unchanged so they cannot erase diagnostics; non-empty values are deleted
 /// rather than replaced with a fixed token that could reproduce the input.
 pub(crate) fn redact_diagnostic(submitted: &str, diagnostic: impl Into<String>) -> String {
@@ -54,8 +54,11 @@ pub(crate) fn redact_diagnostic(submitted: &str, diagnostic: impl Into<String>) 
         return diagnostic;
     }
     let debug = format!("{submitted:?}");
-    if debug != submitted {
-        diagnostic = diagnostic.replace(&debug, "");
+    diagnostic = diagnostic.replace(&debug, "");
+    // Debug string formatting always surrounds the escaped content in quotes.
+    let escaped = &debug[1..debug.len() - 1];
+    if escaped != submitted {
+        diagnostic = diagnostic.replace(escaped, "");
     }
     diagnostic.replace(submitted, "")
 }
@@ -121,13 +124,19 @@ mod tests {
     fn redact_diagnostic_removes_literal_and_debug_escaped_secret() {
         let submitted = "line\n\"quoted\\path";
         let debug = format!("{submitted:?}");
-        let diagnostic = format!("route=hid detail={debug} suffix=preserved");
-        let redacted = redact_diagnostic(submitted, diagnostic);
-
-        assert!(!redacted.contains(submitted));
-        assert!(!redacted.contains(&debug));
-        assert!(redacted.contains("route=hid"));
-        assert!(redacted.contains("suffix=preserved"));
+        for diagnostic in [
+            format!("route=hid detail={debug} suffix=preserved"),
+            format!(
+                "route=hid query={:?} suffix=preserved",
+                format!("field {submitted}")
+            ),
+        ] {
+            let redacted = redact_diagnostic(submitted, diagnostic);
+            assert!(!redacted.contains(submitted));
+            assert!(!redacted.contains(&debug[1..debug.len() - 1]));
+            assert!(redacted.contains("route=hid"));
+            assert!(redacted.contains("suffix=preserved"));
+        }
     }
 
     #[test]
