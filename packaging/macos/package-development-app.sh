@@ -110,10 +110,12 @@ plutil -lint "$APP/Contents/Info.plist"
 
 # Refuse to publish an accidentally thin app. Verify both the source and the
 # installed copy so packaging cannot silently replace or corrupt a slice.
-# `lipo` requires the input file before the operation; putting it after the
-# architectures makes Xcode's implementation parse the path as another arch.
-lipo "$SOURCE_BINARY" -verify_arch arm64 x86_64
-lipo "$APP_BINARY" -verify_arch arm64 x86_64
+# Check one architecture per invocation: Xcode's lipo rejects the combined
+# arm64/x86_64 spelling even for a genuine universal input.
+for required_architecture in arm64 x86_64; do
+  lipo "$SOURCE_BINARY" -verify_arch "$required_architecture"
+  lipo "$APP_BINARY" -verify_arch "$required_architecture"
+done
 
 # Sign inside-out, explicitly, without `codesign --deep`: sign nested code
 # first and the outer bundle last. Ad-hoc signing is sufficient for this
