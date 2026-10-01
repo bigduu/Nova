@@ -103,6 +103,15 @@ function postEvent(name, details = {}, epoch = state.epoch) {
     epoch,
     details,
   });
+  if (["pair_pending", "pair_expired", "pair_confirmed", "route_revoked"].includes(name)) {
+    notifyPopup(details.reason ?? name);
+  }
+}
+
+function notifyPopup(reason) {
+  // This carries no authorization or page data. A visible popup reads the
+  // current worker state; no receiver is normal when the popup is closed.
+  void chrome.runtime.sendMessage({ channel: CHANNEL, type: "popup_state_changed", reason }).catch(() => {});
 }
 
 function scheduleReconnect() {
@@ -127,6 +136,7 @@ function connectNative() {
       invalidatePairingCandidate();
       state.disconnectNative();
       void revokeContentRoute(previousRoute);
+      notifyPopup("native_disconnected");
       scheduleReconnect();
     });
     postNative({
@@ -137,6 +147,7 @@ function connectNative() {
       extensionVersion: chrome.runtime.getManifest().version,
       epoch: state.epoch,
     });
+    notifyPopup("native_connected");
   } catch (error) {
     nativePort = null;
     state.disconnectNative();
@@ -687,6 +698,7 @@ function revokeTabAccess(tabId, reason) {
       { documentId: entry.route.documentId }).catch(() => {});
   }
   if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason });
+  else notifyPopup(reason);
 }
 
 async function pingExactRoute(route) {
@@ -716,8 +728,7 @@ function candidateStillMatches(candidate) {
 }
 
 async function createPairingCandidate() {
-  invalidatePairingCandidate();
-  const revision = pairingCandidateRevision;
+  let revision = pairingCandidateRevision;
   const pending = state.pendingPair;
   if (!pending) return null;
   if (pending.expiresAt <= Date.now()) {
@@ -728,7 +739,17 @@ async function createPairingCandidate() {
   const tabId = await activeTabId();
   if (revision !== pairingCandidateRevision || !Number.isSafeInteger(tabId)) return null;
   const entry = state.routes.get(tabId);
-  if (!entry) return null;
+  if (!entry) {
+    if (pairingCandidate) invalidatePairingCandidate();
+    return null;
+  }
+  if (pairingCandidate && candidateStillMatches(pairingCandidate) &&
+      sameRoute(pairingCandidate.route, entry.route, false) &&
+      pairingCandidate.page.title === entry.title && pairingCandidate.page.url === entry.url) {
+    return pairingCandidate;
+  }
+  invalidatePairingCandidate();
+  revision = pairingCandidateRevision;
 
   const snapshot = Object.freeze({
     pendingRequestId: pending.requestId,
@@ -740,8 +761,11 @@ async function createPairingCandidate() {
   try {
     await pingExactRoute(snapshot.route);
   } catch (error) {
-    if (revision === pairingCandidateRevision) invalidatePairingCandidate();
-    state.unregisterTopFrame(snapshot.route, "content_unavailable");
+    // A late read/probe cannot remove a route that was subsequently paired.
+    if (revision === pairingCandidateRevision && candidateStillMatches(snapshot)) {
+      invalidatePairingCandidate();
+      state.unregisterTopFrame(snapshot.route, "content_unavailable");
+    }
     throw error;
   }
 
@@ -815,8 +839,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const route = trustedSenderRoute(sender, message.nonce);
       const previous = state.routes.get(route.tabId);
       state.registerTopFrame(route, { url: sender.url ?? message.url, title: message.title });
+      const current = state.routes.get(route.tabId);
       if (previous && !sameRoute(previous.route, route, false)) invalidatePairingCandidate();
       if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason: "document_replaced" });
+      else if (!previous || !sameRoute(previous.route, route, false) ||
+               previous.url !== current.url || previous.title !== current.title) {
+        notifyPopup("page_enabled");
+      }
       sendResponse({ ok: true, route });
     } catch (error) {
       sendResponse({ ok: false, code: error?.code ?? "registration_failed" });
@@ -834,6 +863,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         invalidatePairingCandidate();
       }
       if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason: "document_unloaded" });
+      else if (removed) notifyPopup("document_unloaded");
       sendResponse({ ok: true });
     } catch (error) {
       sendResponse({ ok: false, code: error?.code ?? "unregister_failed" });
@@ -917,6 +947,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       clearTimeout(pairTimer);
       const response = state.denyPair();
       postNative(response);
+      notifyPopup("pair_denied");
       sendResponse({ ok: true });
     } catch (error) {
       sendResponse({ ok: false, code: error?.code ?? "pair_failed" });
@@ -946,6 +977,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   const beforeEpoch = state.epoch;
   state.unregisterTab(tabId, "tab_closed");
   if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason: "tab_closed" });
+  else notifyPopup("tab_closed");
 });
 
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
@@ -959,6 +991,7 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   state.unregisterTab(removedTabId, "tab_replaced");
   state.unregisterTab(addedTabId, "tab_replaced");
   if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason: "tab_replaced" });
+  else notifyPopup("tab_replaced");
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -980,6 +1013,9 @@ chrome.permissions.onRemoved.addListener((permissions) => {
       revokeTabAccess(tabId, "permission_removed");
     }
   }
+  notifyPopup("site_permission_removed");
 });
+
+chrome.permissions.onAdded.addListener(() => notifyPopup("site_permission_added"));
 
 connectNative();
