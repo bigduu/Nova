@@ -13,6 +13,7 @@ use core_foundation::base::{CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
+use core_foundation::url::CFURL;
 use std::ffi::c_void;
 
 /// A global-logical rectangle `(x, y, width, height)`.
@@ -126,6 +127,30 @@ pub(crate) fn ax_string(el: &AXUIElement, name: &'static str) -> String {
         .and_then(|v| v.downcast_into::<CFString>())
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+fn document_url_value(value: CFType) -> Option<String> {
+    value
+        .downcast::<CFString>()
+        .map(|string| string.to_string())
+        .or_else(|| {
+            value
+                .downcast::<CFURL>()
+                .map(|url| url.get_string().to_string())
+        })
+        .filter(|url| !url.trim().is_empty())
+}
+
+/// Read only metadata on the selected window: AXDocument is a CFString,
+/// while AXURL may be a CFURL. Neither attribute needs pixel capture.
+pub(crate) fn ax_document_url(el: &AXUIElement) -> Option<String> {
+    for name in ["AXDocument", "AXURL"] {
+        let attr = AXAttribute::<CFType>::new(&CFString::from_static_string(name));
+        if let Some(url) = el.attribute(&attr).ok().and_then(document_url_value) {
+            return Some(url);
+        }
+    }
+    None
 }
 
 /// Read an arbitrary boolean-ish AX attribute. Cocoa controls use either
@@ -272,6 +297,33 @@ pub(crate) fn point_in_rect(px: f64, py: f64, r: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_metadata_document_url_accepts_cfstring_and_cfurl() {
+        let text = CFString::new("https://example.test/文档?q=1");
+        assert_eq!(
+            document_url_value(text.as_CFType()).as_deref(),
+            Some("https://example.test/文档?q=1")
+        );
+        let url = CFURL::from_file_system_path(
+            CFString::new("/tmp/Nova document.txt"),
+            core_foundation::url::kCFURLPOSIXPathStyle,
+            false,
+        );
+        assert_eq!(
+            document_url_value(url.as_CFType()).as_deref(),
+            Some("file:///tmp/Nova%20document.txt")
+        );
+    }
+
+    #[test]
+    fn semantic_metadata_document_url_omits_empty_and_unsupported_values() {
+        assert_eq!(document_url_value(CFString::new(" \t").as_CFType()), None);
+        assert_eq!(
+            document_url_value(CFBoolean::false_value().as_CFType()),
+            None
+        );
+    }
 
     #[test]
     fn rect_intersection() {

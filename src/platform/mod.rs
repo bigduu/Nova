@@ -188,6 +188,8 @@ pub struct UiNodeStates {
     pub selected: Option<bool>,
     pub checked: Option<bool>,
     pub expanded: Option<bool>,
+    /// A provider-exposed scroll container; absent when not supported/known.
+    pub scrollable: Option<bool>,
 }
 
 /// A node value whose secure/redacted state is impossible to confuse with
@@ -245,6 +247,8 @@ pub struct UiTarget {
     pub pid: i32,
     pub app_name: String,
     pub window_title: String,
+    /// URL reported by the selected window/document, never inferred from text.
+    pub document_url: Option<String>,
     /// Opaque native window id (CGWindowID/HWND) when available.
     pub window_id: Option<u64>,
     pub bounds: Option<UiBounds>,

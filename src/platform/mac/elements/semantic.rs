@@ -130,8 +130,18 @@ fn readable_role(role: &str) -> bool {
     )
 }
 
-fn should_emit(mode: UiReadMode, actionable: bool, content: bool) -> bool {
-    (mode.includes_interactive() && actionable) || (mode.includes_content() && content)
+fn scrollable_state(role: &str) -> Option<bool> {
+    (role == "AXScrollArea").then_some(true)
+}
+
+fn should_emit(
+    mode: UiReadMode,
+    actionable: bool,
+    content: bool,
+    scrollable: Option<bool>,
+) -> bool {
+    (mode.includes_interactive() && actionable)
+        || (mode.includes_content() && (content || scrollable == Some(true)))
 }
 
 struct Walk<'a> {
@@ -264,6 +274,7 @@ impl<'a> Walk<'a> {
         }
 
         let actions = ax_actions(element);
+        let scrollable = scrollable_state(&role);
         let actionable = is_actionable(&role)
             || CLICK_ACTIONS
                 .iter()
@@ -309,7 +320,9 @@ impl<'a> Walk<'a> {
             || !description.is_empty()
             || !matches!(&value, UiNodeValue::Absent);
 
-        if should_emit(self.options.mode, actionable, content) && self.emitted.insert(identity) {
+        if should_emit(self.options.mode, actionable, content, scrollable)
+            && self.emitted.insert(identity)
+        {
             let checked = if matches!(role.as_str(), "AXCheckBox" | "AXRadioButton" | "AXSwitch") {
                 ax_bool(element, "AXValue")
             } else {
@@ -327,6 +340,7 @@ impl<'a> Walk<'a> {
                     selected: ax_bool(element, "AXSelected"),
                     checked,
                     expanded: ax_bool(element, "AXExpanded"),
+                    scrollable,
                 },
                 bounds: rect.map(bounds),
                 depth,
@@ -464,7 +478,24 @@ pub(super) fn read_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_web_pass, WebRichness, WEB_STABLE_PASSES};
+    use super::{observe_web_pass, scrollable_state, should_emit, WebRichness, WEB_STABLE_PASSES};
+    use crate::platform::UiReadMode;
+
+    #[test]
+    fn semantic_metadata_unnamed_scroll_area_is_content_without_an_action_mark() {
+        let scrollable = scrollable_state("AXScrollArea");
+        assert_eq!(scrollable, Some(true));
+        assert!(should_emit(UiReadMode::All, false, false, scrollable));
+        assert!(should_emit(UiReadMode::Content, false, false, scrollable));
+        assert!(!should_emit(
+            UiReadMode::Interactive,
+            false,
+            false,
+            scrollable
+        ));
+        assert_eq!(scrollable_state("AXGroup"), None);
+        assert!(!should_emit(UiReadMode::Content, false, false, None));
+    }
 
     #[test]
     fn web_area_without_descendants_is_not_materialized() {
