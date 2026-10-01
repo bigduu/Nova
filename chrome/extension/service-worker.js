@@ -15,6 +15,7 @@ import { RouterState } from "./lib/router-state.js";
 
 const CHANNEL = "nova-extension-v1";
 const NATIVE_HOST = "com.zenith.nova.chrome";
+const PACKAGED_SCRIPTS = ["lib/semantic-runtime.js", "content-script.js"];
 const state = new RouterState();
 let nativePort = null;
 let reconnectTimer = null;
@@ -113,6 +114,12 @@ function connectNative() {
 }
 
 async function sendContent(route, action, args) {
+  // Chrome checks the actual document's current host/activeTab access. The
+  // packaged bootstrap is idempotent and never reads semantic page content.
+  await bootstrapScripts(route.tabId, route.documentId);
+  if (action !== "ping" && state.checkPairedRoute(route)) {
+    throw new ProtocolError("page_access_revoked", "The paired page was revoked; enable and pair it again");
+  }
   const message = {
     channel: CHANNEL,
     type: "semantic_command",
@@ -193,6 +200,14 @@ async function dispatchRequest(request) {
     }
     postNative(state.complete(request.requestId, request.action, content.route, content.result));
   } catch (error) {
+    if (["page_access_denied", "page_access_revoked", "stale_document", "content_unavailable"].includes(error?.code)) {
+      // A late permission probe belongs only to the pairing that started it.
+      if (sameRoute(decision.route, state.paired?.route, true)) {
+        revokeTabAccess(decision.route.tabId, error.code);
+      }
+      postNative(state.reject(request, error.code, error.message));
+      return;
+    }
     const isTimeout = error?.code === "content_timeout";
     const errorCode = isTimeout
       ? "ambiguous_content_timeout"
@@ -263,8 +278,103 @@ function isTrustedPopupSender(sender) {
 }
 
 async function activeTabId() {
+  return (await activeTab())?.id ?? null;
+}
+
+async function activeTab() {
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  return Number.isSafeInteger(tabs[0]?.id) ? tabs[0].id : null;
+  return Number.isSafeInteger(tabs[0]?.id) ? tabs[0] : null;
+}
+
+function siteAccess(rawUrl) {
+  let url;
+  try { url = new URL(rawUrl); } catch {
+    return { status: "unknown", code: "page_url_unavailable", message: "The current page URL is unavailable. Open Nova from a web page." };
+  }
+  if (!["http:", "https:"].includes(url.protocol) ||
+      url.hostname === "chromewebstore.google.com" ||
+      (url.hostname === "chrome.google.com" && url.pathname.startsWith("/webstore"))) {
+    return { status: "unsupported", code: "restricted_page", message: "Chrome does not allow Nova on this page. Use an HTTP(S) page outside the Chrome Web Store." };
+  }
+  return { origin: url.origin, sitePattern: `${url.protocol}//${url.hostname}/*` };
+}
+
+async function activePageAccess() {
+  const tab = await activeTab();
+  const access = { ...siteAccess(tab?.url), tabId: tab?.id ?? null, url: tab?.url ?? null };
+  if (!access.sitePattern) return access;
+  const siteAllowed = await chrome.permissions.contains({ origins: [access.sitePattern] });
+  return {
+    ...access,
+    siteAllowed,
+    status: siteAllowed ? "site_allowed" : state.routes.has(tab.id) ? "tab_enabled" : "needs_tab_access",
+    message: siteAllowed
+      ? "This site is allowed. Enable the page, then pair its exact document."
+      : state.routes.has(tab.id)
+        ? "This tab is enabled temporarily. Pairing is still required."
+        : "Enable this tab temporarily, or allow only the site shown below.",
+  };
+}
+
+async function bootstrapScripts(tabId, documentId = null) {
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [0] },
+      files: documentId ? ["content-script.js"] : PACKAGED_SCRIPTS,
+      world: "ISOLATED",
+    });
+  } catch {
+    throw new ProtocolError("page_access_denied", "Chrome denied access to this document. Open Nova on the page or allow its site, then enable and pair again.");
+  }
+  const main = results.find((result) => result.frameId === 0);
+  if (!main || !isOpaqueId(main.documentId, 256) || (documentId && main.documentId !== documentId)) {
+    throw new ProtocolError("stale_document", "The document changed; review the page and pair again");
+  }
+  if (!main.result?.ok) {
+    throw new ProtocolError("content_unavailable", "The packaged page bridge could not register; enable the page again");
+  }
+  return main.documentId;
+}
+
+async function bootstrapReviewedTab(message) {
+  const tab = await activeTab();
+  if (!tab || tab.id !== message.tabId || tab.url !== message.url) {
+    throw new ProtocolError("stale_reviewed_tab", "The reviewed tab changed; reopen the popup to review it again");
+  }
+  const access = siteAccess(tab.url);
+  if (!access.sitePattern) throw new ProtocolError(access.code, access.message);
+  const documentId = await bootstrapScripts(tab.id);
+  const current = await activeTab();
+  const entry = state.routes.get(tab.id);
+  if (!current || current.id !== tab.id || current.url !== tab.url || entry?.route.documentId !== documentId) {
+    throw new ProtocolError("stale_document", "The document changed while enabling it; review and enable it again");
+  }
+  return { ok: true };
+}
+
+function removedHostMatches(pattern, rawUrl) {
+  if (pattern === "<all_urls>") return true;
+  const parts = /^(\*|https?):\/\/([^/]+)\//u.exec(pattern);
+  if (!parts) return false;
+  let url;
+  try { url = new URL(rawUrl); } catch { return false; }
+  const [, scheme, host] = parts;
+  return (scheme === "*" || `${scheme}:` === url.protocol) &&
+    (host === "*" || host === url.hostname ||
+      (host.startsWith("*.") && (url.hostname === host.slice(2) || url.hostname.endsWith(host.slice(1)))));
+}
+
+function revokeTabAccess(tabId, reason) {
+  const entry = state.routes.get(tabId);
+  if (pairingCandidateRoute()?.tabId === tabId) invalidatePairingCandidate();
+  const beforeEpoch = state.epoch;
+  state.unregisterTab(tabId, reason);
+  if (entry) {
+    void chrome.tabs.sendMessage(tabId, { channel: CHANNEL, type: "revoke_access" },
+      { documentId: entry.route.documentId }).catch(() => {});
+  }
+  if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason });
 }
 
 async function pingExactRoute(route) {
@@ -423,9 +533,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // popup. Do not accept the same message shape from an injected content
   // script merely because it belongs to this extension ID.
   if (!isTrustedPopupSender(sender)) return false;
+  if (message.type === "bootstrap_tab") {
+    void bootstrapReviewedTab(message).then(sendResponse).catch((error) =>
+      sendResponse({ ok: false, code: error?.code ?? "page_access_failed", message: error?.message }));
+    return true;
+  }
   if (message.type === "popup_state") {
     void (async () => {
-      const candidate = state.pendingPair ? await createPairingCandidate() : null;
+      let access = await activePageAccess();
+      let candidate = null;
+      try {
+        candidate = state.pendingPair ? await createPairingCandidate() : null;
+      } catch (error) {
+        access = { ...access, status: "denied", code: error?.code ?? "content_unavailable", message: error?.message };
+      }
       if (!state.pendingPair) invalidatePairingCandidate();
       const activeId = candidate ? candidate.route.tabId : await activeTabId();
       const activeEntry = Number.isSafeInteger(activeId) ? state.routes.get(activeId) : null;
@@ -445,6 +566,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           : null,
         pairedPage,
         candidateId: candidate?.candidateId ?? null,
+        access,
       });
     })().catch(() => sendResponse({ ok: false, code: "popup_state_failed" }));
     return true;
@@ -508,10 +630,15 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== "loading" && changeInfo.url === undefined) return;
-  if (pairingCandidateRoute()?.tabId === tabId) invalidatePairingCandidate();
-  const beforeEpoch = state.epoch;
-  state.unregisterTab(tabId, "navigation");
-  if (state.epoch !== beforeEpoch) postEvent("route_revoked", { reason: "navigation" });
+  revokeTabAccess(tabId, "navigation");
+});
+
+chrome.permissions.onRemoved.addListener((permissions) => {
+  for (const [tabId, entry] of [...state.routes]) {
+    if (permissions.origins?.some((pattern) => removedHostMatches(pattern, entry.url))) {
+      revokeTabAccess(tabId, "permission_removed");
+    }
+  }
 });
 
 connectNative();

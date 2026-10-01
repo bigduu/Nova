@@ -1,9 +1,9 @@
 (() => {
   "use strict";
 
-  // Manifest configuration already sets all_frames=false. Keep the runtime
-  // guard too: a future manifest edit must not silently widen Nova's authority.
+  // Bootstrap targets only the main frame; retain the runtime boundary too.
   if (window.top !== window || !globalThis.NovaSemantic) return;
+  if (globalThis.NovaContentBridge) return globalThis.NovaContentBridge.enable();
 
   const CHANNEL = "nova-extension-v1";
   const nonceBytes = new Uint8Array(16);
@@ -15,6 +15,8 @@
   let trustedRoute = null;
   let currentSnapshot = null;
   let registerTimer = null;
+  let enabled = true;
+  let registration = null;
 
   function baseRouteMatches(route) {
     return Boolean(
@@ -27,7 +29,9 @@
   }
 
   function register() {
-    chrome.runtime.sendMessage(
+    if (!enabled) return Promise.resolve({ ok: false, code: "page_access_revoked" });
+    if (registration) return registration;
+    registration = new Promise((resolve) => chrome.runtime.sendMessage(
       {
         channel: CHANNEL,
         type: "register_top_frame",
@@ -36,17 +40,27 @@
         title: document.title,
       },
       (response) => {
+        if (!enabled) {
+          resolve({ ok: false, code: "page_access_revoked" });
+          return;
+        }
         if (chrome.runtime.lastError || !response?.ok) {
           clearTimeout(registerTimer);
           registerTimer = setTimeout(register, 1000);
+          resolve({ ok: false, code: response?.code ?? "content_unavailable" });
           return;
         }
         trustedRoute = response.route;
+        resolve(response);
       },
-    );
+    )).finally(() => { registration = null; });
+    return registration;
   }
 
   async function handleCommand(message) {
+    if (!enabled) {
+      return { ok: false, action: message.action, code: "page_access_revoked", message: "Page access was revoked; enable and pair the page again" };
+    }
     if (!baseRouteMatches(message.route)) {
       return { ok: false, action: message.action, code: "route_mismatch", message: "content route mismatch" };
     }
@@ -104,11 +118,19 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (
       sender.id !== chrome.runtime.id ||
-      message?.channel !== CHANNEL ||
-      message?.type !== "semantic_command"
+      message?.channel !== CHANNEL
     ) {
       return false;
     }
+    if (message.type === "revoke_access") {
+      enabled = false;
+      clearTimeout(registerTimer);
+      currentSnapshot = null;
+      trustedRoute = null;
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message.type !== "semantic_command") return false;
     handleCommand(message)
       .then(sendResponse)
       .catch((error) =>
@@ -139,5 +161,11 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", register, { once: true });
   }
-  register();
+  globalThis.NovaContentBridge = {
+    enable() {
+      enabled = true;
+      return register();
+    },
+  };
+  return register();
 })();

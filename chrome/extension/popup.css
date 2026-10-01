@@ -42,6 +42,15 @@ h1 {
   font-size: 12px;
 }
 
+main {
+  display: grid;
+  gap: 12px;
+}
+
+section[hidden] {
+  display: none;
+}
+
 section {
   display: grid;
   gap: 9px;

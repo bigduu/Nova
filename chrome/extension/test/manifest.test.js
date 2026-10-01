@@ -57,13 +57,8 @@ test("declared Nova icons are PNG files with exact dimensions", async () => {
   );
 });
 
-test("semantic content scripts never run in subframes or blank-frame fallbacks", () => {
-  assert.equal(manifest.content_scripts.length, 1);
-  const content = manifest.content_scripts[0];
-  assert.equal(content.all_frames, false);
-  assert.equal(content.match_about_blank, false);
-  assert.equal(content.run_at, "document_start");
-  assert.deepEqual(content.js, ["lib/semantic-runtime.js", "content-script.js"]);
+test("fresh installs have no automatic content scripts", () => {
+  assert.equal(Object.hasOwn(manifest, "content_scripts"), false);
 });
 
 test("extension has no externally connectable web surface", () => {
@@ -71,14 +66,15 @@ test("extension has no externally connectable web surface", () => {
   assert.equal(Object.hasOwn(manifest, "web_accessible_resources"), false);
 });
 
-test("extension requests only native messaging API permission", () => {
-  assert.deepEqual(manifest.permissions, ["nativeMessaging"]);
+test("required access uses activeTab and scripting without mandatory host access", () => {
+  assert.deepEqual(manifest.permissions, ["nativeMessaging", "activeTab", "scripting"]);
   assert.equal(Object.hasOwn(manifest, "host_permissions"), false);
 });
 
-test("declarative content access is limited to HTTP documents", () => {
-  assert.deepEqual(manifest.content_scripts[0].matches, [
+test("optional site access is limited to HTTP and leaves file/incognito off", () => {
+  assert.deepEqual(manifest.optional_host_permissions, [
     "http://*/*",
     "https://*/*",
   ]);
+  assert.equal(Object.hasOwn(manifest, "incognito"), false);
 });

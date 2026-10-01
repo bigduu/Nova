@@ -5,6 +5,13 @@
   const elements = Object.fromEntries(
     [
       "connection",
+      "access",
+      "access-origin",
+      "access-status",
+      "site-scope",
+      "use-tab",
+      "allow-site",
+      "revoke-site",
       "pending",
       "paired",
       "idle",
@@ -21,6 +28,7 @@
   let expiry = null;
   let countdownTimer = null;
   let pairingCandidateId = null;
+  let reviewedAccess = null;
 
   function originOnly(rawUrl) {
     try {
@@ -52,15 +60,31 @@
     if (remaining === 0) clearInterval(countdownTimer);
   }
 
+  function renderAccess(access) {
+    reviewedAccess = access?.sitePattern && Number.isSafeInteger(access.tabId) && typeof access.url === "string"
+      ? Object.freeze({ ...access }) : null;
+    elements["access-origin"].textContent = access?.origin ?? "No supported web page";
+    elements["access-status"].textContent = access?.message ?? "Page access is unavailable. Reopen Nova from a web page.";
+    elements["site-scope"].textContent = reviewedAccess
+      ? `Site scope: ${access.sitePattern} (all ports, no subdomains). Page access alone does not pair Nova.`
+      : "Only HTTP(S) pages are supported. File and incognito access stay off by default.";
+    elements["use-tab"].disabled = !reviewedAccess;
+    elements["allow-site"].disabled = !reviewedAccess || Boolean(access.siteAllowed);
+    elements["revoke-site"].hidden = !reviewedAccess || !access.siteAllowed;
+    elements["revoke-site"].disabled = !reviewedAccess || !access.siteAllowed;
+  }
+
   async function render() {
     const response = await send("popup_state");
     if (!response?.ok) throw new Error(response?.code ?? "Could not read Nova state");
     const { status, activePage, pairedPage, candidateId } = response;
+    renderAccess(response.access);
     elements.connection.textContent = status.connected ? "Nova.app connected" : "Nova.app unavailable";
     elements.pending.hidden = true;
     elements.paired.hidden = true;
     elements.idle.hidden = true;
     pairingCandidateId = null;
+    elements.pair.disabled = true;
     clearInterval(countdownTimer);
 
     if (status.paired) {
@@ -72,8 +96,10 @@
     }
     if (status.pendingPair) {
       elements.pending.hidden = false;
-      elements["page-title"].textContent = activePage?.title || "Unsupported page";
-      elements["page-origin"].textContent = activePage ? originOnly(activePage.url) : "Nova cannot access this page";
+      elements["page-title"].textContent = activePage?.title || (response.access?.sitePattern
+        ? "Enable this tab to review its document" : "Unsupported page");
+      elements["page-origin"].textContent = activePage ? originOnly(activePage.url)
+        : response.access?.origin ?? "Nova cannot access this page";
       pairingCandidateId = typeof candidateId === "string" ? candidateId : null;
       expiry = status.pendingPair.expiresAt;
       tickCountdown();
@@ -82,6 +108,62 @@
     }
     elements.idle.hidden = false;
   }
+
+  elements["use-tab"].addEventListener("click", async () => {
+    const access = reviewedAccess;
+    if (!access) return showError("Review a supported web tab first");
+    elements["use-tab"].disabled = true;
+    try {
+      const response = await send("bootstrap_tab", { tabId: access.tabId, url: access.url });
+      if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Could not enable this tab");
+      elements.error.hidden = true;
+      await render();
+    } catch (error) {
+      elements["access-status"].textContent = error.message;
+      showError(error.message);
+      elements["use-tab"].disabled = false;
+    }
+  });
+
+  elements["allow-site"].addEventListener("click", () => {
+    const access = reviewedAccess;
+    if (!access) return showError("Review a supported site first");
+    elements["allow-site"].disabled = true;
+    try {
+      // Call directly in the popup gesture, before any asynchronous work.
+      const request = chrome.permissions.request({ origins: [access.sitePattern] });
+      void request.then(async (granted) => {
+        if (!granted) {
+          elements["access-status"].textContent = "Site permission denied. Use this tab for temporary access, or try allowing the site again.";
+          elements["allow-site"].disabled = false;
+          return;
+        }
+        elements.error.hidden = true;
+        await render();
+      }).catch((error) => {
+        showError(error.message);
+        elements["allow-site"].disabled = false;
+      });
+    } catch (error) {
+      showError(error.message);
+      elements["allow-site"].disabled = false;
+    }
+  });
+
+  elements["revoke-site"].addEventListener("click", async () => {
+    const access = reviewedAccess;
+    if (!access) return showError("Review the allowed site first");
+    elements["revoke-site"].disabled = true;
+    try {
+      const removed = await chrome.permissions.remove({ origins: [access.sitePattern] });
+      if (!removed) throw new Error("Chrome did not remove this site's permission");
+      elements.error.hidden = true;
+      await render();
+    } catch (error) {
+      showError(error.message);
+      elements["revoke-site"].disabled = false;
+    }
+  });
 
   elements.pair.addEventListener("click", async () => {
     elements.pair.disabled = true;

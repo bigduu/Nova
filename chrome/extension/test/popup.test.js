@@ -9,6 +9,13 @@ const [popupSource, popupMarkup] = await Promise.all([
 ]);
 const ids = [
   "connection",
+  "access",
+  "access-origin",
+  "access-status",
+  "site-scope",
+  "use-tab",
+  "allow-site",
+  "revoke-site",
   "pending",
   "paired",
   "idle",
@@ -35,10 +42,11 @@ class FakeElement {
   }
 }
 
-async function renderPopup(response) {
+async function renderPopup(response, permissions = {}) {
   const elements = Object.fromEntries(ids.map((id) => [id, new FakeElement()]));
   const sent = [];
   const chrome = {
+    permissions,
     runtime: {
       lastError: null,
       sendMessage(message, callback) {
@@ -61,6 +69,86 @@ async function renderPopup(response) {
   await new Promise((resolve) => setImmediate(resolve));
   return { elements, sent };
 }
+
+const reviewedAccess = {
+  tabId: 31,
+  url: "https://reviewed.example:8443/private?secret=hidden",
+  origin: "https://reviewed.example:8443",
+  sitePattern: "https://reviewed.example/*",
+  status: "needs_tab_access",
+  message: "Enable this tab temporarily",
+  siteAllowed: false,
+};
+
+function consentState(access = reviewedAccess) {
+  return { ok: true, status: { connected: true, paired: false, pendingPair: null }, access };
+}
+
+test("site request runs directly in the gesture for the already displayed exact host", async () => {
+  const requested = [];
+  let inGesture = false;
+  const { elements, sent } = await renderPopup(consentState(), {
+    request(options) {
+      assert.equal(inGesture, true, "request cannot wait for an async worker round trip");
+      requested.push(structuredClone(options));
+      return Promise.resolve(false);
+    },
+  });
+  assert.match(elements["site-scope"].textContent, /https:\/\/reviewed\.example\/\*/u);
+  assert.equal(elements["site-scope"].textContent.includes("secret"), false);
+  inGesture = true;
+  elements["allow-site"].listeners.get("click")();
+  inGesture = false;
+  assert.deepEqual(requested, [{ origins: ["https://reviewed.example/*"] }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(elements["access-status"].textContent, /permission denied/iu);
+  assert.equal(elements["allow-site"].disabled, false);
+  assert.equal(sent.length, 1, "denial neither bootstraps nor confirms a pairing");
+});
+
+test("tab access passes only the reviewed tab and URL, never pairs implicitly", async () => {
+  const { elements, sent } = await renderPopup((message) =>
+    message.type === "bootstrap_tab" ? { ok: true } : consentState());
+  await elements["use-tab"].listeners.get("click")();
+  assert.deepEqual(sent.map((message) => message.type), ["popup_state", "bootstrap_tab", "popup_state"]);
+  assert.equal(sent[1].tabId, reviewedAccess.tabId);
+  assert.equal(sent[1].url, reviewedAccess.url);
+});
+
+test("site revocation removes exactly the displayed host permission", async () => {
+  const removed = [];
+  const { elements } = await renderPopup(consentState({ ...reviewedAccess, siteAllowed: true }), {
+    remove(options) {
+      removed.push(structuredClone(options));
+      return Promise.resolve(true);
+    },
+  });
+  assert.equal(elements["revoke-site"].hidden, false);
+  assert.equal(elements["allow-site"].disabled, true);
+  await elements["revoke-site"].listeners.get("click")();
+  assert.deepEqual(removed, [{ origins: ["https://reviewed.example/*"] }]);
+});
+
+test("unknown or restricted pages disable both permission controls", async () => {
+  const { elements } = await renderPopup(consentState({
+    status: "unsupported", code: "restricted_page", message: "Chrome does not allow Nova on this page",
+  }));
+  assert.equal(elements["use-tab"].disabled, true);
+  assert.equal(elements["allow-site"].disabled, true);
+  assert.equal(elements["revoke-site"].hidden, true);
+  assert.match(elements["access-status"].textContent, /does not allow/iu);
+});
+
+test("an unenabled HTTP tab is distinct from an unsupported page in the pair review", async () => {
+  const { elements } = await renderPopup({
+    ...consentState(),
+    status: { connected: true, paired: false, pendingPair: { expiresAt: Date.now() + 10_000 } },
+    activePage: null, candidateId: null,
+  });
+  assert.equal(elements["page-title"].textContent, "Enable this tab to review its document");
+  assert.equal(elements["page-origin"].textContent, reviewedAccess.origin);
+  assert.equal(elements.pair.disabled, true);
+});
 
 test("popup displays the Nova icon instead of the temporary letter mark", () => {
   assert.match(

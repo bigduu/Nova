@@ -15,6 +15,15 @@
       </div>
     </header>
     <main>
+      <section id="access">
+        <p class="eyebrow">Page access</p>
+        <p id="access-origin" class="origin"></p>
+        <p id="access-status" class="hint">Checking page access…</p>
+        <p id="site-scope" class="hint"></p>
+        <button id="use-tab" type="button" disabled>Use this tab</button>
+        <button id="allow-site" class="secondary" type="button" disabled>Allow this site</button>
+        <button id="revoke-site" class="danger" type="button" hidden>Revoke site access</button>
+      </section>
       <section id="pending" hidden>
         <p class="eyebrow">Pair request</p>
         <p id="page-title" class="title"></p>
@@ -27,7 +36,7 @@
         <p class="eyebrow">Paired</p>
         <p id="paired-origin" class="origin"></p>
         <p>Only this exact document can receive semantic actions.</p>
-        <button id="release" class="danger" type="button">Release access</button>
+        <button id="release" class="danger" type="button">Release pairing</button>
       </section>
       <section id="idle" hidden>
         <p>No live pairing request.</p>

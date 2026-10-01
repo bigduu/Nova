@@ -10,8 +10,18 @@ isolated from the desktop/OCR server:
 The bridge never turns DOM actions into screen coordinates. A page must first
 be explicitly paired, and every action is addressed to the exact top-level
 `tabId` + Chrome `documentId` + page nonce + pairing epoch returned by `pair`.
-Navigation, native-host disconnect, extension restart, or explicit release
+Navigation, site permission removal, native-host disconnect, extension restart, or explicit release
 revokes that route.
+
+The extension installs with `nativeMessaging`, `activeTab`, and `scripting`,
+without automatic page injection. Open its popup on an HTTP(S) page and click
+**Use this tab** for temporary access. **Allow this site** requests only the
+displayed scheme/hostname, across ports and without subdomains; Chrome stores
+that optional permission. **Revoke site access** removes it and revokes affected
+pairings. Neither a permission grant nor loading the packaged scripts pairs a
+document or returns its DOM to Nova. After navigation, enable and pair the new
+document again. File/incognito access remains off by default, and restricted
+Chrome pages are unsupported. No persistent content scripts are registered.
 
 ## Developer setup (macOS)
 
@@ -32,7 +42,9 @@ revokes that route.
 4. Keep Nova.app running. The host connects only to
    `/tmp/nova-app-<uid>/chrome.sock` (override with `NOVA_CHROME_SOCKET` for an
    isolated test instance).
-5. Ask Nova to run `pair`, open the extension popup within 30 seconds, inspect
+5. On the intended page, open the extension popup and click **Use this tab**.
+   Optionally choose **Allow this site** for ongoing permission on that host.
+6. Ask Nova to run `pair`, open the extension popup within 30 seconds, inspect
    the displayed origin, and click **Pair this page**.
 
 This is a developer workflow. The unpacked extension and ad-hoc/native-host
