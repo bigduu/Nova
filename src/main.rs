@@ -1061,4 +1061,40 @@ mod cli_tests {
             Some(Commands::ChromeDevtools(_))
         ));
     }
+
+    #[test]
+    fn devtools_cli_distinguishes_default_profile_and_literal_endpoint_inputs() {
+        let Some(Commands::ChromeDevtools(defaults)) =
+            Cli::try_parse_from(["nova", "chrome-devtools"])
+                .unwrap()
+                .command
+        else {
+            panic!("missing DevTools subcommand");
+        };
+        assert!(defaults.profile.is_none());
+        assert!(defaults.browser_url.is_none() && defaults.ws_endpoint.is_none());
+        let Some(Commands::ChromeDevtools(explicit)) =
+            Cli::try_parse_from(["nova", "chrome-devtools", "--profile", "isolated"])
+                .unwrap()
+                .command
+        else {
+            panic!("missing DevTools subcommand");
+        };
+        assert_eq!(
+            explicit.profile,
+            Some(nova::chrome_devtools::ChromeProfile::Isolated)
+        );
+        // URLs remain raw strings in Clap. The pre-spawn policy reports fixed
+        // errors instead of a value parser reflecting credential-bearing input.
+        let raw = "http://private:secret@127.0.0.1:9222";
+        let Some(Commands::ChromeDevtools(endpoint)) =
+            Cli::try_parse_from(["nova", "chrome-devtools", "--browser-url", raw])
+                .unwrap()
+                .command
+        else {
+            panic!("missing DevTools subcommand");
+        };
+        assert!(endpoint.profile.is_none());
+        assert_eq!(endpoint.browser_url.as_deref(), Some(raw));
+    }
 }
