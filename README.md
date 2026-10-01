@@ -332,6 +332,11 @@ The target includes its window title and, when the selected macOS window
 exposes `AXDocument`/`AXURL`, an optional `url`. Unsupported URL/state attributes
 are omitted; Windows uses supported cached UIA states and ScrollPattern metadata.
 
+Windows reads preserve cached ValuePattern text, including Unicode and multiline
+values, for controls that expose the pattern. Empty, unsupported, failed, or
+non-string values are absent; password fields and unknown password status stay
+redacted. Controls exposing only TextPattern have no value fallback.
+
 Native text writes (`type_text`, `write_clipboard`, batch typing, and
 `ax_set_value`) omit the submitted text from tracing and acknowledgements.
 Write diagnostics retain character/UTF-8 byte counts and native operation
