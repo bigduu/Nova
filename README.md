@@ -229,14 +229,18 @@ embedded runtime.
 
 ### Chrome DevTools MCP sidecar
 
-For routine Chrome page automation and debugging, Nova can launch the official
+For advanced Chrome page automation and debugging, Nova can launch the official
 [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 next to the desktop server. This is a transparent stdio sidecar, not a second
 browser implementation inside Nova. It requires npm/`npx`, Node.js
 `^20.19.0`, `^22.12.0`, or `>=23`, and current stable Chrome (or newer). Nova
 pins the reviewed upstream package to `chrome-devtools-mcp@1.8.0`.
 
-On macOS, a recommended two-server configuration is:
+Application-level integrations should accept an app selector (name or bundle ID)
+and use `inspect_app` discovery internally. Discovery alone does not grant CDP
+control; automatic app-to-provider routing remains a separate integration slice.
+Endpoint copying and the separate MCP configuration below are advanced transport
+compatibility. On macOS:
 
 ```json
 {
@@ -292,9 +296,55 @@ the connected pages before acting.
 > selected Chrome profile, including authenticated pages. Enable it only for a
 > trusted local MCP client, and disable remote debugging when finished.
 
+An internal consumer or advanced caller can attach to an explicitly selected,
+already-running browser instead of relying on stable Chrome's default profile:
+
+```sh
+nova chrome-devtools --browser-url http://127.0.0.1:9222
+nova chrome-devtools --ws-endpoint 'ws://[::1]:9222/devtools/browser/<id>'
+```
+
+Use one endpoint, without `--profile` (including explicit `isolated`) or
+`--headless`. `--browser-url` accepts HTTP(S) at the browser root, with an optional
+trailing `/`; `--ws-endpoint` accepts WS(S) at `/devtools/browser/<id>`, where the
+ID uses letters, digits, hyphen or underscore. Both require an original literal
+loopback IP and explicit port 1–65535. Hostnames, abbreviated/integer/hex IPs,
+credentials, query strings and fragments are rejected before starting npx.
+Nova forwards the selected address literally and adds no Chrome launch flags
+or automatic connection fallback. HTTPS/WSS use upstream's certificate checks.
+
+These inputs are **trusted local endpoints**, not network confinement. Pinned
+[Puppeteer HTTP discovery](https://github.com/puppeteer/puppeteer/blob/puppeteer-v25.8.0/packages/puppeteer-core/src/common/BrowserConnector.ts#L180-L195)
+uses the returned `webSocketDebuggerUrl`, and its
+[WebSocket transport follows redirects](https://github.com/puppeteer/puppeteer/blob/puppeteer-v25.8.0/packages/puppeteer-core/src/node/NodeWebSocketTransport.ts#L19-L29).
+A local service can therefore lead the connection to another address. The
+[pinned options](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/chrome-devtools-mcp-v1.8.0/src/config/mcp-options.ts)
+and [ownership cleanup](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/chrome-devtools-mcp-v1.8.0/src/browser.ts#L276-L300)
+distinguish attachment from launch: disconnect, stdin EOF or SIGTERM detach from
+an attached browser, while upstream closes a browser it launched itself.
+
+After connecting, call `list_pages` and choose by the expected title/URL. Use the
+returned `pageId` explicitly on every page-scoped read/action. For two windows,
+if the intended pages have IDs 7 and 12, first `take_snapshot({pageId: 7})` and
+`fill({pageId: 7, uid: "<field from that snapshot>", value: "example"})`; then
+`take_snapshot({pageId: 12})` and `click({pageId: 12, uid: "<button from that snapshot>"})`.
+Obtain fresh page IDs and element UIDs after pages close or change; do not rely
+on whichever window is focused.
+
+The endpoint must expose **browser-level CDP**, covering the app's pages/windows.
+The WS path check excludes renderer-only `/devtools/page/...` sockets and Node/V8
+main-process inspector WebSocket URLs. HTTP root syntax alone cannot establish
+the advertised service's identity. Upstream officially targets
+Chrome/Chrome for Testing; Electron/CEF attachment is experimental and unverified
+for each runtime until reads/actions are tested in its own windows. A successful
+MCP `tools/list` alone does not establish application compatibility. On setup or
+connection failure, check the selected app's supported debugging setup and
+refresh its discovery metadata before retrying this transport. Keep Bodhi open;
+Nova's native AX and separately paired extension capabilities remain available.
+
 Use `--enable-webmcp` to expose upstream's experimental WebMCP tools. Nova adds
 Chrome's required `--enable-features=WebMCP` launch argument in isolated mode;
-for an existing profile, Chrome itself must already have been started with that
+for an existing profile or endpoint, the browser must already have started with that
 feature enabled. WebMCP requires Chrome 150+. `--expose-network-headers` and
 `--enable-performance-crux` are explicit privacy opt-ins. The pinned 1.8.0
 package does not support a
