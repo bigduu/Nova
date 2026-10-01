@@ -29,6 +29,12 @@
   let countdownTimer = null;
   let pairingCandidateId = null;
   let reviewedAccess = null;
+  let currentStatus = null;
+  let busy = false;
+  let refreshPending = false;
+  let uiRevision = 0;
+  let errorRevision = -1;
+  let changeReason = null;
 
   function originOnly(rawUrl) {
     try {
@@ -41,6 +47,7 @@
   function showError(message) {
     elements.error.textContent = String(message || "Operation failed").slice(0, 300);
     elements.error.hidden = false;
+    errorRevision = uiRevision;
   }
 
   function send(type, details = {}) {
@@ -56,8 +63,18 @@
     if (!expiry) return;
     const remaining = Math.max(0, expiry - Date.now());
     elements.countdown.textContent = `${Math.ceil(remaining / 1000)} seconds remaining`;
-    elements.pair.disabled = !pairingCandidateId || remaining === 0;
+    updateControls();
     if (remaining === 0) clearInterval(countdownTimer);
+  }
+
+  function updateControls() {
+    const blocked = busy || refreshPending;
+    elements["use-tab"].disabled = blocked || !reviewedAccess;
+    elements["allow-site"].disabled = blocked || !reviewedAccess || Boolean(reviewedAccess.siteAllowed);
+    elements["revoke-site"].disabled = blocked || !reviewedAccess?.siteAllowed;
+    elements.pair.disabled = blocked || !currentStatus?.connected || !pairingCandidateId || !expiry || expiry <= Date.now();
+    elements.deny.disabled = blocked || !currentStatus?.pendingPair;
+    elements.release.disabled = blocked || !currentStatus?.paired;
   }
 
   function renderAccess(access) {
@@ -68,23 +85,35 @@
     elements["site-scope"].textContent = reviewedAccess
       ? `Site scope: ${access.sitePattern} (all ports, no subdomains). Page access alone does not pair Nova.`
       : "Only HTTP(S) pages are supported. File and incognito access stay off by default.";
-    elements["use-tab"].disabled = !reviewedAccess;
-    elements["allow-site"].disabled = !reviewedAccess || Boolean(access.siteAllowed);
     elements["revoke-site"].hidden = !reviewedAccess || !access.siteAllowed;
-    elements["revoke-site"].disabled = !reviewedAccess || !access.siteAllowed;
   }
 
-  async function render() {
-    const response = await send("popup_state");
+  function idleMessage(status) {
+    if (!status.connected) return "Nova.app unavailable. Start or reconnect Nova, then ask it to pair.";
+    const reason = changeReason ?? status.lastRevocation?.reason;
+    if (reason === "pair_expired") return "Pair request expired. Ask Nova for a new request and confirm it within 30 seconds.";
+    if (["navigation", "document_replaced", "document_unloaded", "tab_closed", "tab_replaced"].includes(reason)) {
+      return "The page changed. Enable the intended tab, then ask Nova to pair its new document.";
+    }
+    if (["permission_removed", "site_permission_removed"].includes(reason)) {
+      return "Site access was removed. Enable the tab or allow its site, then ask Nova to pair again.";
+    }
+    if (["popup_release", "released", "pair_denied"].includes(reason)) return "Pairing ended. Ask Nova for a new Pair request when ready.";
+    return "No live pairing request. Ask Nova to pair, then confirm the reviewed document within 30 seconds.";
+  }
+
+  function renderState(response) {
     if (!response?.ok) throw new Error(response?.code ?? "Could not read Nova state");
     const { status, activePage, pairedPage, candidateId } = response;
+    currentStatus = status;
+    if (errorRevision !== uiRevision) elements.error.hidden = true;
     renderAccess(response.access);
     elements.connection.textContent = status.connected ? "Nova.app connected" : "Nova.app unavailable";
     elements.pending.hidden = true;
     elements.paired.hidden = true;
     elements.idle.hidden = true;
     pairingCandidateId = null;
-    elements.pair.disabled = true;
+    expiry = null;
     clearInterval(countdownTimer);
 
     if (status.paired) {
@@ -107,97 +136,125 @@
       return;
     }
     elements.idle.hidden = false;
+    elements.idle.textContent = idleMessage(status);
   }
 
-  elements["use-tab"].addEventListener("click", async () => {
-    const access = reviewedAccess;
-    if (!access) return showError("Review a supported web tab first");
-    elements["use-tab"].disabled = true;
+  async function refresh() {
+    refreshPending = true;
+    if (busy) return updateControls();
+    busy = true;
+    updateControls();
     try {
+      while (refreshPending) {
+        refreshPending = false;
+        const revision = uiRevision;
+        try {
+          const response = await send("popup_state");
+          if (revision === uiRevision) renderState(response);
+        } catch (error) {
+          if (revision !== uiRevision) continue;
+          currentStatus = null;
+          reviewedAccess = null;
+          pairingCandidateId = null;
+          elements.connection.textContent = "Nova state unavailable";
+          elements.pending.hidden = true;
+          elements.paired.hidden = true;
+          elements.idle.hidden = false;
+          elements.idle.textContent = "Could not refresh Nova state. Reopen the popup; start Nova if it is unavailable.";
+          showError(error.message);
+        }
+      }
+    } finally {
+      busy = false;
+      updateControls();
+    }
+  }
+
+  async function runAction(operation) {
+    if (busy || refreshPending) return;
+    busy = true;
+    const revision = ++uiRevision;
+    updateControls();
+    try {
+      await operation();
+    } catch (error) {
+      if (revision === uiRevision) showError(error.message);
+    } finally {
+      busy = false;
+      await refresh();
+    }
+  }
+
+  elements["use-tab"].addEventListener("click", () => {
+    const access = reviewedAccess;
+    return runAction(async () => {
+      if (!access) throw new Error("Review a supported web tab first");
       const response = await send("bootstrap_tab", { tabId: access.tabId, url: access.url });
       if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Could not enable this tab");
-      elements.error.hidden = true;
-      await render();
-    } catch (error) {
-      elements["access-status"].textContent = error.message;
-      showError(error.message);
-      elements["use-tab"].disabled = false;
-    }
+    });
   });
 
   elements["allow-site"].addEventListener("click", () => {
     const access = reviewedAccess;
-    if (!access) return showError("Review a supported site first");
-    elements["allow-site"].disabled = true;
-    try {
-      // Call directly in the popup gesture, before any asynchronous work.
-      const request = chrome.permissions.request({ origins: [access.sitePattern] });
-      void request.then(async (granted) => {
-        if (!granted) {
-          elements["access-status"].textContent = "Site permission denied. Use this tab for temporary access, or try allowing the site again.";
-          elements["allow-site"].disabled = false;
-          return;
-        }
-        elements.error.hidden = true;
-        await render();
-      }).catch((error) => {
-        showError(error.message);
-        elements["allow-site"].disabled = false;
-      });
-    } catch (error) {
-      showError(error.message);
-      elements["allow-site"].disabled = false;
-    }
+    return runAction(async () => {
+      if (!access) throw new Error("Review a supported site first");
+      // runAction invokes this operation synchronously in the click gesture;
+      // the permission request precedes any await or worker message.
+      const granted = await chrome.permissions.request({ origins: [access.sitePattern] });
+      if (!granted) throw new Error("Site permission denied. Use this tab for temporary access, or try allowing the site again.");
+    });
   });
 
-  elements["revoke-site"].addEventListener("click", async () => {
+  elements["revoke-site"].addEventListener("click", () => {
     const access = reviewedAccess;
-    if (!access) return showError("Review the allowed site first");
-    elements["revoke-site"].disabled = true;
-    try {
+    return runAction(async () => {
+      if (!access) throw new Error("Review the allowed site first");
       const removed = await chrome.permissions.remove({ origins: [access.sitePattern] });
       if (!removed) throw new Error("Chrome did not remove this site's permission");
-      elements.error.hidden = true;
-      await render();
-    } catch (error) {
-      showError(error.message);
-      elements["revoke-site"].disabled = false;
-    }
+    });
   });
 
-  elements.pair.addEventListener("click", async () => {
-    elements.pair.disabled = true;
-    try {
-      const candidateId = pairingCandidateId;
+  elements.pair.addEventListener("click", () => {
+    const candidateId = pairingCandidateId;
+    return runAction(async () => {
       pairingCandidateId = null;
       if (!candidateId) throw new Error("Pairing candidate expired; reopen the popup");
       const response = await send("confirm_pair", { candidateId });
       if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Pair failed");
-      await render();
-    } catch (error) {
-      showError(error.message);
-    }
+    });
   });
 
-  elements.deny.addEventListener("click", async () => {
-    try {
+  elements.deny.addEventListener("click", () => {
+    return runAction(async () => {
       const response = await send("deny_pair");
       if (!response?.ok) throw new Error(response?.code ?? "Deny failed");
-      await render();
-    } catch (error) {
-      showError(error.message);
-    }
+    });
   });
 
-  elements.release.addEventListener("click", async () => {
-    try {
+  elements.release.addEventListener("click", () => {
+    return runAction(async () => {
       const response = await send("release_pair");
       if (!response?.ok) throw new Error(response?.code ?? "Release failed");
-      await render();
-    } catch (error) {
-      showError(error.message);
-    }
+    });
   });
 
-  render().catch((error) => showError(error.message));
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (sender.id !== chrome.runtime.id || sender.tab !== undefined ||
+        message?.channel !== CHANNEL || message.type !== "popup_state_changed") return false;
+    uiRevision += 1;
+    changeReason = message.reason;
+    pairingCandidateId = null;
+    // Invalidate visible consent immediately, even while an action reply is
+    // pending. Only a fresh worker read can show enabled controls again.
+    elements.connection.textContent = message.reason === "native_disconnected"
+      ? "Nova.app unavailable" : "Updating Nova state…";
+    elements.pending.hidden = true;
+    elements.paired.hidden = true;
+    elements.idle.hidden = false;
+    elements.idle.textContent = "Updating Nova state…";
+    void refresh();
+    return false;
+  });
+
+  void refresh();
 })();

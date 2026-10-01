@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+
+const [popupSource, popupMarkup] = await Promise.all([
+  readFile(new URL("../popup.js", import.meta.url), "utf8"),
+  readFile(new URL("../popup.html", import.meta.url), "utf8"),
+]);
 
 function eventHook() {
   const listeners = [];
@@ -15,7 +22,9 @@ function eventHook() {
 }
 
 function installConsentApis(chrome) {
+  chrome.runtime.sendMessage ??= async () => {};
   chrome.permissions ??= { contains: async () => false, onRemoved: eventHook() };
+  chrome.permissions.onAdded ??= eventHook();
   chrome.scripting ??= {
     executeScript: async ({ target }) => [{
       frameId: 0,
@@ -453,7 +462,7 @@ test("content scripts cannot impersonate the user-confirmation popup", async (t)
   assert.equal(response, undefined);
 });
 
-test("pair confirmation rejects random and superseded candidate IDs", async (t) => {
+test("unchanged state reads reuse the reviewed token; random and consumed tokens are rejected", async (t) => {
   const originalChrome = globalThis.chrome;
   const extensionMessages = eventHook();
   const nativeMessages = eventHook();
@@ -525,19 +534,7 @@ test("pair confirmation rejects random and superseded candidate IDs", async (t) 
   );
   assert.match(first.candidateId, /^pair-candidate-[a-f0-9]{32}$/u);
   assert.match(second.candidateId, /^pair-candidate-[a-f0-9]{32}$/u);
-  assert.notEqual(first.candidateId, second.candidateId);
-
-  const stale = await callListener(
-    listener,
-    {
-      channel: "nova-extension-v1",
-      type: "confirm_pair",
-      candidateId: first.candidateId,
-    },
-    popupSender,
-  );
-  assert.equal(stale.ok, false);
-  assert.equal(stale.code, "invalid_pair_candidate");
+  assert.equal(first.candidateId, second.candidateId);
 
   const random = await callListener(
     listener,
@@ -562,6 +559,9 @@ test("pair confirmation rejects random and superseded candidate IDs", async (t) 
   );
   assert.equal(confirmed.ok, true);
   assert.equal(confirmed.route.documentId, "document-candidate");
+  const consumed = await callListener(listener,
+    { channel: "nova-extension-v1", type: "confirm_pair", candidateId: first.candidateId }, popupSender);
+  assert.equal(consumed.code, "invalid_pair_candidate");
 });
 
 test("reviewed document token cannot pair its same-tab navigation replacement", async (t) => {
@@ -689,6 +689,9 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
   const originalChrome = globalThis.chrome;
   const extensionMessages = eventHook();
   const nativeMessages = eventHook();
+  const nativeDisconnect = eventHook();
+  const popupMessages = eventHook();
+  const notifications = [];
   const posted = [];
   const injections = [];
   const contentMessages = [];
@@ -706,14 +709,19 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
       id: sender.id,
       getManifest: () => ({ version: "0.1.0" }),
       connectNative: () => ({
-        onMessage: nativeMessages, onDisconnect: eventHook(),
+        onMessage: nativeMessages, onDisconnect: nativeDisconnect,
         postMessage: (message) => posted.push(structuredClone(message)),
       }),
       onMessage: extensionMessages,
+      async sendMessage(message) {
+        notifications.push(structuredClone(message));
+        popupMessages.emit(message, { id: chrome.runtime.id });
+      },
     },
     permissions: {
       contains: async ({ origins }) => origins.every((origin) => grants.has(origin)),
       onRemoved: eventHook(),
+      onAdded: eventHook(),
     },
     scripting: {
       async executeScript(options) {
@@ -768,6 +776,7 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
     return confirmed.route;
   };
   return { chrome, tab, sender, posted, injections, contentMessages, grants, popup, enable,
+    popupMessages, notifications, nativeDisconnect,
     candidate, pair, request,
     denyAccess: () => { denied = true; },
     deferRead: (reply) => { readReply = reply; },
@@ -911,4 +920,121 @@ test("a late denied permission probe cannot revoke a newer pairing in the same d
   assert.equal(current.status.paired, true);
   assert.deepEqual(current.status.route, confirmed.route);
   assert.equal(fixture.contentMessages.some((message) => message.type === "revoke_access"), false);
+});
+
+function openPopup(fixture) {
+  const elements = Object.fromEntries([...popupMarkup.matchAll(/id="([^"]+)"([^>]*)/gu)].map(([, id, attributes]) => [id, {
+    textContent: "", hidden: /\bhidden\b/u.test(attributes), disabled: /\bdisabled\b/u.test(attributes), listeners: new Map(),
+    addEventListener(type, listener) { this.listeners.set(type, listener); },
+  }]));
+  const sent = [];
+  vm.runInNewContext(popupSource, {
+    chrome: {
+      permissions: fixture.chrome.permissions,
+      runtime: {
+        id: fixture.chrome.runtime.id, onMessage: fixture.popupMessages,
+        sendMessage(message, callback) {
+          sent.push(structuredClone(message));
+          void fixture.popup(message.type, message).then(callback);
+        },
+      },
+    },
+    Date, URL, console,
+    document: { getElementById: (id) => elements[id] },
+    setInterval: () => 1, clearInterval() {},
+  });
+  return { elements, sent };
+}
+
+test("the production worker notifies an already-open popup through Pair, confirmation and release", async (t) => {
+  const fixture = await consentFixture(t);
+  await fixture.enable();
+  const view = openPopup(fixture);
+  await waitForValue(() => !view.elements.idle.hidden, "initial popup state");
+  fixture.request("open-popup-pair", "pair");
+  await waitForValue(() => !view.elements.pending.hidden && !view.elements.pair.disabled, "pending Pair in open popup");
+  await view.elements.pair.listeners.get("click")();
+  assert.equal(view.elements.paired.hidden, false);
+  assert.equal(view.elements.pending.hidden, true);
+  assert.equal(fixture.posted.find((message) => message.requestId === "open-popup-pair").status, "ok");
+  await view.elements.release.listeners.get("click")();
+  assert.equal(view.elements.paired.hidden, true);
+  assert.equal(view.elements.release.disabled, true);
+  assert.match(view.elements.idle.textContent, /Pairing ended/u);
+  const reads = view.sent.length;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(view.sent.length, reads, "the popup does not poll after handling the state change");
+});
+
+test("repeated bootstrap and state reads neither notify nor churn an unchanged candidate", async (t) => {
+  const fixture = await consentFixture(t);
+  await fixture.enable();
+  const initial = await fixture.candidate();
+  const notifications = fixture.notifications.length;
+  const probes = fixture.injections.length;
+  const first = await fixture.popup("popup_state");
+  const second = await fixture.popup("popup_state");
+  assert.equal(first.candidateId, initial.candidateId);
+  assert.equal(second.candidateId, initial.candidateId);
+  assert.equal(fixture.injections.length, probes, "a state read reuses the reviewed candidate without another bootstrap");
+  await fixture.enable();
+  assert.equal(fixture.notifications.length, notifications, "same-route registration must not trigger a refresh loop");
+});
+
+test("production lifecycle changes refresh an open popup and remove stale controls", async (t) => {
+  for (const reason of ["navigation", "released", "native_disconnected", "pair_expired"]) {
+    await t.test(reason, async (child) => {
+      child.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+      const fixture = await consentFixture(child);
+      const route = reason === "pair_expired" ? null : await fixture.pair();
+      const view = openPopup(fixture);
+      if (route) await waitForValue(() => !view.elements.paired.hidden, "paired popup");
+      else {
+        await fixture.enable();
+        fixture.request("popup-timeout-pair", "pair");
+        await waitForValue(() => !view.elements.pending.hidden && !view.elements.pair.disabled, "pending popup");
+      }
+      if (reason === "navigation") fixture.chrome.tabs.onUpdated.emit(fixture.tab.id, { status: "loading" });
+      if (reason === "released") fixture.request("external-popup-release", "release", route);
+      if (reason === "native_disconnected") fixture.nativeDisconnect.emit();
+      if (reason === "pair_expired") child.mock.timers.tick(30_010);
+      await waitForValue(() => !view.elements.idle.hidden && view.elements.pair.disabled && view.elements.release.disabled &&
+        view.elements.idle.textContent !== "Updating Nova state…", "revoked popup");
+      assert.equal(view.elements.pending.hidden, true);
+      assert.equal(view.elements.paired.hidden, true);
+      assert.equal(view.elements.error.hidden, true);
+      assert.match(view.elements.idle.textContent, reason === "navigation" ? /page changed/iu
+        : reason === "released" ? /Pairing ended/u
+        : reason === "native_disconnected" ? /Start or reconnect Nova/u : /request expired/iu);
+    });
+  }
+});
+
+test("late candidate probe success or failure cannot undo a newer pairing", async (t) => {
+  for (const succeeds of [true, false]) {
+    await t.test(succeeds ? "late success" : "late failure", async (child) => {
+      const fixture = await consentFixture(child);
+      await fixture.enable();
+      fixture.request("late-candidate-pair", "pair");
+      const executeScript = fixture.chrome.scripting.executeScript;
+      let finishProbe;
+      fixture.chrome.scripting.executeScript = (options) => {
+        if (options.target.documentIds && !finishProbe) return new Promise((resolve, reject) => {
+          finishProbe = () => succeeds ? resolve([{ frameId: 0, documentId: fixture.sender.documentId, result: { ok: true } }])
+            : reject(new Error("old candidate access denied"));
+        });
+        return executeScript(options);
+      };
+      const oldRead = fixture.popup("popup_state");
+      await waitForValue(() => finishProbe, "old candidate probe");
+      const current = await fixture.popup("popup_state");
+      const confirmed = await fixture.popup("confirm_pair", { candidateId: current.candidateId });
+      assert.equal(confirmed.ok, true);
+      finishProbe();
+      assert.equal((await oldRead).candidateId, null);
+      const after = await fixture.popup("popup_state");
+      assert.equal(after.status.paired, true);
+      assert.deepEqual(after.status.route, confirmed.route);
+    });
+  }
 });
