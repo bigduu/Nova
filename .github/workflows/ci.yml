@@ -173,6 +173,35 @@ jobs:
       - name: Test cached ValuePattern contracts without a desktop
         run: cargo test --locked --lib windows_cached_value --verbose
 
+  windows-chrome-bridge:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            chrome/native-host/target
+          key: ${{ runner.os }}-cargo-chrome-runtime-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build and lint the real Windows host
+        run: |
+          cargo build --locked --manifest-path chrome/native-host/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --manifest-path chrome/native-host/Cargo.toml --all-targets -- -D warnings
+          exit $LASTEXITCODE
+      - name: Run native pipe ACL, cancellation and launched-host contracts
+        run: cargo test --locked --manifest-path chrome/native-host/Cargo.toml --verbose
+      - name: Run managed MCP round trips and existing unconfigured entrypoint
+        run: |
+          $env:NOVA_TEST_CHROME_HOST = Join-Path $PWD "chrome/native-host/target/debug/nova-chrome-host.exe"
+          cargo test --locked --test e2e_windows_chrome_bridge --test e2e_managed_mcp --verbose
+          exit $LASTEXITCODE
+
   # Headless-build gate (src/platform/headless): NATIVE ubuntu, so beyond
   # check/clippy it actually RUNS the server and proves the MCP handshake +
   # tools/list works with no desktop backend — the exact probe MCP registries

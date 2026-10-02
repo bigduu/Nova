@@ -27,6 +27,8 @@ impl Connector {
             // an installed Nova.app or use the user's service.
             .env("NOVA_APP_SOCKET", socket)
             .env_remove("NOVA_APP_BUNDLE")
+            .env_remove("NOVA_CHROME_EXTENSION_ID")
+            .env_remove("NOVA_CHROME_PIPE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

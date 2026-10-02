@@ -378,6 +378,14 @@ fn main() -> Result<()> {
         if cli.http {
             nova::server::run_http(&cli.addr).await
         } else {
+            #[cfg(windows)]
+            if matches!(cli.command, Some(Commands::Mcp))
+                && nova_chrome_bridge::managed_chrome_configured()?
+            {
+                let bridge = nova_chrome_bridge::ChromeBridge::bind_default()
+                    .context("cannot start the configured Windows Chrome bridge; keep the first managed Nova broker running or correct the local pipe/configuration permissions")?;
+                return nova::server::run_stdio_with_chrome(bridge).await;
+            }
             nova::server::run_stdio().await
         }
     })
