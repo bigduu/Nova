@@ -201,12 +201,14 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> Result<()> {
     app.finishLaunching();
     let status = AppStatus::default();
     let menu = StatusMenu::new(status.clone(), mtm);
+    let cursor = super::cursor_overlay::CursorOverlay::new(mtm);
     let service_status = status.clone();
     let mut service = Some(
         runtime.spawn(async move { crate::app_service::run_with_status(service_status).await }),
     );
     while !menu.target.ivars().quit.get() {
         if service.as_ref().is_some_and(|task| task.is_finished()) {
+            cursor.stop();
             match runtime.block_on(service.take().expect("finished service exists")) {
                 Ok(Ok(crate::app_service::ServiceExit::AlreadyRunning)) => return Ok(()),
                 Ok(Err(error)) => tracing::error!(%error, "Nova app service failed"),
@@ -215,6 +217,7 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> Result<()> {
             status.set_service(ServiceState::Failed);
         }
         menu.target.render();
+        cursor.tick();
         super::event_loop::pump_application(&app);
     }
     if let Some(service) = service {
