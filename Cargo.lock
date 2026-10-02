@@ -1225,6 +1225,7 @@ dependencies = [
  "bitflags",
  "libc",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
 ]
 

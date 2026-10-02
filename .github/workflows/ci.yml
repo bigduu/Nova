@@ -182,7 +182,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Stdio handshake smoke test (headless build)
-        run: cargo test --test e2e_stdio --test e2e_managed_mcp --verbose
+        run: cargo test --test e2e_stdio --test e2e_managed_mcp --test e2e_app_status --verbose
 
-      - name: Application discovery fixture contracts (headless build)
-        run: cargo test --lib app_inspection --verbose
+      - name: Application discovery and status fixture contracts (headless build)
+        run: cargo test --lib app_ --verbose
