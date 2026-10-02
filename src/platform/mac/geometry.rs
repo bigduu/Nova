@@ -106,19 +106,17 @@ pub fn screen_recording_available() -> bool {
 ///
 /// This is the macOS-recommended way to ask (`CGRequestScreenCaptureAccess`): it
 /// surfaces the system prompt when there is no prior decision and is a no-op (no
-/// prompt, returns `true`) once granted. Call it at startup in the MAIN process —
-/// which the OS can attribute to the launching app — and NOT in the headless
-/// capture-worker subprocess, which cannot present a prompt. Relying on the
-/// `SCShareableContent::get` side-effect from the worker is why the first-run
-/// prompt stopped appearing.
+/// prompt, returns `true`) once granted. Call only for an explicit user action
+/// in the main app process, never during startup/refresh or from the headless
+/// capture worker. Use [`preflight_screen_capture`] for passive status checks.
 pub fn request_screen_recording_access() -> bool {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGRequestScreenCaptureAccess() -> bool;
     }
     // SAFETY: a CoreGraphics C function taking no args and returning a bool; it
-    // triggers the TCC request and reports the current grant. Safe to call once
-    // at startup from the main thread.
+    // triggers the TCC request and reports the current grant. The menu invokes
+    // this on the main thread only after the user selects the request action.
     unsafe { CGRequestScreenCaptureAccess() }
 }
 

@@ -28,6 +28,7 @@ use core_graphics::geometry::CGPoint;
 use std::thread;
 use std::time::Duration;
 
+use super::cursor_overlay::{feedback, CueKind};
 use crate::error::{NovaError, Result};
 use crate::tools::input::InputTarget;
 
@@ -91,6 +92,7 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
             y: sy + (y - sy) * t,
         };
         if let Ok(ev) = make_mouse_event(CGEventType::MouseMoved, CGMouseButton::Left, pt, None) {
+            feedback(pt.x, pt.y, CueKind::Move);
             ev.post(CGEventTapLocation::HID);
         }
         thread::sleep(MOVE_STEP_DELAY);
@@ -98,7 +100,9 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
 
     // Snap to the exact target so the final position is pixel-accurate.
     CGDisplay::warp_mouse_cursor_position(CGPoint { x, y })
-        .map_err(|e| NovaError::Input(format!("warp_mouse_cursor_position: {e:?}")))
+        .map_err(|e| NovaError::Input(format!("warp_mouse_cursor_position: {e:?}")))?;
+    feedback(x, y, CueKind::Move);
+    Ok(())
 }
 
 /// Get the current cursor position in logical coordinates.
@@ -139,8 +143,10 @@ fn press_release(
     pos: CGPoint,
     target: InputTarget,
     click_state: i64,
+    cue: CueKind,
 ) -> Result<()> {
     let d = make_mouse_event(down, button, pos, Some(click_state))?;
+    feedback(pos.x, pos.y, cue);
     post_event(&d, target);
     thread::sleep(CLICK_HOLD);
     let u = make_mouse_event(up, button, pos, Some(click_state))?;
@@ -171,6 +177,7 @@ pub fn left_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
         pos,
         target,
         1,
+        CueKind::LeftClick,
     )
 }
 
@@ -185,6 +192,7 @@ pub fn right_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
         pos,
         target,
         1,
+        CueKind::RightClick,
     )
 }
 
@@ -201,6 +209,7 @@ pub fn double_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
         pos,
         target,
         1,
+        CueKind::DoubleClick,
     )?;
     thread::sleep(DOUBLE_CLICK_GAP);
     press_release(
@@ -210,6 +219,7 @@ pub fn double_click_at(x: f64, y: f64, target: InputTarget) -> Result<()> {
         pos,
         target,
         2,
+        CueKind::DoubleClick,
     )
 }
 
@@ -237,6 +247,7 @@ pub fn scroll_at(x: f64, y: f64, lines: i32, target: InputTarget) -> Result<()> 
     if let InputTarget::Pid(_) = target {
         event.set_location(CGPoint { x, y });
     }
+    feedback(x, y, CueKind::Scroll(lines));
     post_event(&event, target);
     Ok(())
 }
