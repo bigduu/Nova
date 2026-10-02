@@ -158,10 +158,15 @@ pub fn default_pipe_path() -> Result<PathBuf> {
 fn expected_extension_id() -> Result<String> {
     let id = env::var("NOVA_CHROME_EXTENSION_ID")
         .context("set NOVA_CHROME_EXTENSION_ID to the exact 32-character Chrome extension ID")?;
+    validate_extension_id(&id)?;
+    Ok(id)
+}
+
+pub(crate) fn validate_extension_id(id: &str) -> Result<()> {
     if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
         bail!("NOVA_CHROME_EXTENSION_ID must contain exactly 32 characters from a through p");
     }
-    Ok(id)
+    Ok(())
 }
 
 pub fn managed_chrome_configured() -> Result<bool> {
@@ -185,7 +190,7 @@ pub(crate) fn configured_pipe_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn pipe_name(path: &Path) -> Result<Vec<u16>> {
+pub(crate) fn pipe_name(path: &Path) -> Result<Vec<u16>> {
     let name = path.to_str().context("Chrome pipe name must be Unicode")?;
     let suffix = name
         .strip_prefix(PIPE_PREFIX)
@@ -766,12 +771,35 @@ impl Drop for NativeWriter {
 }
 
 pub(crate) fn run_host() -> Result<()> {
-    expected_extension_id()?;
-    let origin = env::args()
+    let (expected_id, pipe) = if env::var_os("NOVA_CHROME_EXTENSION_ID").is_some()
+        || env::var_os("NOVA_CHROME_PIPE").is_some()
+    {
+        // Any present environment selects the existing strict route. An invalid
+        // or incomplete environment must never be rescued by installation data.
+        (expected_extension_id()?, configured_pipe_path()?)
+    } else {
+        let executable = env::current_exe().context("locate the native host executable")?;
+        let config = crate::registration::read_host_config(
+            &executable
+                .parent()
+                .context("native host executable has no directory")?
+                .join(crate::registration::CONFIG_NAME),
+        )
+        .context("native host configuration unavailable; run nova chrome-host install with an exact extension ID, or explicitly configure both Chrome processes")?;
+        (config.extension_id.clone(), config.resolved_pipe()?)
+    };
+    let origin = env::args_os()
         .nth(1)
         .context("Chrome did not provide the extension origin")?;
-    let extension_id = validate_extension_origin(&origin)?;
-    let mut app = AppBridgeConnection::connect(configured_pipe_path()?)?;
+    let origin = origin
+        .to_str()
+        .context("Chrome extension origin must be Unicode")?;
+    let extension_id = validate_extension_origin(origin)?;
+    if extension_id != expected_id {
+        bail!("Chrome origin differs from the exact configured extension ID");
+    }
+    let mut app = AppBridgeConnection::connect(pipe)?;
+    app.expected_id = Some(expected_id);
     app.send(&host_hello(&extension_id)?)?;
     // SAFETY: borrowed stdin is the binary anonymous pipe supplied by Chrome.
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };

@@ -188,14 +188,22 @@ jobs:
             target
             chrome/native-host/target
           key: ${{ runner.os }}-cargo-chrome-runtime-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build and lint the real Windows host
+      - name: Build both real Windows fixture binaries and lint the host
         run: |
           cargo build --locked --manifest-path chrome/native-host/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --bin nova
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked --manifest-path chrome/native-host/Cargo.toml --all-targets -- -D warnings
           exit $LASTEXITCODE
-      - name: Run native pipe ACL, cancellation and launched-host contracts
-        run: cargo test --locked --manifest-path chrome/native-host/Cargo.toml --verbose
+      - name: Run owned registration, native pipe and launched-host contracts
+        run: |
+          $env:NOVA_TEST_CHROME_HOST = Join-Path $PWD "chrome/native-host/target/debug/nova-chrome-host.exe"
+          $env:NOVA_TEST_NOVA_EXE = Join-Path $PWD "target/debug/nova.exe"
+          cargo test --locked --manifest-path chrome/native-host/Cargo.toml --verbose
+          exit $LASTEXITCODE
+      - name: Run Windows CLI parsing without registration I/O
+        run: cargo test --locked --bin nova cli_tests --verbose
       - name: Run managed MCP round trips and existing unconfigured entrypoint
         run: |
           $env:NOVA_TEST_CHROME_HOST = Join-Path $PWD "chrome/native-host/target/debug/nova-chrome-host.exe"
