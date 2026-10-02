@@ -182,7 +182,12 @@ fn windows_launched_host_preserves_fragmented_concatenated_and_binary_frames() {
     app.send(&binary).unwrap();
     assert_eq!(host.receive(), binary);
     drop(app);
-    assert!(host.wait().success());
+    let status = host.wait();
+    assert!(
+        status.success(),
+        "host broker-loss exit: {status}; stderr (first 4096 characters): {}",
+        host.stderr().chars().take(4096).collect::<String>()
+    );
     assert!(host.input.is_some());
     // The same singleton is disconnected until the broker re-arms accept. A
     // launched reconnect must wait through this ordinary readiness interval.
