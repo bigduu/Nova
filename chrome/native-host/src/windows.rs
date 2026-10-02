@@ -558,7 +558,10 @@ impl AppBridgeConnection {
             )
         };
         match result {
-            Err(error) if error.code() == ERROR_BROKEN_PIPE.to_hresult() => {
+            Err(error)
+                if error.code() == ERROR_BROKEN_PIPE.to_hresult()
+                    || error.code() == ERROR_PIPE_NOT_CONNECTED.to_hresult() =>
+            {
                 self.decoder.finish()?;
                 self.eof = true;
                 return Ok(());
@@ -602,7 +605,10 @@ impl AppBridgeConnection {
                 Err(error)
                     if error
                         .downcast_ref::<::windows::core::Error>()
-                        .is_some_and(|error| error.code() == ERROR_BROKEN_PIPE.to_hresult()) =>
+                        .is_some_and(|error| {
+                            error.code() == ERROR_BROKEN_PIPE.to_hresult()
+                                || error.code() == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+                        }) =>
                 {
                     self.decoder.finish()?;
                     return Ok(None);
@@ -884,6 +890,38 @@ mod tests {
             assert!(started.elapsed() >= Duration::from_millis(300));
             assert!(started.elapsed() < Duration::from_secs(2));
             assert!(AppBridgeListener::bind(listener.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn windows_broker_disconnect_ends_immediate_and_pending_reads_but_rejects_partial_tail() {
+        for pending in [false, true] {
+            for partial in [false, true] {
+                let (listener, mut client, mut server) = connected();
+                let hello = host_hello("abcdefghijklmnopabcdefghijklmnop").unwrap();
+                let mut bytes = encode_ndjson(&hello).unwrap();
+                if partial {
+                    bytes.push(b'{');
+                }
+                server.write_bytes(&bytes).unwrap();
+                assert!(client.wait_readable(POLL).unwrap());
+                assert_eq!(client.receive().unwrap(), Some(hello));
+                if pending {
+                    // Start a real overlapped ReadFile before the broker closes.
+                    client.begin_read().unwrap();
+                    let read = client.read.as_ref().unwrap();
+                    assert!(read.operation.pending);
+                    assert!(!read.operation.ready(Duration::ZERO).unwrap());
+                }
+                drop(server); // production Drop calls DisconnectNamedPipe.
+                if partial {
+                    let error = client.receive().unwrap_err().to_string();
+                    assert!(error.contains("truncated NDJSON"), "{error}");
+                } else {
+                    assert!(client.receive().unwrap().is_none());
+                }
+                assert!(AppBridgeListener::bind(listener.path()).is_err());
+            }
         }
     }
 
