@@ -985,6 +985,7 @@ async function pendingValueWorkerFixture(t) {
   let revocationHold = null;
   const targets = [];
   const valueReplies = [];
+  let firstValueReply;
   fixture.chrome.tabs.sendMessage = async (tabId, message, options) => {
     targets.push({ tabId, type: message.type, documentId: options.documentId });
     if (message.type === "revoke_access") {
@@ -994,9 +995,11 @@ async function pendingValueWorkerFixture(t) {
     const reply = callListener(contentListener, message, { id: contentRuntime.id });
     if (message.action !== "set_value") return reply;
     const captured = reply.then((value) => { valueReplies.push(value); return value; });
+    firstValueReply ??= captured;
     return Promise.race([captured, transportFailure]);
   };
   return { ...fixture, field, ready, resumeDigest, revocationReady, targets, valueReplies, failTransport,
+    get firstValueReply() { return firstValueReply; },
     delayRevocation() { revocationHold = new Promise((resolve) => { deliverRevocation = resolve; }); },
     deliverRevocation: () => deliverRevocation(),
   };
@@ -1038,7 +1041,9 @@ for (const mode of ["native release", "popup release", "native disconnect", "con
       assert.equal(timeout.error.code, "ambiguous_content_timeout");
     }
     fixture.resumeDigest();
-    const reply = await waitForValue(() => fixture.valueReplies[0], "held hash response after forwarded revoke");
+    // Web Crypto finishes off-thread. Await the actual bounded content reply;
+    // a fixed number of event-loop turns can expire before its I/O completes.
+    const reply = await fixture.firstValueReply;
     assert.equal(reply.code, "page_access_revoked");
     assert.equal(fixture.field.value, "Initial ✓");
     assert.deepEqual(fixture.field.events, []);
