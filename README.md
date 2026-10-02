@@ -171,8 +171,8 @@ Windows and Linux headless builds serve ordinary stdio MCP. On macOS it only
 connects to the independent Nova.app, launching it through LaunchServices when
 needed. Install the app separately, open it once, and grant **Accessibility** to
 Nova; **Screen Recording** is needed for capture, OCR, and `list_windows` (the
-current preview may request it on app startup). The bundled executable can also
-be used as the connector:
+app menu requests it only when you explicitly choose that action). The bundled
+executable can also be used as the connector:
 
 ```json
 {
@@ -429,6 +429,33 @@ stale-inventory failure; it is expected to fail.
 
 ### Permission ownership
 
+The packaged macOS app has a **Nova** menu-bar entry. It shows the local
+service's **Starting**, **Ready**, or **Failed** state separately from
+**Accessibility** and **Screen Recording**. Ready means the local service is
+listening; it does not imply either permission is granted or Chrome is paired.
+If startup fails, the menu stays available with a failed state. A duplicate
+launch exits and leaves the existing service owner running.
+
+Startup and **Refresh Status** only check current permissions. They do not
+capture anything, open Settings, request a permission, or wait on the Chrome
+pairing queue. **Request Accessibility…** asks only for reading and operating
+native application controls. **Request Screen Recording…** asks only for
+screenshots and screen text recognition. Each section also has its own
+**Open … Settings** action. A “Not granted” result may mean permission has not
+been requested yet; it does not distinguish that case from denial.
+
+After changing a permission, choose **Refresh Status** and retry the Nova tool;
+Bodhi can remain open. Capture continues to use the existing helper and its
+permission-change recovery on the next capture request; refresh itself neither
+starts nor restarts a capture helper. **Quit Nova** ends the service and its
+connections. Reopen Nova and reconnect only the Nova MCP server in the client
+when needed. There is no automatic request replay or restart control.
+
+The menu is available only in the macOS app service. Direct stdio/HTTP and
+connector processes keep their existing transports and have no status menu.
+This UI does not guarantee that permissions survive replacing/signing Nova or
+an OS update; those remain separate installation and release checks.
+
 The independent app transport is the preferred permission model: grant
 **Screen Recording** and **Accessibility** to `Nova.app`, then use
 `nova mcp` (or explicit `nova --connect`). The connector never initializes
@@ -495,6 +522,25 @@ the host keeping a stable signing identity.
 > the fresh replayd.
 
 ## Coordinate grounding
+
+In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
+also show a purple virtual arrow at the supplied logical point. Click rings
+and scroll direction cues fade after 400 ms; the arrow clears after 1.2 seconds
+of inactivity. The panel passes through mouse input and cannot take keyboard
+focus. Foreground input still moves the real pointer; PID/background delivery
+keeps its existing behavior. Batch uses the same native backend. Internal
+pointer restoration after element-center fallback leaves the cue at that click.
+Feedback marks an input attempt; it does not confirm the target accepted it.
+Semantic-only AX actions and browser DOM actions do not infer cursor positions;
+direct no-UI transports and pure connectors do not create this overlay.
+
+Display and region captures exclude the reserved cursor window only when its
+owner resolves to the same Nova executable, including updates to a warm capture
+stream. Other-app single-window captures keep their existing filter. Rendering,
+click-through, focus/pointer behavior, batch, cold/warm screenshot exclusion and
+Quit cleanup still require controlled real desktop acceptance; automated tests
+do not establish those GUI results. Multi-display and full-screen behavior also
+need live verification on the available setup.
 
 A general LLM judging pixel coordinates off a downscaled screenshot is the main
 source of mis-clicks — so the primary path avoids pixels entirely.
