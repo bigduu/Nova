@@ -22,6 +22,7 @@
 //! the live stream, not a fresh connection.
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use screencapturekit::cg::CGRect;
 use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
 use screencapturekit::dispatch_queue::{DispatchQoS, DispatchQueue};
 use screencapturekit::screenshot_manager::CGImageExt;
-use screencapturekit::shareable_content::SCShareableContent;
+use screencapturekit::shareable_content::{SCShareableContent, SCWindow};
 use screencapturekit::stream::{
     configuration::SCStreamConfiguration, content_filter::SCContentFilter,
     output_type::SCStreamOutputType, SCStream,
@@ -51,11 +52,99 @@ enum Target {
     Region(u64), // hash of the (rounded) source rect — different rect ⇒ retarget
 }
 
+fn filter_changed(
+    current: Option<Target>,
+    current_exclusions: &[u32],
+    next: Target,
+    next_exclusions: &[u32],
+) -> bool {
+    current != Some(next) || current_exclusions != next_exclusions
+}
+
+fn sorted_exclusion_ids(mut ids: Vec<u32>) -> Vec<u32> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn matches_overlay_owner(
+    title: Option<&str>,
+    pid: i32,
+    nova_executable: &Path,
+    owner_executable: impl FnOnce(i32) -> Option<PathBuf>,
+) -> bool {
+    title == Some(super::super::cursor_overlay::WINDOW_TITLE)
+        && pid > 0
+        && owner_executable(pid).is_some_and(|owner| owner == nova_executable)
+}
+
+/// Capture runs in a different Nova process. Read WindowServer metadata here
+/// rather than trusting a process-local panel ID or opening another IPC route.
+fn overlay_exclusions(content: &SCShareableContent) -> (Vec<SCWindow>, Vec<u32>) {
+    let Ok(executable) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let windows: Vec<_> = content
+        .windows()
+        .into_iter()
+        .filter(|window| {
+            let Some(owner) = window.owning_application() else {
+                return false;
+            };
+            matches_overlay_owner(
+                window.title().as_deref(),
+                owner.process_id(),
+                &executable,
+                |pid| {
+                    super::super::geometry::proc_path(pid)
+                        .and_then(|path| Path::new(path.trim_end_matches('\0')).canonicalize().ok())
+                },
+            )
+        })
+        .collect();
+    let ids = sorted_exclusion_ids(windows.iter().map(SCWindow::window_id).collect());
+    (windows, ids)
+}
+
 /// The most recent decoded frame, plus a monotonically increasing sequence number
 /// so a capture can wait for a frame produced AFTER it (re)targeted the stream.
 struct Latest {
     rgb: image::RgbImage,
     seq: u64,
+}
+
+/// Old stream closures keep their old Arcs, including callbacks that were
+/// already decoding when stop_capture completed. A new stream must not share
+/// their publication slot, counter or delegate flag after exclusions change.
+fn replace_callback_state(
+    latest: &mut Arc<Mutex<Option<Latest>>>,
+    seq: &mut Arc<AtomicU64>,
+    dead: &mut Arc<AtomicBool>,
+) {
+    *latest = Arc::new(Mutex::new(None));
+    *seq = Arc::new(AtomicU64::new(0));
+    *dead = Arc::new(AtomicBool::new(false));
+}
+
+fn publish_frame(latest: &Mutex<Option<Latest>>, seq: &AtomicU64, rgb: image::RgbImage) {
+    let n = seq.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Ok(mut slot) = latest.lock() {
+        *slot = Some(Latest { rgb, seq: n });
+    }
+}
+
+fn available_frame(
+    latest: &Mutex<Option<Latest>>,
+    base: Option<u64>,
+    grace_elapsed: bool,
+) -> Option<image::RgbImage> {
+    let slot = latest.lock().ok()?;
+    let latest = slot.as_ref()?;
+    match base {
+        None => Some(latest.rgb.clone()),
+        Some(b) if latest.seq > b || grace_elapsed => Some(latest.rgb.clone()),
+        Some(_) => None,
+    }
 }
 
 /// Resolved capture target: the SCK filter to point the stream at, the dimensions
@@ -70,6 +159,7 @@ struct Resolved {
     view: ViewFrame,
     window_pid: Option<i32>,
     target: Target,
+    excluded_window_ids: Vec<u32>,
 }
 
 /// Owns the long-lived stream. Driven from the single-threaded worker loop, so the
@@ -78,6 +168,7 @@ struct Resolved {
 pub struct StreamCapturer {
     stream: Option<SCStream>,
     target: Option<Target>,
+    excluded_window_ids: Vec<u32>,
     latest: Arc<Mutex<Option<Latest>>>,
     seq: Arc<AtomicU64>,
     queue: DispatchQueue,
@@ -115,6 +206,7 @@ impl StreamCapturer {
         Self {
             stream: None,
             target: None,
+            excluded_window_ids: Vec::new(),
             latest: Arc::new(Mutex::new(None)),
             seq: Arc::new(AtomicU64::new(0)),
             // UserInitiated: deliver frames promptly without main-queue contention.
@@ -178,6 +270,8 @@ impl StreamCapturer {
     }
 
     fn capture_resolved(&mut self, r: Resolved) -> Result<RawCapture, String> {
+        let exclusions_changed =
+            self.stream.is_some() && self.excluded_window_ids != r.excluded_window_ids;
         // Drain any pending screen-lock/unlock notification onto this thread's run
         // loop (a few 0-timeout passes service the queued mach message without
         // adding latency), then honor it: a stream that spanned a lock/screensaver
@@ -213,20 +307,35 @@ impl StreamCapturer {
             config = config.with_source_rect(rect);
         }
 
-        // Retarget only when the target actually changed. The region's rect is
-        // baked into its target key, so a different zoom rect already counts as a
-        // change here; re-applying the SAME config/filter must be avoided — SCK
-        // emits no new frame for an unchanged config, which would stall the wait.
+        // Filter-update completion doesn't drain an old output callback that
+        // may still be decoding. On an existing stream's exclusion-set change,
+        // use the existing stop/start path with independent callback state, so
+        // late old pixels/delegates cannot satisfy or stop the new capture.
+        if exclusions_changed {
+            self.reset();
+            replace_callback_state(&mut self.latest, &mut self.seq, &mut self.dead);
+        }
+
+        // Keep ordinary target-only retarget and same-target reuse unchanged.
+        // Reapplying unchanged config/filter emits no new frame and would stall.
         let was_none = self.stream.is_none();
-        let retargeting = self.target != Some(r.target);
+        let target_changed = self.target != Some(r.target);
+        let retargeting = filter_changed(
+            self.target,
+            &self.excluded_window_ids,
+            r.target,
+            &r.excluded_window_ids,
+        );
         if was_none {
             step(&format!("stream: start (target={:?})", r.target));
             self.start_stream(&r.filter, &config)?;
         } else if retargeting {
             step(&format!("stream: retarget -> {:?}", r.target));
             let s = self.stream.as_ref().unwrap();
-            s.update_configuration(&config)
-                .map_err(|e| format!("update_configuration: {e}"))?;
+            if target_changed {
+                s.update_configuration(&config)
+                    .map_err(|e| format!("update_configuration: {e}"))?;
+            }
             s.update_content_filter(&r.filter)
                 .map_err(|e| format!("update_content_filter: {e}"))?;
         }
@@ -246,6 +355,7 @@ impl StreamCapturer {
             Some(self.seq.load(Ordering::Acquire))
         };
         self.target = Some(r.target);
+        self.excluded_window_ids = r.excluded_window_ids;
 
         let rgb = match self.wait_for_frame(base) {
             Ok(rgb) => rgb,
@@ -287,6 +397,7 @@ impl StreamCapturer {
             }
         }
         self.target = None;
+        self.excluded_window_ids.clear();
         if let Ok(mut slot) = self.latest.lock() {
             *slot = None;
         }
@@ -331,10 +442,7 @@ impl StreamCapturer {
                 let Some(rgb) = image::RgbImage::from_raw(w, h, rgb_bytes) else {
                     return;
                 };
-                let n = seq.fetch_add(1, Ordering::AcqRel) + 1;
-                if let Ok(mut slot) = latest.lock() {
-                    *slot = Some(Latest { rgb, seq: n });
-                }
+                publish_frame(&latest, &seq, rgb);
             },
             SCStreamOutputType::Screen,
             Some(&self.queue),
@@ -362,21 +470,10 @@ impl StreamCapturer {
         let start = Instant::now();
         let deadline = start + FRAME_WAIT_TIMEOUT;
         loop {
-            if let Ok(slot) = self.latest.lock() {
-                if let Some(latest) = slot.as_ref() {
-                    match base {
-                        // New target: any frame is the one we want.
-                        None => return Ok(latest.rgb.clone()),
-                        // Same target: a fresher frame arrived.
-                        Some(b) if latest.seq > b => return Ok(latest.rgb.clone()),
-                        // Same target, no fresher frame yet but grace elapsed:
-                        // the screen is static — the latest frame is current.
-                        Some(_) if start.elapsed() >= FRESH_FRAME_GRACE => {
-                            return Ok(latest.rgb.clone());
-                        }
-                        Some(_) => {}
-                    }
-                }
+            if let Some(rgb) =
+                available_frame(&self.latest, base, start.elapsed() >= FRESH_FRAME_GRACE)
+            {
+                return Ok(rgb);
             }
             if Instant::now() >= deadline {
                 return Err(format!(
@@ -540,9 +637,10 @@ fn resolve_display() -> Result<Resolved, String> {
         .ok_or_else(|| "no displays found — SCShareableContent lists no displays while the display is asleep/locked; wake it and retry".to_string())?;
     let disp = crate::platform::mac::geometry::primary_display();
     let dims = compute_target_dims(disp.width, disp.height);
+    let (excluded_windows, excluded_window_ids) = overlay_exclusions(&content);
     let filter = SCContentFilter::create()
         .with_display(display)
-        .with_excluding_windows(&[])
+        .with_excluding_windows(&excluded_windows.iter().collect::<Vec<_>>())
         .build();
     Ok(Resolved {
         filter,
@@ -556,6 +654,7 @@ fn resolve_display() -> Result<Resolved, String> {
         },
         window_pid: None,
         target: Target::Display,
+        excluded_window_ids,
     })
 }
 
@@ -601,9 +700,10 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
         .find(|d| d.display_id() == main_id)
         .or_else(|| displays.first())
         .ok_or_else(|| "no displays found — SCShareableContent lists no displays while the display is asleep/locked; wake it and retry".to_string())?;
+    let (excluded_windows, excluded_window_ids) = overlay_exclusions(&content);
     let filter = SCContentFilter::create()
         .with_display(display)
-        .with_excluding_windows(&[])
+        .with_excluding_windows(&excluded_windows.iter().collect::<Vec<_>>())
         .build();
 
     // Identity = rounded rect, so an identical re-zoom can reuse, others retarget.
@@ -626,6 +726,7 @@ fn resolve_region(rect: (f64, f64, f64, f64)) -> Result<Resolved, String> {
         },
         window_pid: None,
         target: Target::Region(key),
+        excluded_window_ids,
     })
 }
 
@@ -749,5 +850,138 @@ fn resolve_window(query: &str) -> Result<Resolved, String> {
         },
         window_pid: pid,
         target: Target::Window(window_id),
+        excluded_window_ids: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_old_publisher_and_delegate_cannot_touch_replacement_stream() {
+        let mut latest = Arc::new(Mutex::new(None));
+        let mut seq = Arc::new(AtomicU64::new(0));
+        let mut dead = Arc::new(AtomicBool::new(false));
+        let old_latest = latest.clone();
+        let old_seq = seq.clone();
+        let old_dead = dead.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let publisher_latest = old_latest.clone();
+        let publisher_seq = old_seq.clone();
+        let delegate_dead = old_dead.clone();
+        let old_callback = std::thread::spawn(move || {
+            // Model a decoded old sample held before the real publication step.
+            let pixels = image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]));
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            publish_frame(&publisher_latest, &publisher_seq, pixels);
+            delegate_dead.store(true, Ordering::Release);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Same helper installed by capture_resolved after stopping a stream
+        // whose exclusion IDs changed. No SCStream or desktop is constructed.
+        replace_callback_state(&mut latest, &mut seq, &mut dead);
+        release_tx.send(()).unwrap();
+        old_callback.join().unwrap();
+
+        assert!(available_frame(&old_latest, None, false).is_some());
+        assert_eq!(old_seq.load(Ordering::Acquire), 1);
+        assert!(old_dead.load(Ordering::Acquire));
+        assert!(available_frame(&latest, None, false).is_none());
+        assert_eq!(seq.load(Ordering::Acquire), 0);
+        assert!(!dead.load(Ordering::Acquire));
+
+        let new_pixels = image::RgbImage::from_pixel(1, 1, image::Rgb([0, 255, 0]));
+        publish_frame(&latest, &seq, new_pixels.clone());
+        assert_eq!(available_frame(&latest, None, false), Some(new_pixels));
+        assert_eq!(seq.load(Ordering::Acquire), 1);
+        assert!(!dead.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn same_target_frame_selection_keeps_fresh_and_grace_behavior() {
+        let latest = Mutex::new(None);
+        let seq = AtomicU64::new(0);
+        assert!(available_frame(&latest, None, true).is_none());
+        let pixels = image::RgbImage::from_pixel(1, 1, image::Rgb([1, 2, 3]));
+        publish_frame(&latest, &seq, pixels.clone());
+        assert_eq!(
+            available_frame(&latest, Some(0), false),
+            Some(pixels.clone())
+        );
+        assert!(available_frame(&latest, Some(1), false).is_none());
+        assert_eq!(available_frame(&latest, Some(1), true), Some(pixels));
+    }
+
+    #[test]
+    fn overlay_title_requires_exact_executable_owner() {
+        let executable = Path::new("/fixture/Nova.app/Contents/MacOS/nova");
+        let title = Some(super::super::super::cursor_overlay::WINDOW_TITLE);
+        assert!(matches_overlay_owner(title, 42, executable, |pid| {
+            assert_eq!(pid, 42);
+            Some(executable.to_path_buf())
+        }));
+        assert!(!matches_overlay_owner(title, 42, executable, |_| {
+            Some(PathBuf::from("/fixture/Other.app/Contents/MacOS/nova"))
+        }));
+        assert!(!matches_overlay_owner(title, 42, executable, |_| None));
+        for rejected in [None, Some("Nova Native Virtual Cursor "), Some("Nova")] {
+            assert!(!matches_overlay_owner(rejected, 42, executable, |_| {
+                panic!("unrelated titles must not trigger an owner lookup")
+            }));
+        }
+        assert!(!matches_overlay_owner(title, 0, executable, |_| {
+            panic!("invalid PID must not trigger an owner lookup")
+        }));
+    }
+
+    #[test]
+    fn display_and_region_warm_filter_changes_require_retarget() {
+        let ids = sorted_exclusion_ids(vec![9, 3, 9]);
+        assert_eq!(ids, vec![3, 9]);
+        for target in [Target::Display, Target::Region(123)] {
+            assert!(filter_changed(None, &[], target, &ids)); // cold start
+            assert!(filter_changed(Some(target), &[], target, &ids)); // new overlay
+            assert!(!filter_changed(Some(target), &ids, target, &ids)); // reuse
+            assert!(filter_changed(Some(target), &ids, target, &[3, 10])); // replacement
+            assert!(filter_changed(Some(target), &ids, target, &[])); // quit
+        }
+        let reordered = sorted_exclusion_ids(vec![9, 3]);
+        assert!(!filter_changed(
+            Some(Target::Display),
+            &ids,
+            Target::Display,
+            &reordered
+        ));
+        assert!(filter_changed(
+            Some(Target::Region(1)),
+            &ids,
+            Target::Region(2),
+            &ids
+        ));
+    }
+
+    #[test]
+    fn other_app_single_window_identity_has_no_overlay_exclusions() {
+        assert!(!filter_changed(
+            Some(Target::Window(12)),
+            &[],
+            Target::Window(12),
+            &[]
+        ));
+        assert!(filter_changed(
+            Some(Target::Display),
+            &[7],
+            Target::Window(12),
+            &[]
+        ));
+        assert!(filter_changed(
+            Some(Target::Window(12)),
+            &[],
+            Target::Window(13),
+            &[]
+        ));
+    }
 }
