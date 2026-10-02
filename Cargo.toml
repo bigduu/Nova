@@ -19,6 +19,11 @@ name = "e2e_resident_app_inspection"
 path = "tests/e2e_resident_app_inspection.rs"
 harness = false
 
+[[test]]
+name = "e2e_app_shutdown"
+path = "tests/e2e_app_shutdown.rs"
+harness = false
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
 
@@ -89,11 +94,11 @@ accessibility = "0.2"
 accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
 core-foundation = "0.10"            # CFString/CFType — must match accessibility's
 # Running-app enumeration for AX-only target resolution.
-objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSWorkspace", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "NSEvent", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "objc2-core-foundation"] }
 
 # Apple Vision OCR (VNRecognizeTextRequest) — native, on-device, no model files.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSEnumerator", "NSData", "NSDictionary", "NSError"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray", "NSEnumerator", "NSData", "NSDictionary", "NSError", "NSDate", "NSRunLoop", "NSURL"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "VNError", "objc2-core-foundation"] }
 
 # ── Platform-specific (Windows) ───────────────────────────────────────
