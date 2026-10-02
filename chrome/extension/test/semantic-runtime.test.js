@@ -921,6 +921,7 @@ test("shadow actions keep exact same-named handles, own-root focus and Unicode v
   const input = nestedRoot.appendChild(new FakeElement("input", { attributes: { "aria-label": "Message" } }));
   const text = nestedRoot.appendChild(new FakeText("Read only shadow 🪷"));
   const document = page(host);
+  second.click = () => { second.clicks += 1; second.attributes["aria-pressed"] = "true"; };
   const { result, handles } = semantic.createSnapshot(document);
   const buttons = result.nodes.filter((node) => node.role === "button");
   assert.equal(buttons.length, 2);
@@ -1017,14 +1018,337 @@ test("deep roots and large native slot assignments share visit bounds without co
   assert.equal(large.handles.size, 0);
 });
 
-test("activate clicks an authorized live semantic node", async () => {
-  const element = new FakeElement("button");
+test("activate confirms a visible control change after exactly one dispatch", async () => {
+  const element = attach(new FakeElement("button", { attributes: { "aria-label": "Toggle" } }));
+  element.click = () => { element.clicks += 1; element.attributes["aria-pressed"] = "true"; };
+  let checks = 0;
   const result = await semantic.performAction(
     { element, actions: ["activate"], sensitive: false },
     "activate",
+    {}, () => { checks += 1; },
   );
   assert.deepEqual(result, { activated: true });
   assert.equal(element.clicks, 1);
+  assert.equal(checks, 4);
+});
+
+function activationTarget(document, element) {
+  return [...semantic.createSnapshot(document).handles.values()].find((handle) => handle.element === element);
+}
+
+test("activation confirms visible text, native control and safe value changes without echoing them", async (t) => {
+  for (const kind of ["text", "checked", "value", "microtask"]) {
+    await t.test(kind, async () => {
+      const button = branch("button", ["Activate"]);
+      const status = branch("output", ["Initial status"]);
+      const field = new FakeElement("input", { type: kind === "checked" ? "checkbox" : "text", checked: false,
+        value: "Initial field", attributes: { "aria-label": "Field" } });
+      const document = page(button, status, field);
+      const changed = "Controlled 中文 🪷 effect";
+      const effect = () => {
+        if (kind === "text" || kind === "microtask") status.textContent = changed;
+        else if (kind === "checked") field.checked = true;
+        else field.value = changed;
+      };
+      button.click = () => { button.clicks += 1; if (kind === "microtask") queueMicrotask(effect); else effect(); };
+      const result = await semantic.performAction(activationTarget(document, button), "activate");
+      assert.deepEqual(result, { activated: true });
+      assert.equal(JSON.stringify(result).includes(changed), false);
+      assert.equal(button.clicks, 1);
+    });
+  }
+});
+
+test("inert, trusted-only, hidden, sensitive and bounds-only handlers have no observed effect", async (t) => {
+  for (const kind of ["inert", "trusted-only", "hidden", "sensitive", "bounds", "focus", "capability"]) {
+    await t.test(kind, async () => {
+      const button = branch("button", ["Activate"]);
+      const hidden = branch("p", ["EXCLUDE_INITIAL"], { hidden: true });
+      const privateField = new FakeElement("input", { type: "password", value: "EXCLUDE_INITIAL" });
+      const document = page(button, hidden, privateField);
+      button.click = () => {
+        button.clicks += 1;
+        if (kind === "trusted-only" && ({ isTrusted: false }).isTrusted) button.textContent = "EXCLUDE_EFFECT";
+        if (kind === "hidden") hidden.textContent = "EXCLUDE_EFFECT";
+        if (kind === "sensitive") privateField.value = "EXCLUDE_EFFECT";
+        if (kind === "bounds") button.rect = { ...button.rect, x: 300, width: 200 };
+        if (kind === "focus") button.focus();
+        if (kind === "capability") button.tabIndex = 3;
+      };
+      await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), (error) => {
+        assert.equal(error.code, "no_observed_effect");
+        assert.match(error.message, /DOM dispatch may already have had side effects/u);
+        assert.match(error.message, /read or inspect the page before retrying/u);
+        assert.equal(error.message.includes("EXCLUDE_EFFECT"), false);
+        return true;
+      });
+      assert.equal(button.clicks, 1);
+    });
+  }
+});
+
+test("activation observes open-shadow changes while closed and private shadows stay excluded", async () => {
+  const button = branch("button", ["Activate"]);
+  const open = new FakeElement("div");
+  const field = open.attachShadow().appendChild(new FakeElement("input", { value: "Open initial", attributes: { "aria-label": "Open field" } }));
+  const privateHost = new FakeElement("div", { attributes: { "data-private": "" } });
+  const privateText = privateHost.attachShadow().appendChild(new FakeText("EXCLUDE_PRIVATE"));
+  const closed = new FakeElement("div");
+  const closedText = closed.attachShadow({ mode: "closed" }).appendChild(new FakeText("EXCLUDE_CLOSED"));
+  const document = page(button, open, privateHost, closed);
+  button.click = () => { button.clicks += 1; privateText._data = "EXCLUDE_CHANGED"; closedText._data = "EXCLUDE_CHANGED"; };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  assert.equal(privateText.reads, 0);
+  assert.equal(closedText.reads, 0);
+  button.click = () => { button.clicks += 1; field.value = "Visible shadow effect"; };
+  assert.deepEqual(await semantic.performAction(activationTarget(document, button), "activate"), { activated: true });
+  assert.equal(button.clicks, 2);
+});
+
+test("changing only a privacy marker cannot justify an activation receipt", async () => {
+  const button = branch("button", ["Activate"]);
+  const field = new FakeElement("input", { value: "Unchanged field", attributes: { "aria-label": "Field" } });
+  const document = page(button, field);
+  button.click = () => { button.clicks += 1; field.attributes["data-private"] = ""; };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  button.click = () => { button.clicks += 1; delete field.attributes["data-private"]; };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  assert.equal(button.clicks, 2);
+});
+
+function externalLabelCase(naming, privateBefore, type = "text") {
+  const button = branch("button", ["Toggle external label only"]);
+  const label = branch("label", ["External unchanged label 中文 🪷"], { attributes: { id: "external-label", for: "external-field" } });
+  if (privateBefore) label.attributes["data-private"] = "";
+  const field = new FakeElement("input", { type, checked: false, value: "Unchanged external value",
+    attributes: { id: "external-field", ...(naming === "aria-labelledby" ? { "aria-labelledby": "external-label" } : {}) } });
+  if (naming === "associated-label") field.labels = [label];
+  const document = page(button, label, field);
+  button.click = () => {
+    button.clicks += 1;
+    if (privateBefore) delete label.attributes["data-private"];
+    else label.attributes["data-private"] = "";
+  };
+  return { button, label, field, document };
+}
+
+function inlineNameCase(privateBefore) {
+  const caption = branch("span", ["Caption unchanged"], { attributes: privateBefore ? { "data-private": "" } : {} });
+  const button = branch("button", ["Public prefix ", caption], { attributes: { "aria-description": "Unchanged public description" } });
+  const field = new FakeElement("input", { value: "Unchanged public value", attributes: { "aria-label": "Public field" } });
+  const document = page(button, field);
+  button.click = () => {
+    button.clicks += 1;
+    if (privateBefore) delete caption.attributes["data-private"];
+    else caption.attributes["data-private"] = "";
+  };
+  return { button, caption, field, document };
+}
+
+test("inline content name privacy-only toggles cannot confirm activation in either direction", async (t) => {
+  for (const privateBefore of [false, true]) {
+    await t.test(privateBefore ? "private-to-public" : "public-to-private", async () => {
+      const { button, caption, field, document } = inlineNameCase(privateBefore);
+      const projectedName = () => semantic.createSnapshot(document).result.nodes.find((node) => node.role === "button").name;
+      assert.equal(projectedName(), privateBefore ? "Public prefix" : "Public prefix Caption unchanged");
+      const unchanged = JSON.stringify([button.textContent, button.style, caption.style, button.rect, caption.rect, field.value]);
+      await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), (error) => {
+        assert.equal(error.code, "no_observed_effect");
+        assert.match(error.message, /DOM dispatch may already have had side effects/u);
+        assert.match(error.message, /read or inspect the page before retrying/u);
+        assert.equal(error.message.includes("Public prefix"), false);
+        assert.equal(error.message.includes("Caption unchanged"), false);
+        assert.equal(error.message.includes(field.value), false);
+        return true;
+      });
+      assert.equal(button.clicks, 1);
+      assert.equal(caption.hasAttribute("data-private"), !privateBefore);
+      assert.equal(JSON.stringify([button.textContent, button.style, caption.style, button.rect, caption.rect, field.value]), unchanged);
+      assert.equal(projectedName(), privateBefore ? "Public prefix Caption unchanged" : "Public prefix");
+    });
+  }
+});
+
+test("inline name masking retains public state and direct-description effects", async (t) => {
+  for (const kind of ["state", "description"]) {
+    await t.test(kind, async () => {
+      const { button, caption, field, document } = inlineNameCase(false);
+      const toggle = button.click.bind(button);
+      button.click = () => {
+        toggle();
+        if (kind === "state") button.attributes["aria-pressed"] = "true";
+        else button.attributes["aria-description"] = "Independent public description 中文 🪷";
+      };
+      assert.deepEqual(await semantic.performAction(activationTarget(document, button), "activate"), { activated: true });
+      assert.equal(button.clicks, 1);
+      assert.equal(caption.hasAttribute("data-private"), true);
+      assert.equal(button.textContent, "Public prefix Caption unchanged");
+      assert.equal(field.value, "Unchanged public value");
+      if (kind === "state") assert.equal(button.getAttribute("aria-pressed"), "true");
+      else assert.equal(button.getAttribute("aria-description"), "Independent public description 中文 🪷");
+    });
+  }
+});
+
+test("external label privacy-only toggles cannot confirm activation in either name path or direction", async (t) => {
+  for (const naming of ["aria-labelledby", "associated-label"]) {
+    for (const privateBefore of [false, true]) {
+      await t.test(`${naming} ${privateBefore ? "private-to-public" : "public-to-private"}`, async () => {
+        const { button, label, field, document } = externalLabelCase(naming, privateBefore);
+        await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), (error) => {
+          assert.equal(error.code, "no_observed_effect");
+          assert.match(error.message, /read or inspect the page before retrying/u);
+          assert.equal(error.message.includes("External unchanged label"), false);
+          assert.equal(error.message.includes(field.value), false);
+          return true;
+        });
+        assert.equal(button.clicks, 1);
+        assert.equal(label.textContent, "External unchanged label 中文 🪷");
+        assert.equal(field.value, "Unchanged external value");
+        assert.equal(label.hasAttribute("data-private"), !privateBefore);
+      });
+    }
+  }
+});
+
+test("external label name masking preserves independent public value and state effects", async (t) => {
+  for (const naming of ["aria-labelledby", "associated-label"]) {
+    for (const kind of ["value", "checked"]) {
+      await t.test(`${naming} ${kind}`, async () => {
+        const { button, label, field, document } = externalLabelCase(naming, false, kind === "checked" ? "checkbox" : "text");
+        button.click = () => {
+          button.clicks += 1;
+          label.attributes["data-private"] = "";
+          if (kind === "value") field.value = "Independent public value 中文 🪷";
+          else field.checked = true;
+        };
+        const result = await semantic.performAction(activationTarget(document, button), "activate");
+        assert.deepEqual(result, { activated: true });
+        assert.equal(JSON.stringify(result).includes("Independent public value"), false);
+        assert.equal(button.clicks, 1);
+        assert.equal(label.hasAttribute("data-private"), true);
+        if (kind === "value") assert.equal(field.value, "Independent public value 中文 🪷");
+        else assert.equal(field.checked, true);
+      });
+    }
+  }
+});
+
+test("external name privacy provenance survives later source ancestry changes", async (t) => {
+  for (const naming of ["aria-labelledby", "associated-label"]) {
+    await t.test(naming, async () => {
+      const { button, label, field } = externalLabelCase(naming, false);
+      const externalParent = branch("div", [label], { attributes: { "data-private": "" } });
+      // Reference lookup can resolve a connected source outside the observed
+      // body. Only the existing reference walk reads this external source.
+      const document = new FakeDocument([externalParent], { body: branch("body", [button, field]) });
+      button.click = () => {
+        button.clicks += 1;
+        delete externalParent.attributes["data-private"];
+        label.parentElement = null;
+        label.parentNode = null;
+      };
+      await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+      assert.equal(button.clicks, 1);
+      assert.equal(field.value, "Unchanged external value");
+      assert.equal(label.textContent, "External unchanged label 中文 🪷");
+    });
+  }
+});
+
+test("bounded public additions and removals can confirm an activation effect", async (t) => {
+  for (const kind of ["add", "remove"]) {
+    await t.test(kind, async () => {
+      const button = branch("button", ["Activate"]);
+      const status = branch("output", kind === "add" ? [] : ["Existing public status"]);
+      const document = page(button, status);
+      button.click = () => { button.clicks += 1; status.textContent = kind === "add" ? "New public status" : ""; };
+      assert.deepEqual(await semantic.performAction(activationTarget(document, button), "activate"), { activated: true });
+      assert.equal(button.clicks, 1);
+    });
+  }
+});
+
+test("post-dispatch adoption observes only the original authorized top document", async () => {
+  const button = branch("button", ["Activate"]);
+  const status = branch("output", ["Original top status"]);
+  const document = page(button, status);
+  button.click = () => {
+    button.clicks += 1;
+    document.body.childNodes.shift();
+    button.ownerDocument = { get body() { assert.fail("post-dispatch child read"); } };
+  };
+  assert.deepEqual(await semantic.performAction(activationTarget(document, button), "activate", {}, undefined, { document }), { activated: true });
+  assert.equal(button.clicks, 1);
+});
+
+test("lack of shared visits for privacy comparison returns uncertainty after one dispatch", async () => {
+  const button = branch("button", ["Activate"]);
+  const privateField = new FakeElement("input", { type: "password" });
+  const document = page(button, privateField, ...Array.from({ length: 12_000 }, () => new FakeElement("div")));
+  button.click = () => { button.clicks += 1; button.attributes["aria-pressed"] = "true"; };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  assert.equal(button.clicks, 1);
+});
+
+test("large activation observations reserve post capacity and ignore truncated lengths and bounds", async () => {
+  const button = branch("button", ["Activate"]);
+  const status = branch("output", ["Counter 0"]);
+  const rest = Array.from({ length: 650 }, () => branch("p", ["Filler text"]));
+  const document = page(button, status, ...rest);
+  button.click = () => { button.clicks += 1; status.textContent = "Counter 1"; };
+  assert.deepEqual(await semantic.performAction(activationTarget(document, button), "activate"), { activated: true });
+  button.click = () => {
+    button.clicks += 1;
+    for (const entry of rest) entry.rect.width = 100000;
+  };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  button.click = () => { button.clicks += 1; rest.at(-1).textContent = "Change beyond observation"; };
+  await assert.rejects(semantic.performAction(activationTarget(document, button), "activate"), { code: "no_observed_effect" });
+  assert.equal(button.clicks, 3);
+});
+
+test("activation phases share cumulative node, character, UTF-8 and visit limits", async (t) => {
+  for (const limits of [{ maxNodes: 500, maxChars: 100_000 }, { maxNodes: 1000, maxChars: 1024 },
+    { maxNodes: 1000, maxChars: 500_000 }]) {
+    await t.test(JSON.stringify(limits), () => {
+      const document = page(...Array.from({ length: 1100 }, () => branch("p", ["界".repeat(512)])));
+      const before = semantic.createSnapshot(document, { ...limits, activationObservation: true });
+      const consumed = { ...before.budget };
+      const after = semantic.createSnapshot(document, { sharedBudget: before.budget, activationObservation: true });
+      assert.equal(after.budget, before.budget);
+      assert.ok(before.result.nodes.length <= limits.maxNodes / 2);
+      assert.ok(after.result.nodes.length <= limits.maxNodes / 2);
+      assert.equal(after.budget.nodes, before.result.nodes.length + after.result.nodes.length);
+      assert.ok(after.budget.characters > consumed.characters);
+      assert.ok(after.budget.bytes > consumed.bytes);
+      assert.ok(after.budget.remaining < consumed.remaining);
+      assert.ok(after.budget.characters <= limits.maxChars);
+      assert.ok(after.budget.bytes <= 1024 * 1024 - 4096);
+      assert.ok(after.budget.nodes <= limits.maxNodes);
+    });
+  }
+  const entries = Array.from({ length: 12_000 }, () => new FakeElement("div"));
+  const document = page(...entries);
+  const before = semantic.createSnapshot(document, { activationObservation: true });
+  assert.equal(before.budget.remaining, 5000);
+  const after = semantic.createSnapshot(document, { sharedBudget: before.budget, activationObservation: true });
+  assert.equal(after.budget.remaining, 0);
+  assert.equal(after.result.truncated, true);
+});
+
+test("activation deadline and observer failures stay bounded and never echo page errors", async () => {
+  const button = branch("button", ["Activate"]);
+  const document = page(button);
+  const handle = activationTarget(document, button);
+  await assert.rejects(semantic.performAction(handle, "activate", {}, undefined, { deadline: Date.now() - 1 }), { code: "content_timeout" });
+  assert.equal(button.clicks, 0);
+  button.click = () => { button.clicks += 1; throw new Error("EXCLUDE_DISPATCH_ERROR"); };
+  await assert.rejects(semantic.performAction(handle, "activate"), (error) => error.code === "no_observed_effect" && !error.message.includes("EXCLUDE_DISPATCH_ERROR"));
+  assert.equal(button.clicks, 1);
+  Object.defineProperty(document, "body", { get() { throw new Error("EXCLUDE_OBSERVER_ERROR"); } });
+  await assert.rejects(semantic.performAction(handle, "activate"), (error) => error.code === "no_observed_effect" && !error.message.includes("EXCLUDE_OBSERVER_ERROR"));
+  assert.equal(button.clicks, 1, "failed pre-observation does not dispatch");
 });
 
 test("focus reports whether the target became active", async () => {
