@@ -22,6 +22,9 @@
       "pair",
       "deny",
       "release",
+      "frame-status",
+      "enable-frames",
+      "remove-frame-permission",
       "error",
     ].map((id) => [id, document.getElementById(id)]),
   );
@@ -29,6 +32,7 @@
   let countdownTimer = null;
   let pairingCandidateId = null;
   let reviewedAccess = null;
+  let reviewedPair = null;
 
   function originOnly(rawUrl) {
     try {
@@ -78,6 +82,13 @@
     const response = await send("popup_state");
     if (!response?.ok) throw new Error(response?.code ?? "Could not read Nova state");
     const { status, activePage, pairedPage, candidateId } = response;
+    reviewedPair = status.paired && status.route ? Object.freeze({ ...status.route }) : null;
+    elements["enable-frames"].disabled = !reviewedPair || Boolean(response.childFrames?.enabled);
+    elements["remove-frame-permission"].hidden = !response.childFrames?.permissionGranted;
+    elements["remove-frame-permission"].disabled = !response.childFrames?.permissionGranted;
+    elements["frame-status"].textContent = response.childFrames?.enabled
+      ? "Child reads enabled for this pairing. Only proven visible same-origin documents are included."
+      : "Top document only. Child reads are off for this pairing.";
     renderAccess(response.access);
     elements.connection.textContent = status.connected ? "Nova.app connected" : "Nova.app unavailable";
     elements.pending.hidden = true;
@@ -196,6 +207,47 @@
       await render();
     } catch (error) {
       showError(error.message);
+    }
+  });
+
+  elements["enable-frames"].addEventListener("click", () => {
+    const route = reviewedPair;
+    if (!route) return showError("Review and pair the page first");
+    elements["enable-frames"].disabled = true;
+    try {
+      // Optional metadata access must be requested directly in this gesture.
+      const request = chrome.permissions.request({ permissions: ["webNavigation"] });
+      void request.then(async (granted) => {
+        if (!granted) {
+          elements["frame-status"].textContent = "Frame metadata permission denied. Top-document reads and actions remain available.";
+          elements["enable-frames"].disabled = false;
+          return;
+        }
+        const response = await send("enable_child_frames", { route });
+        if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Could not enable child reads");
+        elements.error.hidden = true;
+        await render();
+      }).catch((error) => {
+        showError(error.message);
+        elements["enable-frames"].disabled = false;
+      });
+    } catch (error) {
+      showError(error.message);
+      elements["enable-frames"].disabled = false;
+    }
+  });
+
+  elements["remove-frame-permission"].addEventListener("click", async () => {
+    elements["remove-frame-permission"].disabled = true;
+    try {
+      if (!(await chrome.permissions.remove({ permissions: ["webNavigation"] }))) {
+        throw new Error("Chrome did not remove frame metadata permission");
+      }
+      elements.error.hidden = true;
+      await render();
+    } catch (error) {
+      showError(error.message);
+      elements["remove-frame-permission"].disabled = false;
     }
   });
 

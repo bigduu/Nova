@@ -7,6 +7,7 @@ const [popupSource, popupMarkup] = await Promise.all([
   readFile(new URL("../popup.js", import.meta.url), "utf8"),
   readFile(new URL("../popup.html", import.meta.url), "utf8"),
 ]);
+const manifest = JSON.parse(await readFile(new URL("../manifest.json", import.meta.url), "utf8"));
 const ids = [
   "connection",
   "access",
@@ -26,6 +27,9 @@ const ids = [
   "pair",
   "deny",
   "release",
+  "frame-status",
+  "enable-frames",
+  "remove-frame-permission",
   "error",
 ];
 
@@ -244,4 +248,61 @@ test("pair button confirms only the candidate returned by popup state", async ()
   assert.equal(sent[1].channel, "nova-extension-v1");
   assert.equal(sent[1].type, "confirm_pair");
   assert.equal(sent[1].candidateId, candidateId);
+});
+
+const pairedRoute = { tabId: 31, documentId: "paired-document", nonce: "paired-nonce", epoch: 4 };
+test("frame metadata permission is optional", () => {
+  assert.deepEqual(manifest.optional_permissions, ["webNavigation"]);
+  assert.equal(manifest.permissions.includes("webNavigation"), false);
+});
+const frameState = (childFrames = {}) => ({ ...consentState(),
+  status: { connected: true, paired: true, route: pairedRoute }, childFrames });
+
+test("optional frame request is a direct gesture and denial leaves top access available", async () => {
+  let inGesture = false;
+  const requests = [];
+  const { elements, sent } = await renderPopup(frameState(), {
+    request(options) {
+      assert.equal(inGesture, true);
+      requests.push(structuredClone(options));
+      return Promise.resolve(false);
+    },
+  });
+  assert.equal(elements["enable-frames"].disabled, false);
+  inGesture = true;
+  elements["enable-frames"].listeners.get("click")();
+  inGesture = false;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, [{ permissions: ["webNavigation"] }]);
+  assert.match(elements["frame-status"].textContent, /denied.*Top-document reads and actions/);
+  assert.equal(elements["enable-frames"].disabled, false);
+  assert.equal(sent.length, 1);
+  assert.match(popupMarkup, /across your browser/);
+  assert.match(popupMarkup, /queries only the paired tab/);
+});
+
+test("granted metadata alone stays off until the exact reviewed pairing is enabled", async () => {
+  let enabled = false;
+  const { elements, sent } = await renderPopup((message) => {
+    if (message.type === "enable_child_frames") { enabled = true; return { ok: true }; }
+    return frameState({ enabled, permissionGranted: true });
+  }, { request: () => Promise.resolve(true) });
+  assert.match(elements["frame-status"].textContent, /Top document only/);
+  elements["enable-frames"].listeners.get("click")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(structuredClone(sent[1].route), pairedRoute);
+  assert.equal(sent[1].type, "enable_child_frames");
+  assert.equal(elements["enable-frames"].disabled, true);
+  assert.match(elements["frame-status"].textContent, /Child reads enabled/);
+});
+
+test("frame permission removal requests only the optional metadata permission", async () => {
+  const removed = [];
+  const { elements } = await renderPopup(frameState({ enabled: true, permissionGranted: true }), {
+    remove(options) { removed.push(structuredClone(options)); return Promise.resolve(true); },
+  });
+  await elements["remove-frame-permission"].listeners.get("click")();
+  assert.deepEqual(removed, [{ permissions: ["webNavigation"] }]);
+  const unpaired = await renderPopup(consentState(), { request() { assert.fail("unpaired request"); } });
+  assert.equal(unpaired.elements["enable-frames"].disabled, true);
 });

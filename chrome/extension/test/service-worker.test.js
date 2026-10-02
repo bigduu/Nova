@@ -52,8 +52,8 @@ function callListener(listener, message, sender) {
 }
 
 async function waitForValue(read, description) {
-  const deadline = Date.now() + 1_000;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + 1_000;
+  while (performance.now() < deadline) {
     const value = read();
     if (value) return value;
     // A native/Web Crypto reply needs elapsed I/O time, not a fixed number
@@ -720,7 +720,7 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
       onMessage: extensionMessages,
     },
     permissions: {
-      contains: async ({ origins }) => origins.every((origin) => grants.has(origin)),
+      contains: async ({ origins = [], permissions = [] }) => [...origins, ...permissions].every((grant) => grants.has(grant)),
       onRemoved: eventHook(),
     },
     scripting: {
@@ -785,6 +785,360 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
       chrome.permissions.onRemoved.emit({ origins: [pattern] });
     },
   };
+}
+
+function frameRecord(frameId, parentFrameId, origin = "https://consent.example:8443") {
+  return { frameId, documentId: frameId === 0 ? "document-consent" : `document-child-${frameId}`,
+    parentFrameId, ...(frameId ? { parentDocumentId: parentFrameId === 0 ? "document-consent" : `document-child-${parentFrameId}` } : {}),
+    url: `${origin}/${frameId ? "same-child-url" : "review"}`, documentLifecycle: "active",
+    frameType: frameId ? "sub_frame" : "outermost_frame", errorOccurred: false };
+}
+
+async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7, 0), frameRecord(0, -1),
+  frameRecord(8, 7), frameRecord(3, 0)]) {
+  const fixture = await consentFixture(t);
+  const [semanticSource, contentSource] = await Promise.all([
+    readFile(new URL("../lib/semantic-runtime.js", import.meta.url), "utf8"),
+    readFile(new URL("../content-script.js", import.meta.url), "utf8"),
+  ]);
+  const contexts = new Map();
+  const documents = new Map();
+  const owners = new Map();
+  const targets = [];
+  const queries = [];
+  const rect = { x: 1, y: 2, width: 80, height: 20 };
+  class Element {
+    constructor(tagName, document, attributes = {}) {
+      Object.assign(this, { nodeType: 1, tagName, ownerDocument: document, attributes, isConnected: true,
+        firstChild: null, parentElement: null, parentNode: null, hidden: false, clicks: 0, value: "Initial top",
+        style: { display: "block", visibility: "visible", opacity: "1" } });
+    }
+    getAttribute(name) { return this.attributes[name] ?? null; }
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
+    closest() { return null; }
+    getRootNode() { return this.ownerDocument; }
+    getClientRects() { return [rect]; }
+    getBoundingClientRect() { return rect; }
+    click() { this.clicks += 1; }
+    focus() { this.ownerDocument.activeElement = this; }
+    dispatchEvent() { return true; }
+  }
+  class ShadowRoot { constructor(mode) { this.mode = mode; } }
+  for (const frame of frames) {
+    const document = { nodeType: 9, title: "Owned frame", readyState: "complete", addEventListener() {},
+      defaultView: { Event, HTMLIFrameElement: Element, ShadowRoot, getComputedStyle: (element) => element.style },
+      createRange() { return { setStart() {}, setEnd() {}, getClientRects: () => [rect], getBoundingClientRect: () => rect }; } };
+    document.body = new Element("BODY", document);
+    const control = new Element("BUTTON", document, { "aria-label": frame.frameId ? `CHILD_${frame.frameId}` : "Top action" });
+    control.parentElement = document.body;
+    document.body.firstChild = control;
+    documents.set(frame.frameId, document);
+    document.defaultView.document = document;
+    contexts.set(frame.frameId, vm.createContext({ document, window: document.defaultView,
+      chrome: { dom: { openOrClosedShadowRoot: () => null } }, TextEncoder, crypto: webcrypto,
+      addEventListener() {}, location: { href: frame.url }, setTimeout, clearTimeout, Date }));
+  }
+  const top = documents.get(0).defaultView;
+  top.top = top;
+  for (const frame of frames) {
+    if (!frame.frameId) continue;
+    const document = documents.get(frame.frameId);
+    const parentDocument = documents.get(frame.parentFrameId);
+    const owner = new Element("IFRAME", parentDocument);
+    owner.parentElement = parentDocument.body;
+    owner.contentWindow = document.defaultView;
+    owner.contentDocument = document;
+    Object.assign(document.defaultView, { top, parent: parentDocument.defaultView, frameElement: owner });
+    owners.set(frame.frameId, owner);
+  }
+  let contentListener;
+  contexts.get(0).chrome = { dom: { openOrClosedShadowRoot: () => null }, runtime: { id: fixture.chrome.runtime.id, lastError: null,
+    onMessage: { addListener(value) { contentListener = value; } },
+    sendMessage(message, callback) {
+      void callListener(fixture.chrome.runtime.onMessage.listeners[0], message, fixture.sender).then((reply) => callback?.(reply));
+    } } };
+  vm.runInContext(semanticSource, contexts.get(0));
+  await vm.runInContext(contentSource, contexts.get(0));
+  let scriptHook = () => {};
+  let queryHook = () => {};
+  fixture.chrome.scripting.executeScript = async (options) => {
+    assert.equal(options.target.tabId, fixture.tab.id);
+    assert.equal(options.world, "ISOLATED");
+    const frame = options.target.documentIds
+      ? frames.find((entry) => entry.documentId === options.target.documentIds[0]) : frames.find((entry) => entry.frameId === 0);
+    assert.ok(frame, "only exact inventoried documents may be injected");
+    targets.push({ frameId: frame.frameId, documentId: frame.documentId,
+      files: options.files, read: Boolean(options.func), budget: structuredClone(options.args?.[0]?.budget) });
+    const replacement = await scriptHook(options, frame);
+    if (replacement) return replacement;
+    let result;
+    if (!frame.frameId) { await contexts.get(0).NovaContentBridge.enable(); result = { ok: true }; }
+    else if (options.files) vm.runInContext(semanticSource, contexts.get(frame.frameId));
+    else result = vm.runInContext(`(${options.func.toString()})`, contexts.get(frame.frameId))(structuredClone(options.args[0]));
+    return [{ frameId: frame.frameId, documentId: frame.documentId, result }];
+  };
+  fixture.chrome.tabs.sendMessage = async (tabId, message, options) => {
+    assert.equal(tabId, fixture.tab.id);
+    assert.equal(options.documentId, fixture.sender.documentId);
+    fixture.contentMessages.push(structuredClone(message));
+    return new Promise((resolve) => { contentListener(message, { id: fixture.chrome.runtime.id }, resolve); });
+  };
+  fixture.chrome.webNavigation = { async getAllFrames(options) {
+    assert.deepEqual(options, { tabId: fixture.tab.id });
+    queries.push(options);
+    await queryHook(queries.length);
+    return structuredClone(frames);
+  } };
+  const route = await fixture.pair();
+  let readId = 0;
+  return { ...fixture, frames, route, documents, owners, targets, queries,
+    hookScript: (hook) => { scriptHook = hook; }, hookQuery: (hook) => { queryHook = hook; },
+    async enableChildren() {
+      fixture.grants.add("webNavigation");
+      assert.equal((await fixture.popup("enable_child_frames", { route })).ok, true);
+    },
+    async read(args = {}) {
+      const id = `child-read-${++readId}`;
+      fixture.request(id, "read", route, args);
+      return waitForValue(() => fixture.posted.find((message) => message.requestId === id), id);
+    },
+  };
+}
+
+test("optional metadata denial and permission grant alone keep top-only reads", async (t) => {
+  const f = await childWorkerFixture(t);
+  const forged = await callListener(f.chrome.runtime.onMessage.listeners[0], {
+    channel: "nova-extension-v1", type: "enable_child_frames", route: f.route,
+  }, { ...f.sender, frameId: 3 });
+  assert.equal(forged, undefined, "a content document cannot enable popup consent");
+  assert.equal((await f.popup("enable_child_frames", { route: f.route })).code, "frame_permission_denied");
+  assert.equal((await f.read()).result.coverage, "top_document");
+  f.grants.add("webNavigation");
+  assert.equal((await f.read()).result.coverage, "top_document");
+  assert.equal(f.queries.length, 0);
+  assert.equal((await f.popup("enable_child_frames", { route: { ...f.route, epoch: f.route.epoch + 1 } })).code, "stale_pair");
+  await f.enableChildren();
+  assert.equal((await f.read()).result.frameCoverage.documents, 5);
+});
+
+test("metadata removal fences an enable awaiting a previously granted permission", async (t) => {
+  const f = await childWorkerFixture(t);
+  f.grants.add("webNavigation");
+  const contains = f.chrome.permissions.contains.bind(f.chrome.permissions);
+  let captured = false;
+  let resume;
+  const held = new Promise((resolve) => { resume = resolve; });
+  f.chrome.permissions.contains = async (details) => {
+    const granted = await contains(details);
+    if (!captured && details.permissions?.includes("webNavigation")) {
+      captured = true;
+      await held;
+    }
+    return granted;
+  };
+  const pending = f.popup("enable_child_frames", { route: f.route });
+  await waitForValue(() => captured, "pending child enable");
+  f.grants.delete("webNavigation");
+  f.chrome.permissions.onRemoved.emit({ permissions: ["webNavigation"], origins: [] });
+  resume();
+  assert.equal((await pending).code, "stale_pair");
+  const removed = await f.popup("popup_state");
+  assert.equal(removed.status.paired, false);
+  assert.ok(removed.status.epoch > f.route.epoch);
+  assert.deepEqual(removed.childFrames, { enabled: false, permissionGranted: false });
+  f.grants.add("webNavigation");
+  f.request("repair-after-removed-enable", "pair");
+  const reviewed = await f.popup("popup_state");
+  const paired = await f.popup("confirm_pair", { candidateId: reviewed.candidateId });
+  assert.equal(paired.ok, true);
+  const route = paired.route;
+  f.request("read-after-removed-enable", "read", route);
+  const read = await waitForValue(() => f.posted.find((message) => message.requestId === "read-after-removed-enable"), "top-only repaired pair");
+  assert.equal(read.result.coverage, "top_document");
+  assert.equal((await f.popup("popup_state")).childFrames.enabled, false);
+  assert.equal(f.queries.length, 0);
+});
+
+test("nested same-URL documents read in browser preorder and child mutations never reach the top", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  const read = await f.read();
+  assert.equal(read.status, "ok");
+  assert.deepEqual(read.result.nodes.map((node) => node.name), ["Top action", "CHILD_3", "CHILD_9", "CHILD_7", "CHILD_8"]);
+  assert.deepEqual(read.result.frameCoverage, { status: "complete", documents: 5, reasons: [] });
+  const child = read.result.nodes[1];
+  assert.ok(child.nodeId.startsWith("child:3:document-child-3:"));
+  assert.notEqual(child.nodeId, read.result.nodes[3].nodeId);
+  assert.ok(read.result.nodes.slice(1).every((node) => !node.actions.length && !Object.hasOwn(node, "bounds")));
+  const targets = f.targets.length;
+  const sends = f.contentMessages.length;
+  for (const action of ["activate", "focus", "set_value", "scroll"]) {
+    f.request(`reject-child-${action}`, action, f.route, { snapshotId: read.result.snapshotId,
+      nodeId: child.nodeId, value: "Must not write", direction: "down" });
+    const rejected = await waitForValue(() => f.posted.find((reply) => reply.requestId === `reject-child-${action}`), action);
+    assert.equal(rejected.error.code, "read_only_child");
+  }
+  assert.equal(f.targets.length, targets, "reserved mutations cannot even bootstrap the top bridge");
+  assert.equal(f.contentMessages.length, sends);
+  const control = f.documents.get(0).body.firstChild;
+  assert.equal(control.clicks, 0);
+  f.request("actual-top-action", "activate", f.route, { snapshotId: read.result.snapshotId, nodeId: read.result.nodes[0].nodeId });
+  assert.equal((await waitForValue(() => f.posted.find((reply) => reply.requestId === "actual-top-action"), "top action")).status, "ok");
+  assert.equal(control.clicks, 1);
+  f.request("consumed-top-action", "activate", f.route, { snapshotId: read.result.snapshotId, nodeId: read.result.nodes[0].nodeId });
+  assert.equal((await waitForValue(() => f.posted.find((reply) => reply.requestId === "consumed-top-action"), "consumed action")).error.code, "stale_snapshot");
+});
+
+test("cross-origin ancestry including a returned top origin is never injected", async (t) => {
+  const f = await childWorkerFixture(t, [frameRecord(0, -1), frameRecord(1, 0, "https://other.example"), frameRecord(2, 1), frameRecord(3, 0)]);
+  await f.enableChildren();
+  const read = await f.read();
+  assert.deepEqual(read.result.nodes.map((node) => node.name), ["Top action", "CHILD_3"]);
+  assert.ok(read.result.frameCoverage.reasons.includes("cross_origin_ancestry"));
+  assert.equal(f.targets.some((target) => [1, 2].includes(target.frameId)), false);
+  assert.equal(JSON.stringify(read.result).includes("other.example"), false);
+});
+
+for (const [reason, exclude] of [
+  ["sandbox_owner", (f) => { f.owners.get(3).attributes.sandbox = "allow-same-origin"; }],
+  ["hidden_owner", (f) => { f.owners.get(3).hidden = true; }],
+  ["sensitive_owner", (f) => { f.owners.get(3).attributes["data-sensitive"] = ""; }],
+  ["closed_shadow_owner", (f) => { const view = f.documents.get(0).defaultView; f.owners.get(3).getRootNode = () => new view.ShadowRoot("closed"); }],
+  ["owner_unproven", (f) => { f.documents.get(3).defaultView.frameElement = null; }],
+  ["restricted_document", (f) => { f.frames.find((frame) => frame.frameId === 3).url = "about:blank"; }],
+  ["unproven_ancestry", (f) => { f.frames.find((frame) => frame.frameId === 3).parentDocumentId = "wrong-parent"; }],
+]) {
+  test(`${reason} omits child and nested text without affecting eligible siblings`, async (t) => {
+    const f = await childWorkerFixture(t);
+    await f.enableChildren();
+    exclude(f);
+    Object.defineProperty(f.documents.get(3), "body", { get() { assert.fail("excluded semantics must not be read"); } });
+    const read = await f.read();
+    assert.equal(read.status, "ok");
+    assert.ok(read.result.frameCoverage.reasons.includes(reason));
+    assert.equal(JSON.stringify(read.result).includes("CHILD_3"), false);
+    assert.equal(JSON.stringify(read.result).includes("CHILD_9"), false);
+    assert.equal(f.targets.some((target) => target.frameId === 9), false);
+    assert.ok(read.result.nodes.some((node) => node.name === "CHILD_7"));
+  });
+}
+
+test("all documents share root node and JSON budgets and at most eight reads/depth four", async (t) => {
+  const frames = [frameRecord(0, -1), ...Array.from({ length: 5 }, (_, i) => frameRecord(i + 1, i)),
+    ...Array.from({ length: 9 }, (_, i) => frameRecord(i + 6, 0))];
+  const f = await childWorkerFixture(t, frames);
+  await f.enableChildren();
+  const bounded = await f.read();
+  assert.equal(bounded.result.frameCoverage.documents, 8);
+  assert.ok(bounded.result.frameCoverage.reasons.includes("depth_limit"));
+  assert.ok(bounded.result.frameCoverage.reasons.includes("document_limit"));
+  assert.equal(f.targets.filter((target) => target.read).length, 7);
+  assert.equal(f.targets.some((target) => target.frameId === 5), false);
+  const small = await f.read({ maxNodes: 2, maxChars: 1024 });
+  assert.ok(small.result.nodes.length <= 2);
+  assert.ok(JSON.stringify(small.result).length <= 1024);
+  assert.ok(small.result.frameCoverage.reasons.includes("budget_exhausted"));
+  assert.equal(Object.hasOwn(small.result, "readBudget"), false);
+});
+
+test("changed child document identities discard every aggregated child", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.hookQuery((count) => { if (count === 2) f.frames.find((frame) => frame.frameId === 9).documentId = "navigated-child"; });
+  const read = await f.read();
+  assert.deepEqual(read.result.nodes.map((node) => node.name), ["Top action"]);
+  assert.deepEqual(read.result.frameCoverage.reasons, ["stale_child_documents"]);
+  assert.equal(read.result.frameCoverage.documents, 1);
+});
+
+test("a mismatched InjectionResult cannot fall back to a same-URL sibling", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.hookScript((options, frame) => frame.frameId === 3 && options.files
+    ? [{ frameId: 7, documentId: "document-child-7" }] : null);
+  const read = await f.read();
+  assert.ok(read.result.frameCoverage.reasons.includes("stale_child_documents"));
+  assert.equal(read.result.nodes.length, 1);
+  assert.equal(f.targets.some((target) => target.read), false);
+});
+
+test("Chrome denial for one child is a private partial exclusion and eligible siblings remain", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.hookScript((_options, frame) => { if (frame.frameId === 3) throw new Error("DO_NOT_LEAK_CHILD_URL_OR_ERROR"); });
+  const read = await f.read();
+  assert.ok(read.result.frameCoverage.reasons.includes("owner_unproven"));
+  assert.ok(read.result.nodes.some((node) => node.name === "CHILD_7"));
+  assert.equal(read.result.nodes.some((node) => node.name === "CHILD_3"), false);
+  assert.equal(JSON.stringify(read).includes("DO_NOT_LEAK"), false);
+});
+
+test("native release and worker restart require a fresh volatile opt-in even when permission remains", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.request("release-child-route", "release", f.route);
+  await waitForValue(() => f.posted.find((message) => message.requestId === "release-child-route"), "child release");
+  assert.equal((await f.popup("popup_state")).childFrames.enabled, false);
+  f.request("repair-child-route", "pair");
+  const candidate = await f.popup("popup_state");
+  const paired = await f.popup("confirm_pair", { candidateId: candidate.candidateId });
+  assert.equal(paired.ok, true);
+  f.request("read-after-repair", "read", paired.route);
+  const read = await waitForValue(() => f.posted.find((message) => message.requestId === "read-after-repair"), "fresh top-only read");
+  assert.equal(read.result.coverage, "top_document");
+  assert.equal((await f.popup("enable_child_frames", { route: paired.route })).ok, true);
+  await import(`../service-worker.js?child-restart=${++consentFixtureId}`);
+  const listeners = f.chrome.runtime.onMessage.listeners;
+  const restarted = await callListener(listeners.at(-1), { channel: "nova-extension-v1", type: "popup_state" }, {
+    id: f.chrome.runtime.id, url: `chrome-extension://${f.chrome.runtime.id}/popup.html`,
+  });
+  assert.equal(restarted.status.paired, false);
+  assert.equal(restarted.childFrames.enabled, false);
+  assert.equal(restarted.childFrames.permissionGranted, true);
+});
+
+test("one absolute content deadline spans root bootstrap and every child", async (t) => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.hookScript((_options, frame) => { if (frame.frameId) now += 4000; });
+  const read = await f.read();
+  const rootDeadline = f.contentMessages.find((message) => message.action === "read").deadline;
+  assert.ok(f.targets.filter((target) => target.read).every((target) => target.budget.deadline === rootDeadline));
+  assert.equal(read.result.nodes.length, 1, "expired aggregation discards already read child data");
+  assert.ok(read.result.frameCoverage.reasons.includes("deadline"));
+  assert.equal(f.targets.filter((target) => target.read).length, 1);
+});
+
+for (const mode of ["navigation", "metadata removal", "popup release"]) {
+  test(`${mode} during child aggregation revokes the existing epoch and drops stale results`, async (t) => {
+    const f = await childWorkerFixture(t);
+    await f.enableChildren();
+    let reached;
+    let resume;
+    const started = new Promise((resolve) => { reached = resolve; });
+    const hold = new Promise((resolve) => { resume = resolve; });
+    f.hookScript(async (options, frame) => { if (frame.frameId === 3 && options.func) { reached(); await hold; } });
+    const pending = f.read();
+    await started;
+    if (mode === "navigation") f.chrome.tabs.onUpdated.emit(f.tab.id, { status: "loading" });
+    if (mode === "metadata removal") {
+      f.grants.delete("webNavigation");
+      f.chrome.permissions.onRemoved.emit({ permissions: ["webNavigation"] });
+    }
+    if (mode === "popup release") assert.equal((await f.popup("release_pair")).ok, true);
+    resume();
+    const stale = await pending;
+    assert.equal(Object.hasOwn(stale, "result"), false);
+    const popup = await f.popup("popup_state");
+    assert.equal(popup.status.paired, false);
+    assert.equal(popup.childFrames.enabled, false);
+    assert.equal(popup.status.epoch, f.route.epoch + 1);
+    const before = f.targets.length;
+    assert.equal((await f.read()).error.code, "not_paired");
+    assert.equal(f.targets.length, before);
+  });
 }
 
 test("fresh consent state never injects or pairs until the reviewed HTTP tab is enabled", async (t) => {
