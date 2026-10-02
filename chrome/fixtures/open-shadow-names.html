@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova shadow names fixture</title>
+<style>body{margin:28px;font:18px/1.7 system-ui} input{font:inherit;padding:5px}.host{padding:12px;border:1px solid #aaa;margin:16px 0}</style>
+<h1>Nova shadow names 验收</h1>
+<div id="unassigned-host" class="host"><span id="unassigned-label" slot="missing">EXCLUDE_UNASSIGNED_LABEL</span><input slot="shown" aria-labelledby="unassigned-label" placeholder="Unassigned label fallback"></div>
+<div id="fallback-host" class="host"><span slot="chosen">Assigned visible child</span></div>
+<p>Outside names ending</p>
+<script>
+document.getElementById('unassigned-host').attachShadow({mode:'open'}).innerHTML='<p>Unassigned label case</p><slot name="shown"></slot>';
+document.getElementById('fallback-host').attachShadow({mode:'open'}).innerHTML='<p>Unused fallback label case</p><slot name="chosen"><span id="fallback-label">EXCLUDE_UNUSED_FALLBACK_LABEL</span></slot><input aria-labelledby="fallback-label" placeholder="Unused fallback safe name">';
+</script>
