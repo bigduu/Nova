@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::platform::UiTree as _;
 /// MCP server lifecycle — tool registration, transport dispatch, and handler routing.
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -12,6 +14,39 @@ pub fn ok_text(msg: impl Into<String>) -> rmcp::model::CallToolResult {
 /// Create an error text result (isError: true).
 pub fn err_result(msg: &str) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)])
+}
+
+pub(crate) fn ax_set_value_with(
+    ui_tree: &dyn crate::platform::UiTree,
+    pid: i32,
+    query: &str,
+    value: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<String, String> {
+    let metadata = crate::tools::input::input_metadata(value);
+    tracing::info!(
+        chars = metadata.chars,
+        bytes = metadata.bytes,
+        "setting native UI value"
+    );
+    ui_tree
+        .ax_set_value(pid, query, value, deadline)
+        .map(|message| {
+            format!(
+                "{} (chars={}, bytes={})",
+                crate::tools::input::redact_diagnostic(value, message),
+                metadata.chars,
+                metadata.bytes
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "{} (chars={}, bytes={})",
+                crate::tools::input::redact_diagnostic(value, error),
+                metadata.chars,
+                metadata.bytes
+            )
+        })
 }
 
 /// Create a successful image result with proper MCP ImageContent.
@@ -73,6 +108,9 @@ pub struct NovaServer {
     /// Chrome document. Ordinary stdio/HTTP sessions deliberately leave this
     /// unset; only the independent Nova.app service injects it.
     chrome_bridge: Option<nova_chrome_bridge::ChromeBridge>,
+    // Private, per-server adapters keep write-handler tests off the desktop.
+    #[cfg(test)]
+    native_write_fixture: Option<std::sync::Arc<input_redaction_tests::Fixture>>,
 }
 
 #[derive(Debug, Default)]
@@ -269,6 +307,14 @@ impl NovaServer {
     async fn current_ax_pid(&self) -> Option<i32> {
         let cached = *self.target_pid.lock().expect("target_pid mutex");
         let deadline = std::time::Instant::now() + READ_UI_TIMEOUT;
+        #[cfg(test)]
+        if let Some(fixture) = &self.native_write_fixture {
+            return fixture
+                .ui_tree
+                .resolve_target(None, cached, deadline)
+                .ok()
+                .map(|target| target.pid);
+        }
         tokio::task::spawn_blocking(move || {
             crate::platform::ui_tree()
                 .resolve_target(None, cached, deadline)
@@ -2269,13 +2315,20 @@ impl NovaServer {
         name = "type_text",
         description = "Type a string of text into the currently focused element."
     )]
-    #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
+    #[tracing::instrument(skip_all, fields(chars = p.text.chars().count(), bytes = p.text.len()), level = "info")]
     async fn type_text(
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::platform::input().type_text(&p.text, self.current_target(p.background)) {
-            Ok(()) => ok_text(format!("typed \"{}\"", p.text)),
+        let input = crate::platform::input();
+        #[cfg(test)]
+        let input = self
+            .native_write_fixture
+            .as_ref()
+            .map_or(input, |fixture| &fixture.input);
+        match crate::tools::input::type_text_with(input, &p.text, self.current_target(p.background))
+        {
+            Ok(ack) => ok_text(ack),
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -2349,7 +2402,13 @@ impl NovaServer {
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn read_clipboard(&self) -> rmcp::model::CallToolResult {
-        match crate::tools::clipboard::read_clipboard() {
+        let clipboard = crate::platform::clipboard();
+        #[cfg(test)]
+        let clipboard = self
+            .native_write_fixture
+            .as_ref()
+            .map_or(clipboard, |fixture| &fixture.clipboard);
+        match clipboard.read() {
             Ok(text) => ok_text(text),
             Err(e) => err_result(&e.to_string()),
         }
@@ -2359,13 +2418,25 @@ impl NovaServer {
         name = "write_clipboard",
         description = "Write text to the system clipboard."
     )]
-    #[tracing::instrument(skip_all, fields(text = %p.text), level = "info")]
+    #[tracing::instrument(skip_all, fields(chars = p.text.chars().count(), bytes = p.text.len()), level = "info")]
     async fn write_clipboard(
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::clipboard::write_clipboard(&p.text) {
-            Ok(()) => ok_text("written to clipboard"),
+        let clipboard = crate::platform::clipboard();
+        #[cfg(test)]
+        let clipboard = self
+            .native_write_fixture
+            .as_ref()
+            .map_or(clipboard, |fixture| &fixture.clipboard);
+        match crate::tools::clipboard::write_clipboard_with(clipboard, &p.text) {
+            Ok(()) => {
+                let metadata = crate::tools::input::input_metadata(&p.text);
+                ok_text(format!(
+                    "written to clipboard (chars={}, bytes={})",
+                    metadata.chars, metadata.bytes
+                ))
+            }
             Err(e) => err_result(&e.to_string()),
         }
     }
@@ -2392,10 +2463,17 @@ impl NovaServer {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> rmcp::model::CallToolResult {
-        match crate::tools::batch::execute_batch(
+        let input = crate::platform::input();
+        #[cfg(test)]
+        let input = self
+            .native_write_fixture
+            .as_ref()
+            .map_or(input, |fixture| &fixture.input);
+        match crate::tools::batch::execute_batch_with(
             p.actions,
             self.current_view(),
             self.current_target(false),
+            input,
         )
         .await
         {
@@ -2442,7 +2520,7 @@ impl NovaServer {
                        or Windows UI Automation. Background, no cursor. Ambiguous substring matches \
                        fail closed; prefer a fresh ax_read node whenever possible."
     )]
-    #[tracing::instrument(skip_all, fields(query = %p.query), level = "info")]
+    #[tracing::instrument(skip_all, fields(query = %crate::tools::input::redact_diagnostic(&p.value, &p.query), chars = p.value.chars().count(), bytes = p.value.len()), level = "info")]
     async fn ax_set_value(
         &self,
         Parameters(p): Parameters<AxSetValueParams>,
@@ -2453,15 +2531,24 @@ impl NovaServer {
         let query = p.query;
         let value = p.value;
         let deadline = std::time::Instant::now() + AX_ACTION_TIMEOUT;
+        #[cfg(test)]
+        let fixture = self.native_write_fixture.clone();
         let task = tokio::task::spawn_blocking(move || {
-            crate::platform::ui_tree().ax_set_value(pid, &query, &value, deadline)
+            let ui_tree = crate::platform::ui_tree();
+            #[cfg(test)]
+            let ui_tree = fixture.as_ref().map_or(ui_tree, |fixture| &fixture.ui_tree);
+            ax_set_value_with(ui_tree, pid, &query, &value, deadline)
         });
         match tokio::time::timeout(AX_ACTION_TIMEOUT + std::time::Duration::from_secs(1), task)
             .await
         {
             Ok(Ok(Ok(message))) => ok_text(message),
             Ok(Ok(Err(error))) => err_result(&error),
-            Ok(Err(join_error)) => err_result(&format!("ax_set_value task failed: {join_error}")),
+            Ok(Err(join_error)) => err_result(if join_error.is_panic() {
+                "ax_set_value worker panicked"
+            } else {
+                "ax_set_value worker was cancelled"
+            }),
             Err(_) => err_result("ax_set_value exceeded its bounded action deadline"),
         }
     }
@@ -3997,5 +4084,499 @@ mod tests {
                 < ocr_run_timeout(crate::platform::OcrMode::Auto)
         );
         assert_eq!(OCR_MAX_CONCURRENT, 2);
+    }
+}
+
+#[cfg(test)]
+mod input_redaction_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const SECRET: &str = "pāss🔐word";
+    const QUERY: &str = "Password field";
+
+    #[derive(Debug)]
+    pub(super) struct Fixture {
+        pub(super) input: FakeInput,
+        pub(super) clipboard: FakeClipboard,
+        pub(super) ui_tree: FakeUiTree,
+    }
+
+    fn fixture_server(fail: bool) -> (NovaServer, Arc<Fixture>) {
+        let fixture = Arc::new(Fixture {
+            input: FakeInput {
+                fail,
+                ..FakeInput::default()
+            },
+            clipboard: FakeClipboard {
+                fail,
+                ..FakeClipboard::default()
+            },
+            ui_tree: FakeUiTree {
+                fail,
+                ..FakeUiTree::default()
+            },
+        });
+        let server = NovaServer {
+            native_write_fixture: Some(fixture.clone()),
+            ..NovaServer::new()
+        };
+        server.set_view(crate::display::view::ViewFrame {
+            origin: (0.0, 0.0),
+            region: (1.0, 1.0),
+            screenshot: (1.0, 1.0),
+        });
+        (server, fixture)
+    }
+
+    #[derive(Clone, Default)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    struct WriterGuard(Arc<Mutex<Vec<u8>>>);
+    impl<'a> MakeWriter<'a> for Writer {
+        type Writer = WriterGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            WriterGuard(self.0.clone())
+        }
+    }
+    impl std::io::Write for WriterGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn trace_capture() -> (Writer, tracing::subscriber::DefaultGuard) {
+        let writer = Writer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(writer.clone())
+            .finish();
+        (writer, tracing::subscriber::set_default(subscriber))
+    }
+    fn trace_text(writer: &Writer) -> String {
+        String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn result_text(result: &rmcp::model::CallToolResult) -> &str {
+        &result.content[0].as_text().expect("text response").text
+    }
+    fn assert_safe(text: &str) {
+        assert!(!text.contains(SECRET), "plaintext leaked: {text}");
+        assert!(
+            text.contains("chars=9"),
+            "character metadata missing: {text}"
+        );
+        assert!(text.contains("bytes=13"), "byte metadata missing: {text}");
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct FakeInput {
+        received: Mutex<Option<String>>,
+        fail: bool,
+    }
+    impl crate::platform::InputInjector for FakeInput {
+        fn mouse_move(&self, _: f64, _: f64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn cursor_position(&self) -> crate::error::Result<(f64, f64)> {
+            Ok((0.0, 0.0))
+        }
+        fn left_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn right_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn double_click_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn scroll_at(
+            &self,
+            _: f64,
+            _: f64,
+            _: i32,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn key_combo(
+            &self,
+            _: &str,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn type_text(
+            &self,
+            text: &str,
+            _: crate::tools::input::InputTarget,
+        ) -> crate::error::Result<()> {
+            *self.received.lock().unwrap() = Some(text.to_string());
+            if self.fail {
+                Err(crate::error::NovaError::Input(format!(
+                    "input route=hid failed: {text:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct FakeClipboard {
+        received: Mutex<Option<String>>,
+        fail: bool,
+    }
+    impl crate::platform::Clipboard for FakeClipboard {
+        fn read(&self) -> crate::error::Result<String> {
+            Ok(SECRET.to_string())
+        }
+        fn write(&self, text: &str) -> crate::error::Result<()> {
+            *self.received.lock().unwrap() = Some(text.to_string());
+            if self.fail {
+                Err(crate::error::NovaError::Clipboard(format!(
+                    "route=pbcopy failed: {text}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct FakeUiTree {
+        received: Mutex<Option<String>>,
+        fail: bool,
+        panic: bool,
+    }
+    impl crate::platform::UiTree for FakeUiTree {
+        fn resolve_target(
+            &self,
+            _: Option<&str>,
+            _: Option<i32>,
+            _: std::time::Instant,
+        ) -> Result<crate::platform::UiTarget, crate::platform::UiReadError> {
+            Ok(crate::platform::UiTarget {
+                pid: 42,
+                app_name: "fixture".into(),
+                window_title: "fixture".into(),
+                window_id: None,
+                bounds: None,
+            })
+        }
+        fn read_snapshot(
+            &self,
+            _: &crate::platform::UiTarget,
+            _: crate::platform::UiSnapshotOptions,
+        ) -> Result<crate::platform::UiSnapshot, crate::platform::UiReadError> {
+            unreachable!()
+        }
+        fn collect_actionable(
+            &self,
+            _: i32,
+            _: usize,
+            _: Option<(f64, f64, f64, f64)>,
+        ) -> Vec<(
+            crate::tools::elements::UiElement,
+            Box<dyn crate::platform::ElementHandle>,
+        )> {
+            Vec::new()
+        }
+        fn ax_click(&self, _: i32, _: &str, _: std::time::Instant) -> Result<String, String> {
+            unreachable!()
+        }
+        fn ax_set_value(
+            &self,
+            _: i32,
+            query: &str,
+            value: &str,
+            _: std::time::Instant,
+        ) -> Result<String, String> {
+            *self.received.lock().unwrap() = Some(value.to_string());
+            if self.panic {
+                panic!("fixture provider panic value={value}");
+            }
+            if self.fail {
+                Err(format!(
+                    "route=uia provider error query={query:?} value={value:?}"
+                ))
+            } else {
+                Ok(format!(
+                    "route=ax provider ack query={query:?} value={value:?}"
+                ))
+            }
+        }
+        fn ax_focus(&self, _: i32, _: &str, _: std::time::Instant) -> Result<String, String> {
+            unreachable!()
+        }
+        fn raise_app(&self, _: i32) {}
+        fn dump_tree(&self, _: i32, _: usize) -> String {
+            String::new()
+        }
+        fn keep_warm(&self, _: i32) {}
+        fn clear_warm(&self) {}
+    }
+
+    #[test]
+    fn metadata_distinguishes_unicode_chars_and_bytes() {
+        assert_eq!(
+            crate::tools::input::input_metadata(SECRET),
+            crate::tools::input::InputMetadata {
+                chars: 9,
+                bytes: 13
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn type_text_handler_success_and_failure_are_redacted() {
+        for fail in [false, true] {
+            let (server, fixture) = fixture_server(fail);
+            let (writer, _guard) = trace_capture();
+            let result = server
+                .type_text(Parameters(TypeParams {
+                    text: SECRET.into(),
+                    background: false,
+                }))
+                .await;
+            let output = result_text(&result);
+            assert_eq!(result.is_error.unwrap_or_default(), fail);
+            assert_safe(output);
+            assert_eq!(
+                fixture.input.received.lock().unwrap().as_deref(),
+                Some(SECRET)
+            );
+            let trace = trace_text(&writer);
+            assert!(
+                trace.contains("type_text{"),
+                "handler span missing: {trace}"
+            );
+            assert_safe(&trace);
+            if fail {
+                assert_eq!(output.matches("input event failed:").count(), 1);
+                assert!(output.contains("input route=hid failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_clipboard_handler_success_and_failure_are_redacted() {
+        for fail in [false, true] {
+            let (server, fixture) = fixture_server(fail);
+            let (writer, _guard) = trace_capture();
+            let result = server
+                .write_clipboard(Parameters(TypeParams {
+                    text: SECRET.into(),
+                    background: false,
+                }))
+                .await;
+            let output = result_text(&result);
+            assert_eq!(result.is_error.unwrap_or_default(), fail);
+            assert_safe(output);
+            assert_eq!(
+                fixture.clipboard.received.lock().unwrap().as_deref(),
+                Some(SECRET)
+            );
+            let trace = trace_text(&writer);
+            assert!(
+                trace.contains("write_clipboard{"),
+                "handler span missing: {trace}"
+            );
+            assert_safe(&trace);
+            if fail {
+                assert_eq!(output.matches("clipboard operation failed:").count(), 1);
+                assert!(output.contains("route=pbcopy failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_type_text_handler_success_and_failure_are_redacted() {
+        for fail in [false, true] {
+            let (server, fixture) = fixture_server(fail);
+            let (writer, _guard) = trace_capture();
+            let result = server
+                .batch_actions(Parameters(BatchParams {
+                    actions: vec![crate::tools::batch::BatchAction::TypeText {
+                        text: SECRET.into(),
+                    }],
+                }))
+                .await;
+            let output = result_text(&result);
+            assert_eq!(result.is_error.unwrap_or_default(), fail);
+            assert_safe(output);
+            assert_eq!(
+                fixture.input.received.lock().unwrap().as_deref(),
+                Some(SECRET)
+            );
+            let trace = trace_text(&writer);
+            assert!(
+                trace.contains("batch_actions{"),
+                "handler span missing: {trace}"
+            );
+            assert_safe(&trace);
+            if fail {
+                assert!(output.contains("input route=hid failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ax_set_value_handler_redacts_value_including_query_overlap() {
+        for fail in [false, true] {
+            let (server, fixture) = fixture_server(fail);
+            let (writer, _guard) = trace_capture();
+            let result = server
+                .ax_set_value(Parameters(AxSetValueParams {
+                    query: format!("{QUERY} {SECRET}"),
+                    value: SECRET.into(),
+                }))
+                .await;
+            let output = result_text(&result);
+            assert_eq!(result.is_error.unwrap_or_default(), fail);
+            assert_safe(output);
+            assert!(output.contains(QUERY));
+            assert!(output.contains(if fail {
+                "route=uia provider error"
+            } else {
+                "route=ax provider ack"
+            }));
+            assert_eq!(
+                fixture.ui_tree.received.lock().unwrap().as_deref(),
+                Some(SECRET)
+            );
+            let trace = trace_text(&writer);
+            assert!(
+                trace.contains("ax_set_value{"),
+                "handler span missing: {trace}"
+            );
+            assert!(trace.contains(QUERY));
+            assert_safe(&trace);
+        }
+    }
+
+    #[tokio::test]
+    async fn ax_set_value_handler_redacts_debug_escaped_query_overlap() {
+        let value = "pāss🔐\n\"quoted\\path";
+        let debug = format!("{value:?}");
+        let escaped = &debug[1..debug.len() - 1];
+        for fail in [false, true] {
+            let (server, fixture) = fixture_server(fail);
+            let (writer, _guard) = trace_capture();
+            let result = server
+                .ax_set_value(Parameters(AxSetValueParams {
+                    query: format!("{QUERY} {value}"),
+                    value: value.into(),
+                }))
+                .await;
+            assert_eq!(result.is_error.unwrap_or_default(), fail);
+            let output = result_text(&result);
+            assert!(!output.contains(value));
+            assert!(!output.contains(escaped), "escaped input leaked: {output}");
+            assert!(output.contains(QUERY));
+            assert!(output.contains(if fail { "route=uia" } else { "route=ax" }));
+            assert!(output.contains(&format!("chars={}", value.chars().count())));
+            assert!(output.contains(&format!("bytes={}", value.len())));
+            assert_eq!(
+                fixture.ui_tree.received.lock().unwrap().as_deref(),
+                Some(value)
+            );
+            let trace = trace_text(&writer);
+            assert!(trace.contains("ax_set_value{"));
+            assert!(!trace.contains(value));
+            assert!(!trace.contains(escaped));
+        }
+    }
+
+    #[test]
+    fn ax_set_value_success_and_failure_are_redacted() {
+        let tree = FakeUiTree {
+            received: Mutex::new(None),
+            fail: false,
+            panic: false,
+        };
+        let (writer, _guard) = trace_capture();
+        let result =
+            ax_set_value_with(&tree, 42, QUERY, SECRET, std::time::Instant::now()).unwrap();
+        assert_eq!(tree.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&result);
+        assert!(
+            result.contains("route=ax"),
+            "safe provider route lost: {result}"
+        );
+        assert_safe(&trace_text(&writer));
+        drop(_guard);
+        let tree = FakeUiTree {
+            received: Mutex::new(None),
+            fail: true,
+            panic: false,
+        };
+        let (writer, _guard) = trace_capture();
+        let error =
+            ax_set_value_with(&tree, 42, QUERY, SECRET, std::time::Instant::now()).unwrap_err();
+        assert_eq!(tree.received.lock().unwrap().as_deref(), Some(SECRET));
+        assert_safe(&error);
+        assert!(
+            error.contains("route=uia"),
+            "safe provider route lost: {error}"
+        );
+        assert_safe(&trace_text(&writer));
+    }
+
+    #[tokio::test]
+    async fn ax_set_value_handler_does_not_return_provider_panic_payload() {
+        let fixture = Arc::new(Fixture {
+            input: FakeInput::default(),
+            clipboard: FakeClipboard::default(),
+            ui_tree: FakeUiTree {
+                panic: true,
+                ..FakeUiTree::default()
+            },
+        });
+        let server = NovaServer {
+            native_write_fixture: Some(fixture.clone()),
+            ..NovaServer::new()
+        };
+        let (writer, _guard) = trace_capture();
+        let result = server
+            .ax_set_value(Parameters(AxSetValueParams {
+                query: QUERY.into(),
+                value: SECRET.into(),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result_text(&result), "ax_set_value worker panicked");
+        assert_eq!(
+            fixture.ui_tree.received.lock().unwrap().as_deref(),
+            Some(SECRET)
+        );
+        assert_safe(&trace_text(&writer));
+    }
+
+    #[tokio::test]
+    async fn read_clipboard_handler_remains_plaintext_without_writing() {
+        let (server, fixture) = fixture_server(false);
+        let result = server.read_clipboard().await;
+        assert_eq!(result_text(&result), SECRET);
+        assert_eq!(fixture.clipboard.received.lock().unwrap().as_deref(), None);
     }
 }
