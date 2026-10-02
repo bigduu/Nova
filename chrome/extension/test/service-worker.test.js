@@ -819,7 +819,7 @@ async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7,
     getRootNode() { return this.ownerDocument; }
     getClientRects() { return [rect]; }
     getBoundingClientRect() { return rect; }
-    click() { this.clicks += 1; }
+    click() { this.clicks += 1; this.attributes["aria-pressed"] = "true"; }
     focus() { this.ownerDocument.activeElement = this; }
     dispatchEvent() { return true; }
   }

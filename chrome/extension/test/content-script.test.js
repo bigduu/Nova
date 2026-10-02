@@ -105,6 +105,240 @@ function pendingReceipt() {
   };
 }
 
+async function activationFixture() {
+  const fixture = await valueReceiptFixture();
+  const button = { ...fixture.fields[0], tagName: "BUTTON", attributes: { "aria-label": "Activate fixture" },
+    value: undefined, firstChild: null, nextSibling: null, clicks: 0,
+    click() { this.clicks += 1; this.onClick?.(); } };
+  fixture.fields[1].nextSibling = button;
+  return { ...fixture, button,
+    activate(snapshot, deadline) {
+      const message = fixture.mutation(snapshot, "unused");
+      message.action = "activate";
+      message.args.nodeId = snapshot.result.nodes.find((node) => node.name === "Activate fixture").nodeId;
+      if (deadline !== undefined) message.deadline = deadline;
+      return fixture.command(message);
+    },
+  };
+}
+
+async function externalLabelActivationFixture(naming, privateBefore) {
+  const fixture = await activationFixture();
+  const document = fixture.context.document;
+  const field = fixture.fields[1];
+  const label = { ...fixture.fields[0], tagName: "LABEL", value: undefined,
+    attributes: { id: "external-label", for: "external-field", ...(privateBefore ? { "data-private": "" } : {}) },
+    nextSibling: fixture.host.firstChild };
+  const data = "External rendered label 中文 🪷";
+  label.firstChild = { nodeType: 3, data, length: data.length, isConnected: true,
+    parentElement: label, ownerDocument: document };
+  fixture.host.firstChild = label;
+  document.getElementById = (id) => id === "external-label" ? label : null;
+  document.createRange = () => ({ setStart() {}, setEnd() {},
+    getClientRects: () => fixture.button.getClientRects(), getBoundingClientRect: () => fixture.button.getBoundingClientRect() });
+  field.attributes = { id: "external-field", ...(naming === "aria-labelledby" ? { "aria-labelledby": "external-label" } : {}) };
+  if (naming === "associated-label") field.labels = [label];
+  fixture.button.onClick = () => {
+    if (privateBefore) delete label.attributes["data-private"];
+    else label.attributes["data-private"] = "";
+  };
+  return { ...fixture, label, field };
+}
+
+test("inline content name privacy toggles return no effect and consume snapshots in both directions", async (t) => {
+  for (const privateBefore of [false, true]) {
+    await t.test(privateBefore ? "private-to-public" : "public-to-private", async () => {
+      const fixture = await activationFixture();
+      const document = fixture.context.document;
+      const button = fixture.button;
+      button.attributes = {};
+      const caption = { ...button, tagName: "SPAN", parentElement: button, nextSibling: null,
+        attributes: privateBefore ? { "data-private": "" } : {} };
+      const text = (data, parentElement) => ({ nodeType: 3, data, length: data.length, isConnected: true,
+        ownerDocument: document, parentElement, nextSibling: null });
+      const prefix = text("Public prefix ", button);
+      prefix.nextSibling = caption;
+      caption.firstChild = text("Caption unchanged", caption);
+      button.firstChild = prefix;
+      document.createRange = () => ({ setStart() {}, setEnd() {}, getClientRects: () => button.getClientRects(),
+        getBoundingClientRect: () => button.getBoundingClientRect() });
+      button.onClick = () => {
+        if (privateBefore) delete caption.attributes["data-private"];
+        else caption.attributes["data-private"] = "";
+      };
+      const observed = () => JSON.stringify([prefix.data, caption.firstChild.data, fixture.fields[1].value,
+        document.defaultView.getComputedStyle(button), document.defaultView.getComputedStyle(caption),
+        button.getBoundingClientRect(), caption.getBoundingClientRect()]);
+      const unchanged = observed();
+      const snapshot = await fixture.read();
+      const target = snapshot.result.nodes.find((node) => node.role === "button");
+      assert.equal(target.name, privateBefore ? "Public prefix" : "Public prefix Caption unchanged");
+      const message = fixture.mutation(snapshot, "unused");
+      message.action = "activate";
+      message.args.nodeId = target.nodeId;
+      const result = await fixture.command(message);
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "no_observed_effect");
+      assert.match(result.message, /DOM dispatch may already have had side effects/u);
+      assert.match(result.message, /read or inspect the page before retrying/u);
+      for (const raw of [prefix.data.trim(), caption.firstChild.data, fixture.fields[1].value]) {
+        assert.equal(JSON.stringify(result).includes(raw), false);
+      }
+      assert.equal(observed(), unchanged);
+      assert.equal(caption.hasAttribute("data-private"), !privateBefore);
+      assert.equal(button.clicks, 1);
+      assert.equal((await fixture.command(message)).code, "stale_snapshot");
+      assert.equal(button.clicks, 1);
+    });
+  }
+});
+
+test("external label privacy toggles return no effect and consume snapshots across both paths/directions", async (t) => {
+  for (const naming of ["aria-labelledby", "associated-label"]) {
+    for (const privateBefore of [false, true]) {
+      await t.test(`${naming} ${privateBefore ? "private-to-public" : "public-to-private"}`, async () => {
+        const fixture = await externalLabelActivationFixture(naming, privateBefore);
+        const snapshot = await fixture.read();
+        const result = await fixture.activate(snapshot);
+        assert.equal(result.code, "no_observed_effect");
+        assert.match(result.message, /DOM dispatch may already have had side effects/u);
+        assert.equal(fixture.button.clicks, 1);
+        assert.equal(fixture.field.value, "Second initial 🪷");
+        assert.equal(fixture.label.firstChild.data, "External rendered label 中文 🪷");
+        assert.equal(JSON.stringify(result).includes(fixture.field.value), false);
+        assert.equal(JSON.stringify(result).includes(fixture.label.firstChild.data), false);
+        assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+        assert.equal(fixture.button.clicks, 1);
+      });
+    }
+  }
+});
+
+test("a private external label still permits a public value effect and a consumed snapshot", async () => {
+  const fixture = await externalLabelActivationFixture("aria-labelledby", true);
+  fixture.button.onClick = () => { fixture.field.value = "Independent public value 中文 🪷"; };
+  const snapshot = await fixture.read();
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.activated, true);
+  assert.equal(fixture.label.hasAttribute("data-private"), true);
+  assert.equal(fixture.field.value, "Independent public value 中文 🪷");
+  assert.equal(JSON.stringify(result).includes(fixture.field.value), false);
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 1);
+});
+
+test("real activation receipt needs a visible effect and every attempt consumes its snapshot", async () => {
+  const fixture = await activationFixture();
+  const read = await fixture.read();
+  const noEffect = await fixture.activate(read);
+  assert.equal(noEffect.ok, false);
+  assert.equal(noEffect.code, "no_observed_effect");
+  assert.match(noEffect.message, /DOM dispatch may already have had side effects/u);
+  assert.match(noEffect.message, /read or inspect the page before retrying/u);
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal((await fixture.activate(read)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 1);
+  const value = "Visible controlled effect 中文 🪷";
+  fixture.button.onClick = () => { fixture.fields[1].value = value; };
+  const fresh = await fixture.read();
+  const positive = await fixture.activate(fresh);
+  assert.equal(positive.ok, true);
+  assert.deepEqual(Object.keys(positive.result), ["activated"]);
+  assert.equal(positive.result.activated, true);
+  assert.equal(JSON.stringify(positive).includes(value), false);
+  assert.equal(fixture.button.clicks, 2);
+  assert.equal((await fixture.activate(fresh)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 2);
+});
+
+test("activation retains the original absolute deadline before and after dispatch", async () => {
+  const fixture = await activationFixture();
+  let now = 1000;
+  fixture.context.Date = { now: () => now };
+  const snapshot = await fixture.read();
+  const expired = await fixture.activate(snapshot, 999);
+  assert.equal(expired.code, "content_timeout");
+  assert.equal(fixture.button.clicks, 0);
+  assert.equal((await fixture.activate(snapshot, 2000)).code, "stale_snapshot");
+  fixture.button.onClick = () => { fixture.fields[1].value = "Visible after deadline"; now = 2000; };
+  const fresh = await fixture.read();
+  const late = await fixture.activate(fresh, 1500);
+  assert.equal(late.ok, false);
+  assert.equal(late.code, "ambiguous_content_timeout");
+  assert.match(late.message, /read or inspect the page before retrying/u);
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal(fixture.fields[1].value, "Visible after deadline");
+  assert.equal(JSON.stringify(late).includes("Visible after deadline"), false);
+  assert.equal((await fixture.activate(fresh, 3000)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 1);
+});
+
+for (const [name, code, invalidate] of [
+  ["revocation", "page_access_revoked", (fixture) => fixture.revoke()],
+  ["revocation then same-document enable", "stale_snapshot", async (fixture) => { fixture.revoke(); await fixture.enable(); }],
+  ["navigation", "route_mismatch", (fixture) => fixture.pagehide()],
+  ["replacement route", "route_mismatch", async (fixture) => { fixture.route.documentId = "other-document"; await fixture.enable(); }],
+  ["new read", "stale_snapshot", (fixture) => fixture.read()],
+]) {
+  test(`activation rejects post-dispatch ${name} with inspection guidance and zero replay`, async () => {
+    const fixture = await activationFixture();
+    const snapshot = await fixture.read();
+    fixture.button.onClick = () => { fixture.fields[1].value = "Visible effect before invalidation"; void invalidate(fixture); };
+    const result = await fixture.activate(snapshot);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, code);
+    assert.match(result.message, /DOM dispatch may already have had side effects/u);
+    assert.match(result.message, /read or inspect the page before retrying/u);
+    assert.equal(JSON.stringify(result).includes("Visible effect before invalidation"), false);
+    assert.equal(fixture.button.clicks, 1);
+    const replay = await fixture.activate(snapshot);
+    assert.equal(replay.ok, false);
+    assert.equal(fixture.button.clicks, 1);
+  });
+}
+
+test("authority invalidated during pre-observation prevents activation dispatch", async () => {
+  const fixture = await activationFixture();
+  const snapshot = await fixture.read();
+  const original = fixture.fields[0].getAttribute;
+  let invalidated = false;
+  fixture.fields[0].getAttribute = function(name) {
+    if (!invalidated) { invalidated = true; fixture.revoke(); }
+    return original.call(this, name);
+  };
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.code, "page_access_revoked");
+  assert.equal(fixture.button.clicks, 0);
+});
+
+test("activation never observes or dispatches into an adopted unproven document", async () => {
+  const fixture = await activationFixture();
+  const snapshot = await fixture.read();
+  fixture.button.ownerDocument = { get body() { assert.fail("unproven document must not be observed"); } };
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.code, "stale_node");
+  assert.equal(fixture.button.clicks, 0);
+  assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+});
+
+test("content rechecks authority when a confirmed activation await resumes", async () => {
+  const fixture = await activationFixture();
+  const snapshot = await fixture.read();
+  fixture.button.onClick = () => { fixture.fields[1].value = "Confirmed effect"; };
+  const original = fixture.button.getClientRects;
+  let scheduled = false;
+  fixture.button.getClientRects = () => {
+    if (fixture.button.clicks && !scheduled) { scheduled = true; queueMicrotask(() => fixture.revoke()); }
+    return original();
+  };
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.code, "page_access_revoked");
+  assert.match(result.message, /DOM dispatch may already have had side effects/u);
+  assert.equal(fixture.button.clicks, 1);
+});
+
 test("reserved child mutations have no top effects and do not consume the root snapshot", async () => {
   const fixture = await valueReceiptFixture();
   for (const action of ["activate", "focus", "set_value", "scroll"]) {
@@ -405,7 +639,7 @@ test("real content snapshot rejects text mutations and preserves a fresh control
   const button = element("BUTTON");
   const caption = text("Increment", button);
   let clicks = 0;
-  button.click = () => { clicks += 1; };
+  button.click = () => { clicks += 1; paragraph.data = `Visible count ${clicks}`; };
   button.parentElement = body;
   button.firstChild = caption;
   paragraph.nextSibling = button;
@@ -511,7 +745,7 @@ test("real content handler preserves shadow routes, exact controls and one mutat
   let firstCount = 0;
   let secondCount = 0;
   first.click = () => { firstCount += 1; };
-  second.click = () => { secondCount += 1; };
+  second.click = () => { secondCount += 1; second.firstChild.data = `Increment ${secondCount}`; };
   const readOnly = text("Shadow read-only 🪷");
   append(root, readOnly, label, input, first, second);
   append(body, host);

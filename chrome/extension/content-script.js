@@ -111,14 +111,28 @@
     // before dispatch, including when the DOM operation fails.
     currentSnapshot = null;
     const authorizedRevision = mutationRevision;
+    const assertCurrent = () => {
+      if (!enabled) throw Object.assign(new Error("Page access was revoked; enable and pair the page again"), { code: "page_access_revoked" });
+      if (!baseRouteMatches(message.route)) throw Object.assign(new Error("content route mismatch"), { code: "route_mismatch" });
+      if (mutationRevision !== authorizedRevision) {
+        throw Object.assign(new Error("Page authority or snapshot changed; read again before retrying"), { code: "stale_snapshot" });
+      }
+    };
     try {
-      const result = await NovaSemantic.performAction(handle, message.action, message.args, () => {
-        if (!enabled) throw Object.assign(new Error("Page access was revoked; enable and pair the page again"), { code: "page_access_revoked" });
-        if (!baseRouteMatches(message.route)) throw Object.assign(new Error("content route mismatch"), { code: "route_mismatch" });
-        if (mutationRevision !== authorizedRevision) {
-          throw Object.assign(new Error("Page authority or snapshot changed; read again before retrying"), { code: "stale_snapshot" });
+      const result = await NovaSemantic.performAction(handle, message.action, message.args, assertCurrent,
+        { deadline: message.deadline, document });
+      if (message.action === "activate") {
+        // Authority can change between the runtime's last check and this await
+        // resuming. A dispatched activation must not receive a stale success.
+        try {
+          assertCurrent();
+          if (message.deadline && Date.now() >= message.deadline) {
+            throw Object.assign(new Error(), { code: "ambiguous_content_timeout" });
+          }
+        } catch (error) {
+          throw Object.assign(new Error(`Activation receipt could not be confirmed (${error.code}). DOM dispatch may already have had side effects; read or inspect the page before retrying.`), { code: error.code });
         }
-      });
+      }
       return { ok: true, action: message.action, route: message.route, result };
     } catch (error) {
       return {

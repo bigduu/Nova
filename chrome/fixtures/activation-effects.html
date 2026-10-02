@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova activation effects fixture</title>
+<style>
+  body { margin: 28px; max-width: 900px; font: 18px/1.6 system-ui, sans-serif; }
+  section { border: 1px solid #aaa; padding: 14px; margin: 16px 0; }
+  button, input { font: inherit; padding: 6px 10px; }
+  output { display: block; }
+  #bounds-only { transition: none; }
+</style>
+<h1>Nova DOM activation effects 验收</h1>
+<p>Owned loopback fixture. Each attempt needs a fresh snapshot. Dispatch counters are independent proof data in <code>window.NovaActivationProof</code>.</p>
+<section>
+  <h2>Visible effects</h2>
+  <button id="visible-text">Visible text effect</button>
+  <output id="visible-status">Visible count 0</output>
+  <label><input id="visible-checkbox" type="checkbox"> Visible checkbox effect</label>
+  <button id="microtask">Microtask visible effect</button>
+  <output id="microtask-status">Microtask count 0</output>
+  <label for="compatibility-message">Compatibility message</label>
+  <input id="compatibility-message" type="text" value="Initial message 中文 🪷">
+</section>
+<section>
+  <h2>No visible effect from DOM dispatch</h2>
+  <button id="inert">Inert activation</button>
+  <button id="trusted-only">Trusted input only</button>
+  <output id="trusted-status">Trusted count 0</output>
+  <button id="hidden-only">Hidden only effect</button>
+  <p id="hidden-status" hidden>EXCLUDE_HIDDEN_INITIAL</p>
+  <button id="sensitive-only">Sensitive only effect</button>
+  <div data-private><p id="private-status">EXCLUDE_PRIVATE_INITIAL</p></div>
+  <input id="password" type="password" aria-label="Excluded password" value="EXCLUDE_PASSWORD_INITIAL">
+  <button id="bounds-only">Bounds only effect</button>
+  <button id="inline-name-marker">Public prefix <span id="inline-caption">Caption unchanged</span></button>
+  <button id="privacy-marker">Toggle privacy marker only</button>
+  <label for="marker-field">Marker unchanged field</label>
+  <input id="marker-field" type="text" value="Marker unchanged value">
+  <button id="native-label-marker">Toggle native label privacy only</button>
+  <label id="native-external-label" for="native-label-field">Native external label unchanged</label>
+  <input id="native-label-field" type="text" value="Native external value unchanged">
+  <button id="aria-label-marker">Toggle aria label privacy only</button>
+  <span id="aria-external-label">ARIA external label unchanged</span>
+  <input id="aria-label-field" type="text" aria-labelledby="aria-external-label" value="ARIA external value unchanged">
+  <button id="label-public-value">External label public value effect</button>
+</section>
+<section>
+  <h2>Bounded observation and delayed outcome</h2>
+  <button id="build-large">Build large observation fixture</button>
+  <output id="budget-status">Budget filler 0</output>
+  <button id="late-visible">Late visible effect</button>
+  <button id="slow">Slow visible effect</button>
+  <output id="slow-status">Slow count 0</output>
+  <p>The slow handler blocks this owned page for eleven seconds. Inspect its eventual state after a timeout; never replay the old attempt.</p>
+</section>
+<div id="filler"></div>
+<script>
+  const proof = window.NovaActivationProof = {
+    dispatches: {}, trustedDispatches: {}, visible: 0, microtask: 0, trusted: 0, slow: 0, markerPrivate: false,
+    nativeLabelPrivate: false, ariaLabelPrivate: false, inlineCaptionPrivate: false, externalValue: 0,
+  };
+  const byId = (id) => document.getElementById(id);
+  function on(id, effect = () => {}) {
+    proof.dispatches[id] = 0;
+    proof.trustedDispatches[id] = 0;
+    byId(id).addEventListener("click", (event) => {
+      proof.dispatches[id] += 1;
+      if (event.isTrusted) proof.trustedDispatches[id] += 1;
+      effect(event);
+    });
+  }
+  on("visible-text", () => { byId("visible-status").textContent = `Visible count ${++proof.visible}`; });
+  on("visible-checkbox");
+  on("microtask", () => queueMicrotask(() => { byId("microtask-status").textContent = `Microtask count ${++proof.microtask}`; }));
+  on("inert");
+  on("trusted-only", (event) => {
+    if (event.isTrusted) byId("trusted-status").textContent = `Trusted count ${++proof.trusted}`;
+  });
+  on("hidden-only", () => { byId("hidden-status").textContent = "EXCLUDE_HIDDEN_CHANGED"; });
+  on("sensitive-only", () => {
+    byId("private-status").textContent = "EXCLUDE_PRIVATE_CHANGED";
+    byId("password").value = "EXCLUDE_PASSWORD_CHANGED";
+  });
+  on("bounds-only", () => { byId("bounds-only").style.transform = "translateX(35px)"; });
+  on("inline-name-marker", () => {
+    proof.inlineCaptionPrivate = !proof.inlineCaptionPrivate;
+    byId("inline-caption").toggleAttribute("data-private", proof.inlineCaptionPrivate);
+  });
+  on("privacy-marker", () => {
+    proof.markerPrivate = !proof.markerPrivate;
+    byId("marker-field").toggleAttribute("data-private", proof.markerPrivate);
+  });
+  on("native-label-marker", () => {
+    proof.nativeLabelPrivate = !proof.nativeLabelPrivate;
+    byId("native-external-label").toggleAttribute("data-private", proof.nativeLabelPrivate);
+  });
+  on("aria-label-marker", () => {
+    proof.ariaLabelPrivate = !proof.ariaLabelPrivate;
+    byId("aria-external-label").toggleAttribute("data-private", proof.ariaLabelPrivate);
+  });
+  on("label-public-value", () => {
+    byId("aria-label-field").value = `Public external value ${++proof.externalValue} 中文 🪷`;
+  });
+  on("build-large", () => {
+    byId("filler").replaceChildren();
+    for (let index = 0; index < 800; index += 1) {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = `Budget filler ${index}: 中文 🪷 ${"bounded content ".repeat(12)}`;
+      byId("filler").appendChild(paragraph);
+    }
+    byId("budget-status").textContent = "Budget filler 800";
+    const late = document.createElement("output");
+    late.id = "late-status";
+    late.textContent = "Late count 0";
+    byId("filler").appendChild(late);
+  });
+  on("late-visible", () => {
+    const late = byId("late-status");
+    if (late) late.textContent = `Late count ${proof.dispatches["late-visible"]}`;
+  });
+  on("slow", () => {
+    const end = performance.now() + 11_000;
+    while (performance.now() < end) { /* Controlled owned-page deadline case. */ }
+    byId("slow-status").textContent = `Slow count ${++proof.slow}`;
+  });
+</script>

@@ -402,7 +402,7 @@
   }
 
   function visit(budget) {
-    if (budget.remaining <= 0 || (budget.deadline && Date.now() >= budget.deadline)) {
+    if (budget.remaining <= (budget.visitFloor ?? 0) || (budget.deadline && Date.now() >= budget.deadline)) {
       budget.truncated = true;
       return false;
     }
@@ -424,7 +424,7 @@
     return { next: node.firstChild };
   }
 
-  function* textTree(root, budget, suppressNamedText = false) {
+  function* textTree(root, budget, suppressNamedText = false, privacyExcluded = null) {
     // Label references can start inside a hidden/sensitive ancestor. Check
     // their context, with the same budget as the main snapshot traversal.
     let depth = 0;
@@ -434,7 +434,10 @@
         budget.truncated = true;
         return;
       }
-      if (excludedTextTree(parent)) return;
+      if (excludedTextTree(parent)) {
+        if (privacyExcluded && isSensitiveElement(parent, false)) privacyExcluded.add(parent);
+        return;
+      }
       // Referenced names must participate in the same composed tree as the
       // main walk, even when their own computed visibility says "visible".
       if (child.parentNode === parent) {
@@ -455,9 +458,12 @@
       if (!visit(budget)) return;
       if (seen.has(node)) continue;
       seen.add(node);
-      if (node.nodeType === 1 && excludedTextTree(node)) continue;
+      if (node.nodeType === 1 && excludedTextTree(node)) {
+        if (privacyExcluded && isSensitiveElement(node, false)) privacyExcluded.add(node);
+        continue;
+      }
       yield { node, suppressed: current.suppressed };
-      if (budget.remaining === 0) {
+      if (budget.remaining <= (budget.visitFloor ?? 0)) {
         budget.truncated = true;
         return;
       }
@@ -503,12 +509,15 @@
   }
 
   function createSnapshot(document, { maxNodes = 500, maxChars = 100_000,
-    deadline = null, includeChildFrames = false, sharedBudget = null, childPrefix = null } = {}) {
+    deadline = null, includeChildFrames = false, sharedBudget = null, childPrefix = null,
+    activationObservation = false } = {}) {
     const nodeLimit = Math.floor(Math.max(1, Math.min(Number(maxNodes) || 500, 1000)));
     const charLimit = Math.floor(Math.max(1024, Math.min(Number(maxChars) || 100_000, 500_000)));
     const snapshotId = randomToken("snapshot");
     const nodes = [];
     const handles = new Map();
+    const privacyExcluded = activationObservation ? new Set() : null;
+    const privateNames = activationObservation ? new Set() : null;
     const result = { snapshotId, nodes, truncated: false, coverage: "top_document" };
     if (includeChildFrames) {
       result.coverage = "top_document_and_same_origin_children";
@@ -520,9 +529,21 @@
     const budget = sharedBudget ?? { remaining: MAX_VISITED, truncated: false, deadline,
       nodes: 0, nodeLimit, charLimit, characters: serialized.length + reserve,
       bytes: new TextEncoder().encode(serialized).byteLength + reserve };
-    if (!visit(budget)) {
+    // Activation has two separate observations, not one snapshot extended by
+    // child frames. Charge both envelopes and reserve half of each existing
+    // limit per phase without resetting any shared consumption counter.
+    if (activationObservation && sharedBudget) {
+      budget.characters += serialized.length;
+      budget.bytes += new TextEncoder().encode(serialized).byteLength;
+    }
+    if (activationObservation) budget.visitFloor = Math.max(0, budget.remaining - Math.floor(MAX_VISITED / 2));
+    const phaseNodes = activationObservation ? Math.min(budget.nodeLimit, budget.nodes + Math.floor(budget.nodeLimit / 2)) : budget.nodeLimit;
+    const phaseChars = activationObservation ? Math.min(budget.charLimit, budget.characters - serialized.length + Math.floor(budget.charLimit / 2)) : budget.charLimit;
+    const phaseBytes = activationObservation ? Math.min(MAX_SNAPSHOT_BYTES, budget.bytes - new TextEncoder().encode(serialized).byteLength + Math.floor(MAX_SNAPSHOT_BYTES / 2)) : MAX_SNAPSHOT_BYTES;
+    if (budget.characters > phaseChars || budget.bytes > phaseBytes || !visit(budget)) {
+      budget.truncated = true;
       result.truncated = true;
-      return { result, handles, budget };
+      return { result, handles, budget, privacyExcluded, privateNames };
     }
     const read = {
       budget,
@@ -534,8 +555,11 @@
         return clipped(normalized, max);
       },
       text(element) {
+        // Every existing name-text path uses this bounded walk. Capture its
+        // privacy influence now, before source ancestry or markers can change.
+        const privateSources = activationObservation ? new Set() : null;
         let value = "";
-        for (const { node } of textTree(element, budget)) {
+        for (const { node } of textTree(element, budget, false, privateSources)) {
           if (node.nodeType !== 3 || !textVisible(node)) continue;
           const remaining = MAX_TEXT_SCAN - value.length;
           value += node.data.slice(0, remaining);
@@ -544,6 +568,7 @@
             break;
           }
         }
+        if (privateSources?.size) read.privateName = true;
         return value;
       },
       truncate() { budget.truncated = true; },
@@ -558,8 +583,8 @@
       const comma = budget.nodes ? 1 : 0;
       const length = serialized.length + comma;
       const byteLength = new TextEncoder().encode(serialized).byteLength + comma;
-      if ((budget.deadline && Date.now() >= budget.deadline) || budget.nodes >= budget.nodeLimit ||
-          budget.characters + length > budget.charLimit || budget.bytes + byteLength > MAX_SNAPSHOT_BYTES) {
+      if ((budget.deadline && Date.now() >= budget.deadline) || budget.nodes >= phaseNodes ||
+          budget.characters + length > phaseChars || budget.bytes + byteLength > phaseBytes) {
         budget.truncated = true;
         return false;
       }
@@ -584,8 +609,8 @@
     }
 
     const root = document.body || document.documentElement || document;
-    for (const { node: element, suppressed } of textTree(root, budget, true)) {
-      if (budget.nodes >= budget.nodeLimit || budget.characters >= budget.charLimit) {
+    for (const { node: element, suppressed } of textTree(root, budget, true, privacyExcluded)) {
+      if (budget.nodes >= phaseNodes || budget.characters >= phaseChars) {
         budget.truncated = true;
         break;
       }
@@ -606,7 +631,9 @@
       const role = effectiveRole(element);
       if (!role) continue;
       const actions = capabilities(element, role);
+      read.privateName = false;
       const name = accessibleName(element, read);
+      if (read.privateName) privateNames.add(element);
       if (!name && actions.length === 0 && !["main", "navigation", "form", "heading"].includes(role)) {
         continue;
       }
@@ -622,7 +649,7 @@
     }
 
     result.truncated = budget.truncated;
-    return { result, handles, budget };
+    return { result, handles, budget, privacyExcluded, privateNames };
   }
 
   function proveChildOwners(view, expectedDepth, budget) {
@@ -723,7 +750,21 @@
     }
   }
 
-  async function performAction(handle, action, args = {}, assertCurrent = () => {}) {
+  function activationSemantics(snapshot, privacyExcluded, budget, privateNames) {
+    return snapshot.result.nodes.filter((node) => {
+      if (!privacyExcluded.size) return true;
+      let depth = 0;
+      for (let element = snapshot.handles.get(node.nodeId)?.element; element; element = composedParent(element)) {
+        if (!visit(budget) || ++depth > MAX_DEPTH) throw new Error("Activation comparison budget exhausted");
+        if (privacyExcluded.has(element)) return false;
+      }
+      return true;
+    }).map(({ nodeId, role, name, states, value, description }) => JSON.stringify({ role,
+      name: privateNames.has(snapshot.handles.get(nodeId)?.element) ? null : name, states, value, description }));
+  }
+
+  async function performAction(handle, action, args = {}, assertCurrent = () => {},
+    { deadline = null, document: authorizedDocument = null } = {}) {
     validateNodeTarget(handle, action);
     const element = handle.element;
     if (Object.hasOwn(args, "x") || Object.hasOwn(args, "y") || Object.hasOwn(args, "coordinates")) {
@@ -731,8 +772,54 @@
     }
     if (action === "activate") {
       if (typeof element.click !== "function") throw Object.assign(new Error("node cannot be activated"), { code: "unsupported_action" });
-      element.click();
-      return { activated: true };
+      const guidance = "DOM dispatch may already have had side effects; read or inspect the page before retrying.";
+      const noEffect = () => Object.assign(new Error(`No bounded visible semantic/control change was confirmed. ${guidance}`), { code: "no_observed_effect" });
+      const observationDocument = authorizedDocument ?? element.ownerDocument;
+      let dispatched = false;
+      const current = () => {
+        assertCurrent();
+        if (deadline && Date.now() >= deadline) {
+          throw Object.assign(new Error("Activation observation exceeded the original content deadline"), { code: "content_timeout" });
+        }
+      };
+      try {
+        current();
+        if (element.ownerDocument !== observationDocument) throw Object.assign(new Error(), { code: "stale_node" });
+        const before = createSnapshot(observationDocument, { deadline, activationObservation: true });
+        current();
+        validateNodeTarget(handle, action);
+        if (element.ownerDocument !== observationDocument) throw Object.assign(new Error(), { code: "stale_node" });
+        dispatched = true;
+        element.click();
+        // Include synchronous handler microtasks, with no polling or observer.
+        await Promise.resolve();
+        current();
+        const after = createSnapshot(observationDocument, {
+          sharedBudget: before.budget, activationObservation: true,
+        });
+        // Privacy classification alone does not change rendering. Exclude
+        // either phase's private roots, using only the still-unspent budget.
+        const privacyExcluded = new Set([...before.privacyExcluded, ...after.privacyExcluded]);
+        const privateNames = new Set([...before.privateNames, ...after.privateNames]);
+        after.budget.visitFloor = 0;
+        const beforeNodes = activationSemantics(before, privacyExcluded, after.budget, privateNames);
+        const afterNodes = activationSemantics(after, privacyExcluded, after.budget, privateNames);
+        current();
+        // A truncated length can reflect a budget boundary, not a page effect.
+        // Only compare the common observed prefix in that case. IDs, bounds,
+        // action capability bookkeeping and snapshot metadata are excluded.
+        const changed = beforeNodes.slice(0, afterNodes.length).some((node, index) => node !== afterNodes[index]) ||
+          (!before.result.truncated && !after.result.truncated && beforeNodes.length !== afterNodes.length);
+        if (!changed) throw noEffect();
+        return { activated: true };
+      } catch (error) {
+        if (["page_access_revoked", "route_mismatch", "stale_snapshot", "stale_node", "sensitive_control", "content_timeout"].includes(error?.code)) {
+          const code = dispatched && error.code === "content_timeout" ? "ambiguous_content_timeout" : error.code;
+          throw Object.assign(new Error(`Activation could not be confirmed (${error.code}). ${guidance}`), { code });
+        }
+        // Observer/dispatch exceptions must not echo page text or values.
+        throw noEffect();
+      }
     }
     if (action === "focus") {
       if (typeof element.focus !== "function") throw Object.assign(new Error("node cannot be focused"), { code: "unsupported_action" });
