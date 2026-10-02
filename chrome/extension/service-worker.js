@@ -24,6 +24,27 @@ let pairTimer = null;
 let pairingCandidate = null;
 let pairingCandidateDraftRoute = null;
 let pairingCandidateRevision = 0;
+let childAccessRoute = null;
+
+function childAccessEnabled(route = state.paired?.route) {
+  if (!sameRoute(childAccessRoute, state.paired?.route, true)) childAccessRoute = null;
+  return Boolean(childAccessRoute && sameRoute(childAccessRoute, route, true));
+}
+
+async function beforeDeadline(run, deadline) {
+  const remaining = deadline - Date.now();
+  const timeout = () => Object.assign(new Error("content script timed out"), { code: "content_timeout" });
+  if (remaining <= 0) throw timeout();
+  let timer;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(timeout()), remaining); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function invalidatePairingCandidate() {
   pairingCandidate = null;
@@ -117,6 +138,7 @@ function connectNative() {
 
 async function revokeContentRoute(route) {
   if (!route) return;
+  if (sameRoute(childAccessRoute, route, true)) childAccessRoute = null;
   let timer;
   try {
     await Promise.race([
@@ -132,10 +154,10 @@ async function revokeContentRoute(route) {
   }
 }
 
-async function sendContent(route, action, args) {
+async function sendContent(route, action, args, deadline = Date.now() + CONTENT_TIMEOUT_MS, includeChildFrames = false) {
   // Chrome checks the actual document's current host/activeTab access. The
   // packaged bootstrap is idempotent and never reads semantic page content.
-  await bootstrapScripts(route.tabId, route.documentId);
+  await beforeDeadline(() => bootstrapScripts(route.tabId, route.documentId), deadline);
   if (action !== "ping" && state.checkPairedRoute(route)) {
     throw new ProtocolError("page_access_revoked", "The paired page was revoked; enable and pair it again");
   }
@@ -145,21 +167,158 @@ async function sendContent(route, action, args) {
     route,
     action,
     args: args ?? {},
+    deadline,
+    includeChildFrames,
   };
-  let timer;
-  try {
-    return await Promise.race([
-      chrome.tabs.sendMessage(route.tabId, message, { documentId: route.documentId }),
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(Object.assign(new Error("content script timed out"), { code: "content_timeout" })),
-          CONTENT_TIMEOUT_MS,
-        );
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+  return beforeDeadline(() => chrome.tabs.sendMessage(route.tabId, message,
+    { documentId: route.documentId }), deadline);
+}
+
+async function readWithChildren(route, args, deadline) {
+  const enabled = childAccessEnabled(route);
+  const content = await sendContent(route, "read", args, deadline, enabled);
+  if (!enabled || !content?.ok || content.action !== "read") return content;
+  const { result, readBudget: budget } = content;
+  const coverage = result?.frameCoverage;
+  if (!budget || !coverage || !sameRoute(content.route, route, true)) {
+    throw new ProtocolError("content_unavailable", "The page bridge could not share the read budget; enable and pair again");
   }
+  const reasons = new Set();
+  let childNodes = [];
+  let documents = 1;
+  const current = () => childAccessEnabled(route) && !state.checkPairedRoute(route);
+  const spend = () => {
+    if (budget.remaining <= 0 || Date.now() >= deadline) return false;
+    budget.remaining -= 1;
+    return true;
+  };
+  const inventory = () => {
+    if (!current()) throw new ProtocolError("page_access_revoked", "Child access was revoked");
+    return beforeDeadline(() => chrome.webNavigation.getAllFrames({ tabId: route.tabId }), deadline);
+  };
+  const signature = (frame) => JSON.stringify([frame.frameId, frame.documentId, frame.parentFrameId,
+    frame.parentDocumentId ?? null, frame.documentLifecycle, frame.errorOccurred, frame.url]);
+  try {
+    if (!current() || !(await beforeDeadline(() => chrome.permissions.contains({ permissions: ["webNavigation"] }), deadline))) {
+      reasons.add("permission_revoked");
+    } else {
+      const frames = await inventory();
+      if (!Array.isArray(frames) || frames.length > budget.remaining) {
+        reasons.add("budget_exhausted");
+      } else {
+        const byId = new Map();
+        const children = new Map();
+        for (const frame of frames) {
+          if (!spend()) { reasons.add("budget_exhausted"); break; }
+          if (!Number.isSafeInteger(frame.frameId) || frame.frameId < 0 ||
+              !isOpaqueId(frame.documentId, 128) || byId.has(frame.frameId)) {
+            reasons.add("unproven_ancestry");
+            break;
+          }
+          byId.set(frame.frameId, frame);
+        }
+        const top = byId.get(0);
+        if (!top || top.documentId !== route.documentId || top.parentFrameId !== -1 ||
+            top.documentLifecycle !== "active" || top.errorOccurred || !siteAccess(top.url).origin) {
+          reasons.add("stale_child_documents");
+        } else if (!reasons.size) {
+          for (const frame of frames) {
+            if (frame.frameId === 0) continue;
+            if (!spend()) { reasons.add("budget_exhausted"); break; }
+            const parent = byId.get(frame.parentFrameId);
+            if (!parent || frame.parentDocumentId !== parent.documentId) {
+              reasons.add("unproven_ancestry");
+              continue;
+            }
+            if (!children.has(parent.frameId)) children.set(parent.frameId, []);
+            children.get(parent.frameId).push(frame);
+          }
+          for (const siblings of children.values()) siblings.sort((a, b) => a.frameId - b.frameId);
+          const stack = [...(children.get(0) ?? [])].reverse().map((frame) => ({ frame, depth: 1 }));
+          const seen = new Set([0]);
+          let attempts = 1;
+          while (stack.length && current()) {
+            const { frame, depth } = stack.pop();
+            if (!spend() || budget.nodes >= budget.nodeLimit || budget.characters >= budget.charLimit ||
+                budget.bytes >= 1024 * 1024 - 4096) { reasons.add("budget_exhausted"); break; }
+            if (seen.has(frame.frameId)) { reasons.add("unproven_ancestry"); continue; }
+            seen.add(frame.frameId);
+            if (depth > 4) { reasons.add("depth_limit"); continue; }
+            const access = siteAccess(frame.url);
+            if (!access.origin || frame.documentLifecycle !== "active" || frame.errorOccurred || frame.frameType !== "sub_frame") {
+              reasons.add("restricted_document"); continue;
+            }
+            // An excluded ancestor excludes its complete subtree, including a
+            // grandchild that returns to the top origin. URLs classify only;
+            // actual owner equality is proven inside the isolated world.
+            if (access.origin !== siteAccess(top.url).origin) { reasons.add("cross_origin_ancestry"); continue; }
+            if (attempts >= 8) { reasons.add("document_limit"); break; }
+            attempts += 1;
+            const target = { tabId: route.tabId, documentIds: [frame.documentId] };
+            let installed;
+            let read;
+            try {
+              installed = await beforeDeadline(() => chrome.scripting.executeScript({
+                target, files: ["lib/semantic-runtime.js"], world: "ISOLATED",
+              }), deadline);
+              if (installed.length === 1 && installed[0].frameId === frame.frameId && installed[0].documentId === frame.documentId && current()) {
+                read = await beforeDeadline(() => chrome.scripting.executeScript({ target, world: "ISOLATED",
+                  func: (options) => globalThis.NovaSemantic.readChildDocument(options),
+                  args: [{ frameId: frame.frameId, documentId: frame.documentId, depth, budget }],
+                }), deadline);
+              }
+            } catch (error) {
+              if (error?.code === "content_timeout") throw error;
+              reasons.add("owner_unproven");
+              continue;
+            }
+            if (installed.length !== 1 || installed[0].frameId !== frame.frameId || installed[0].documentId !== frame.documentId) {
+              reasons.add("stale_child_documents"); childNodes = []; documents = 1; break;
+            }
+            if (!current()) break;
+            if (read.length !== 1 || read[0].frameId !== frame.frameId || read[0].documentId !== frame.documentId || !read[0].result) {
+              reasons.add("stale_child_documents"); childNodes = []; documents = 1; break;
+            }
+            const child = read[0].result;
+            Object.assign(budget, child.budget);
+            if (child.reason) { reasons.add(child.reason); continue; }
+            childNodes.push(...child.nodes);
+            documents += 1;
+            for (const sibling of [...(children.get(frame.frameId) ?? [])].reverse()) {
+              stack.push({ frame: sibling, depth: depth + 1 });
+            }
+          }
+          // A navigation in any inventoried ancestry discards all child data.
+          // No global navigation listener or retained frame registry is needed.
+          const after = await inventory();
+          if (!Array.isArray(after) || after.length !== frames.length) {
+            childNodes = []; documents = 1; reasons.add("stale_child_documents");
+          } else {
+            for (const frame of after) {
+              if (!spend() || !byId.has(frame.frameId) || signature(frame) !== signature(byId.get(frame.frameId))) {
+                childNodes = []; documents = 1;
+                reasons.add(budget.remaining <= 0 ? "budget_exhausted" : "stale_child_documents");
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!current() || !(await beforeDeadline(() => chrome.permissions.contains({ permissions: ["webNavigation"] }), deadline))) {
+      childNodes = []; documents = 1; reasons.add("permission_revoked");
+    }
+  } catch (error) {
+    childNodes = []; documents = 1;
+    reasons.add(error?.code === "content_timeout" ? "deadline" : "metadata_unavailable");
+  }
+  if (!current()) { childNodes = []; documents = 1; reasons.add("permission_revoked"); }
+  result.nodes.push(...childNodes);
+  result.truncated ||= budget.truncated || reasons.has("budget_exhausted") || reasons.has("deadline");
+  coverage.documents = documents;
+  coverage.reasons = [...reasons];
+  coverage.status = reasons.size || result.truncated ? "partial" : "complete";
+  return content;
 }
 
 async function dispatchRequest(request) {
@@ -203,7 +362,16 @@ async function dispatchRequest(request) {
   if (!decision.execute) return;
 
   try {
-    const content = await sendContent(decision.route, request.action, request.args);
+    if (["activate", "focus", "set_value", "scroll"].includes(request.action) &&
+        typeof request.args?.nodeId === "string" && request.args.nodeId.startsWith("child:")) {
+      postNative(state.failExecution(request.requestId, request.action, decision.route,
+        "read_only_child", "Child document nodes are read-only"));
+      return;
+    }
+    const deadline = Date.now() + CONTENT_TIMEOUT_MS;
+    const content = request.action === "read"
+      ? await readWithChildren(decision.route, request.args, deadline)
+      : await sendContent(decision.route, request.action, request.args, deadline);
     if (!content || content.action !== request.action) {
       postNative(state.complete(request.requestId, content?.action ?? "status", decision.route, undefined));
       return;
@@ -393,6 +561,7 @@ function removedHostMatches(pattern, rawUrl) {
 }
 
 function revokeTabAccess(tabId, reason) {
+  if (childAccessRoute?.tabId === tabId) childAccessRoute = null;
   const entry = state.routes.get(tabId);
   if (pairingCandidateRoute()?.tabId === tabId) invalidatePairingCandidate();
   const beforeEpoch = state.epoch;
@@ -565,6 +734,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, code: error?.code ?? "page_access_failed", message: error?.message }));
     return true;
   }
+  if (message.type === "enable_child_frames") {
+    void (async () => {
+      const route = state.paired?.route;
+      if (!route || !sameRoute(message.route, route, true)) {
+        throw new ProtocolError("stale_pair", "Review and pair the page before enabling child reads");
+      }
+      const granted = await chrome.permissions.contains({ permissions: ["webNavigation"] });
+      if (!granted) throw new ProtocolError("frame_permission_denied", "Frame metadata permission was denied; top-document reads remain available");
+      if (state.checkPairedRoute(route)) throw new ProtocolError("stale_pair", "Pairing changed; review the page again");
+      childAccessRoute = Object.freeze({ ...route });
+      sendResponse({ ok: true });
+    })().catch((error) => sendResponse({ ok: false, code: error?.code ?? "frame_access_failed", message: error?.message }));
+    return true;
+  }
   if (message.type === "popup_state") {
     void (async () => {
       let access = await activePageAccess();
@@ -594,6 +777,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         pairedPage,
         candidateId: candidate?.candidateId ?? null,
         access,
+        childFrames: { enabled: childAccessEnabled(),
+          permissionGranted: await chrome.permissions.contains({ permissions: ["webNavigation"] }) },
       });
     })().catch(() => sendResponse({ ok: false, code: "popup_state_failed" }));
     return true;
@@ -666,6 +851,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.permissions.onRemoved.addListener((permissions) => {
+  if (permissions.permissions?.includes("webNavigation") && state.paired?.route) {
+    // Fence a pending popup enable even before its volatile opt-in is assigned.
+    const previous = state.paired.route;
+    childAccessRoute = null;
+    state.revoke("frame_permission_removed");
+    void revokeContentRoute(previous);
+    postEvent("route_revoked", { reason: "frame_permission_removed" });
+  }
   for (const [tabId, entry] of [...state.routes]) {
     if (permissions.origins?.some((pattern) => removedHostMatches(pattern, entry.url))) {
       revokeTabAccess(tabId, "permission_removed");

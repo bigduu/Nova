@@ -402,7 +402,7 @@
   }
 
   function visit(budget) {
-    if (budget.remaining === 0) {
+    if (budget.remaining <= 0 || (budget.deadline && Date.now() >= budget.deadline)) {
       budget.truncated = true;
       return false;
     }
@@ -484,7 +484,7 @@
     return style?.visibility !== "hidden" && style?.visibility !== "collapse";
   }
 
-  function textBounds(node) {
+  function textBounds(node, readOnly = false) {
     if (!textVisible(node)) return null;
     const range = node.ownerDocument?.createRange?.();
     if (!range) return null;
@@ -499,19 +499,31 @@
         break;
       }
     }
-    return rendered ? bounds(range) : null;
+    return rendered ? readOnly ? true : bounds(range) : null;
   }
 
-  function createSnapshot(document, { maxNodes = 500, maxChars = 100_000 } = {}) {
+  function createSnapshot(document, { maxNodes = 500, maxChars = 100_000,
+    deadline = null, includeChildFrames = false, sharedBudget = null, childPrefix = null } = {}) {
     const nodeLimit = Math.floor(Math.max(1, Math.min(Number(maxNodes) || 500, 1000)));
     const charLimit = Math.floor(Math.max(1024, Math.min(Number(maxChars) || 100_000, 500_000)));
     const snapshotId = randomToken("snapshot");
     const nodes = [];
     const handles = new Map();
     const result = { snapshotId, nodes, truncated: false, coverage: "top_document" };
-    let characters = JSON.stringify(result).length;
-    let bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
-    const budget = { remaining: MAX_VISITED, truncated: false };
+    if (includeChildFrames) {
+      result.coverage = "top_document_and_same_origin_children";
+      result.frameCoverage = { status: "partial", documents: 1, reasons: [] };
+    }
+    const serialized = JSON.stringify(result);
+    // Reserve bounded coverage metadata once, never once per child document.
+    const reserve = includeChildFrames ? 512 : 0;
+    const budget = sharedBudget ?? { remaining: MAX_VISITED, truncated: false, deadline,
+      nodes: 0, nodeLimit, charLimit, characters: serialized.length + reserve,
+      bytes: new TextEncoder().encode(serialized).byteLength + reserve };
+    if (!visit(budget)) {
+      result.truncated = true;
+      return { result, handles, budget };
+    }
     const read = {
       budget,
       clip(value, max) {
@@ -537,23 +549,30 @@
       truncate() { budget.truncated = true; },
     };
     function append(node, element) {
+      if (childPrefix) {
+        node.nodeId = `${childPrefix}${node.nodeId}`;
+        node.actions = [];
+        delete node.bounds;
+      }
       const serialized = JSON.stringify(node);
-      const comma = nodes.length ? 1 : 0;
+      const comma = budget.nodes ? 1 : 0;
       const length = serialized.length + comma;
       const byteLength = new TextEncoder().encode(serialized).byteLength + comma;
-      if (nodes.length >= nodeLimit || characters + length > charLimit || bytes + byteLength > MAX_SNAPSHOT_BYTES) {
+      if ((budget.deadline && Date.now() >= budget.deadline) || budget.nodes >= budget.nodeLimit ||
+          budget.characters + length > budget.charLimit || budget.bytes + byteLength > MAX_SNAPSHOT_BYTES) {
         budget.truncated = true;
         return false;
       }
       nodes.push(node);
-      handles.set(node.nodeId, { element, actions: node.actions, sensitive: false });
-      characters += length;
-      bytes += byteLength;
+      if (!childPrefix) handles.set(node.nodeId, { element, actions: node.actions, sensitive: false });
+      budget.nodes += 1;
+      budget.characters += length;
+      budget.bytes += byteLength;
       return true;
     }
 
     const scrollingElement = document.scrollingElement || document.documentElement;
-    if (scrollingElement && !isSensitiveElement(scrollingElement) && isScrollable(scrollingElement)) {
+    if (!childPrefix && scrollingElement && !isSensitiveElement(scrollingElement) && isScrollable(scrollingElement)) {
       const node = {
         nodeId: "root",
         role: "document",
@@ -566,19 +585,19 @@
 
     const root = document.body || document.documentElement || document;
     for (const { node: element, suppressed } of textTree(root, budget, true)) {
-      if (nodes.length >= nodeLimit || characters >= charLimit) {
+      if (budget.nodes >= budget.nodeLimit || budget.characters >= budget.charLimit) {
         budget.truncated = true;
         break;
       }
       if (element.nodeType === 3) {
         if (suppressed) continue;
-        const rect = textBounds(element);
+        const rect = textBounds(element, Boolean(childPrefix));
         if (!rect) continue;
         const name = read.clip(element.data, MAX_NAME);
         if (!name) continue;
         if (!append({
           nodeId: `n${nodes.length + 1}`, role: "text", name,
-          actions: [], states: {}, bounds: rect,
+          actions: [], states: {}, ...(childPrefix ? {} : { bounds: rect }),
         }, element)) break;
         continue;
       }
@@ -597,13 +616,77 @@
       if (value !== undefined) node.value = { kind: "text", text: value };
       const description = read.clip(attr(element, "aria-description") ?? "", MAX_NAME);
       if (description) node.description = description;
-      const rect = bounds(element);
+      const rect = childPrefix ? null : bounds(element);
       if (rect) node.bounds = rect;
       if (!append(node, element)) break;
     }
 
     result.truncated = budget.truncated;
-    return { result, handles };
+    return { result, handles, budget };
+  }
+
+  function proveChildOwners(view, expectedDepth, budget) {
+    let child = view;
+    let depth = 0;
+    try {
+      if (typeof global.chrome?.dom?.openOrClosedShadowRoot !== "function") return "owner_unproven";
+      while (child !== view.top && depth < 4) {
+        if (!visit(budget)) return "budget_exhausted";
+        const owner = child.frameElement;
+        const parent = child.parent;
+        const parentDocument = parent.document;
+        if (!owner || !(owner instanceof parent.HTMLIFrameElement) || !owner.isConnected ||
+            owner.contentWindow !== child || owner.contentDocument !== child.document ||
+            owner.ownerDocument !== parentDocument) return "owner_unproven";
+        const root = owner.getRootNode();
+        if (root !== parentDocument) {
+          return root instanceof parent.ShadowRoot && root.mode === "closed"
+            ? "closed_shadow_owner" : "shadow_owner_unsupported";
+        }
+        if (owner.hasAttribute("sandbox")) return "sandbox_owner";
+        if (![...owner.getClientRects()].some((rect) => rect.width > 0 && rect.height > 0)) return "hidden_owner";
+        let ancestorDepth = 0;
+        for (let element = owner; element?.nodeType === 1; element = element.parentElement) {
+          if (!visit(budget) || ++ancestorDepth > MAX_DEPTH) return "budget_exhausted";
+          if (element.assignedSlot) return "shadow_owner_unsupported";
+          // A closed slot hides assignedSlot from light-DOM descendants. Reject
+          // every shadow host without reading its root or projected content.
+          const shadow = global.chrome.dom.openOrClosedShadowRoot(element);
+          if (shadow) return shadow.mode === "closed" ? "closed_shadow_owner" : "shadow_owner_unsupported";
+          if (isSensitiveElement(element, false)) return "sensitive_owner";
+          const style = parent.getComputedStyle(element);
+          if (!element.isConnected || element.hidden || element.hasAttribute("inert") ||
+              validBooleanAria(attr(element, "aria-hidden")) === "true" ||
+              style.display === "none" || style.visibility === "hidden" ||
+              style.visibility === "collapse" || Number.parseFloat(style.opacity) === 0) return "hidden_owner";
+        }
+        child = parent;
+        depth += 1;
+      }
+      return depth === expectedDepth && depth > 0 && child === view.top ? null : "owner_unproven";
+    } catch {
+      // Opaque/cross-origin owners can be null or throw. Never read content or
+      // copy page-controlled error messages from an unproven document.
+      return "owner_unproven";
+    }
+  }
+
+  function readChildDocument({ frameId, documentId, depth, budget }) {
+    const view = global.window;
+    const excluded = (reason) => ({ nodes: [], budget, reason });
+    if (!view || view === view.top || global.document !== view.document) return excluded("owner_unproven");
+    const reason = proveChildOwners(view, depth, budget);
+    if (reason) return excluded(reason);
+    try {
+      const snapshot = createSnapshot(global.document, {
+        sharedBudget: budget, childPrefix: `child:${frameId}:${documentId}:`,
+      });
+      const changed = proveChildOwners(view, depth, budget);
+      if (changed) return excluded(changed);
+      return { nodes: snapshot.result.nodes, budget, reason: null };
+    } catch {
+      return excluded("owner_unproven");
+    }
   }
 
   async function sha256Bytes(bytes) {
@@ -712,6 +795,7 @@
     isSensitiveElement,
     isVisible,
     performAction,
+    readChildDocument,
     safeValue,
     validBooleanAria,
   });

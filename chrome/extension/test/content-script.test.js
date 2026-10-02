@@ -105,6 +105,33 @@ function pendingReceipt() {
   };
 }
 
+test("reserved child mutations have no top effects and do not consume the root snapshot", async () => {
+  const fixture = await valueReceiptFixture();
+  for (const action of ["activate", "focus", "set_value", "scroll"]) {
+    const snapshot = await fixture.read();
+    const mutation = fixture.mutation(snapshot, "Must not write");
+    mutation.action = action;
+    mutation.args.nodeId = `child:17:child-document:${mutation.args.nodeId}`;
+    mutation.args.direction = "down";
+    const rejected = await fixture.command(mutation);
+    assert.equal(rejected.code, "read_only_child");
+    assert.deepEqual(fixture.fields.map((field) => field.value), ["First initial ✓", "Second initial 🪷"]);
+    assert.deepEqual(fixture.fields.map((field) => field.events), [[], []]);
+    const top = fixture.mutation(snapshot, "unused");
+    top.action = "focus";
+    assert.equal((await fixture.command(top)).result.focused, true);
+    assert.equal((await fixture.command(top)).code, "stale_snapshot");
+  }
+});
+
+test("packaged content bridge never registers a child document", () => {
+  const context = vm.createContext({ window: { top: {} }, NovaSemantic: {}, chrome: {
+    runtime: { onMessage: { addListener() { assert.fail("child listener"); } } },
+  } });
+  vm.runInContext(contentSource, context);
+  assert.equal(context.NovaContentBridge, undefined);
+});
+
 test("missing crypto.subtle rejects a value receipt before writing or emitting events", async () => {
   const fixture = await valueReceiptFixture({ getRandomValues: (bytes) => webcrypto.getRandomValues(bytes) });
   const snapshot = await fixture.read();

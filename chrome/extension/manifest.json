@@ -16,6 +16,7 @@
     "scripting"
   ],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "optional_permissions": ["webNavigation"],
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"

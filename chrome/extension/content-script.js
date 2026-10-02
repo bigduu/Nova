@@ -77,16 +77,22 @@
       const snapshot = NovaSemantic.createSnapshot(document, {
         maxNodes: message.args?.maxNodes,
         maxChars: message.args?.maxChars,
+        deadline: message.deadline,
+        includeChildFrames: message.includeChildFrames === true,
       });
       currentSnapshot = {
         id: snapshot.result.snapshotId,
         handles: snapshot.handles,
       };
-      return { ok: true, action: "read", route: message.route, result: snapshot.result };
+      return { ok: true, action: "read", route: message.route, result: snapshot.result,
+        ...(message.includeChildFrames ? { readBudget: snapshot.budget } : {}) };
     }
 
     if (!["activate", "focus", "set_value", "scroll"].includes(message.action)) {
       return { ok: false, action: message.action, code: "unknown_action", message: "unknown content action" };
+    }
+    if (typeof message.args?.nodeId === "string" && message.args.nodeId.startsWith("child:")) {
+      return { ok: false, action: message.action, code: "read_only_child", message: "Child document nodes are read-only" };
     }
     if (
       !currentSnapshot ||

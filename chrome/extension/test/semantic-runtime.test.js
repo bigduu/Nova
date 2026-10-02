@@ -264,6 +264,145 @@ test("semantic runtime exposes a frozen, bounded API", () => {
   assert.equal(semantic.VALID_ROLES.has("script"), false);
 });
 
+function childOwnerFixture(t, depth = 1, childContent = [branch("p", ["Child text 中文 🪷"]),
+  new FakeElement("input", { attributes: { "aria-label": "Child control" }, value: "Read-only value" })]) {
+  const documents = [page(new FakeElement("button", { textContent: "Top action" }))];
+  const owners = [];
+  const top = documents[0].defaultView;
+  top.top = top;
+  top.document = documents[0];
+  top.HTMLIFrameElement = FakeElement;
+  top.ShadowRoot = FakeShadowRoot;
+  for (let index = 1; index <= depth; index += 1) {
+    const document = page(...(index === depth ? childContent : [branch("p", ["Intermediate text"])]));
+    const parentDocument = documents.at(-1);
+    const parent = parentDocument.defaultView;
+    const view = document.defaultView;
+    const owner = parentDocument.body.appendChild(new FakeElement("iframe", { rects: [{ width: 30, height: 40 }] }));
+    Object.assign(view, { parent, top, document, frameElement: owner,
+      HTMLIFrameElement: FakeElement, ShadowRoot: FakeShadowRoot });
+    owner.contentWindow = view;
+    owner.contentDocument = document;
+    documents.push(document);
+    owners.push(owner);
+  }
+  for (const [key, value] of [["window", documents.at(-1).defaultView], ["document", documents.at(-1)],
+    ["chrome", { dom: { openOrClosedShadowRoot: (element) => element._shadow ?? null } }]]) {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, key);
+    Object.defineProperty(globalThis, key, { value, writable: true, configurable: true });
+    t.after(() => { if (previous) Object.defineProperty(globalThis, key, previous); else delete globalThis[key]; });
+  }
+  const root = (options = {}) => semantic.createSnapshot(documents[0], { ...options, includeChildFrames: true });
+  const read = (budget) => semantic.readChildDocument({ frameId: 17, documentId: "real-child-document", depth, budget });
+  return { documents, owners, root, read };
+}
+
+test("proven nested child owners produce scoped read-only nodes and retain only top handles", (t) => {
+  const fixture = childOwnerFixture(t, 2);
+  const root = fixture.root();
+  const child = fixture.read(root.budget);
+  assert.equal(child.reason, null);
+  assert.deepEqual(child.nodes.map((node) => node.name), ["Child text 中文 🪷", "Child control"]);
+  assert.ok(child.nodes.every((node) => node.nodeId.startsWith("child:17:real-child-document:")));
+  assert.ok(child.nodes.every((node) => !node.actions.length && !Object.hasOwn(node, "bounds")));
+  assert.equal(Object.hasOwn(child, "handles"), false);
+  assert.equal(root.handles.size, 1);
+  assert.ok(root.result.nodes[0].actions.includes("activate"));
+  assert.equal(child.nodes[1].value.text, "Read-only value");
+});
+
+test("child reads check rendered text but never calculate child coordinates", (t) => {
+  const fixture = childOwnerFixture(t);
+  const document = fixture.documents[1];
+  document.body.childNodes[1].getBoundingClientRect = () => assert.fail("child control bounds");
+  const range = document.createRange.bind(document);
+  document.createRange = () => ({ ...range(), getBoundingClientRect() { assert.fail("child text bounds"); } });
+  assert.equal(fixture.read(fixture.root().budget).reason, null);
+});
+
+for (const [name, expected, change] of [
+  ["missing owner", "owner_unproven", (f) => { f.documents[1].defaultView.frameElement = null; }],
+  ["disconnected owner", "owner_unproven", (f) => { f.owners[0].isConnected = false; }],
+  ["wrong window", "owner_unproven", (f) => { f.owners[0].contentWindow = {}; }],
+  ["wrong document", "owner_unproven", (f) => { f.owners[0].contentDocument = {}; }],
+  ["sandbox", "sandbox_owner", (f) => { f.owners[0].attributes.sandbox = "allow-same-origin"; }],
+  ["hidden owner", "hidden_owner", (f) => { f.owners[0].hidden = true; }],
+  ["zero boxes", "hidden_owner", (f) => { f.owners[0].rects = []; }],
+  ["zero width", "hidden_owner", (f) => { f.owners[0].rects = [{ width: 0, height: 40 }]; }],
+  ["zero height", "hidden_owner", (f) => { f.owners[0].rects = [{ width: 30, height: 0 }]; }],
+  ["hidden ancestor", "hidden_owner", (f) => { f.documents[0].body.style.display = "none"; }],
+  ["inert ancestor", "hidden_owner", (f) => { f.documents[0].body.attributes.inert = ""; }],
+  ["ARIA hidden ancestor", "hidden_owner", (f) => { f.documents[0].body.attributes["aria-hidden"] = "true"; }],
+  ["transparent ancestor", "hidden_owner", (f) => { f.documents[0].body.style.opacity = "0"; }],
+  ["sensitive owner", "sensitive_owner", (f) => { f.owners[0].attributes["data-private"] = ""; }],
+  ["sensitive ancestor", "sensitive_owner", (f) => { f.documents[0].body.attributes["data-sensitive"] = ""; }],
+  ["closed shadow", "closed_shadow_owner", (f) => { f.owners[0].getRootNode = () => new FakeShadowRoot(f.documents[0].body, "closed"); }],
+  ["open shadow", "shadow_owner_unsupported", (f) => { f.owners[0].getRootNode = () => new FakeShadowRoot(f.documents[0].body, "open"); }],
+  ["slotted owner", "shadow_owner_unsupported", (f) => { f.owners[0].assignedSlot = {}; }],
+  ["closed slotted owner", "closed_shadow_owner", (f) => {
+    const host = f.documents[0].body.appendChild(new FakeElement("div"));
+    host.attachShadow({ mode: "closed" });
+    host.appendChild(f.owners[0]);
+    assert.equal(f.owners[0].assignedSlot, null);
+    assert.equal(host.shadowRoot, null);
+  }],
+  ["missing shadow proof API", "owner_unproven", () => { globalThis.chrome.dom.openOrClosedShadowRoot = undefined; }],
+  ["failed shadow proof API", "owner_unproven", () => { globalThis.chrome.dom.openOrClosedShadowRoot = () => { throw new Error("DO_NOT_LEAK"); }; }],
+]) {
+  test(`child ${name} is excluded before any child text, title or URL is read`, (t) => {
+    const fixture = childOwnerFixture(t);
+    const root = fixture.root();
+    change(fixture);
+    let reads = 0;
+    for (const property of ["body", "title", "URL"]) {
+      Object.defineProperty(fixture.documents[1], property, { get() { reads += 1; throw new Error("DO_NOT_LEAK"); } });
+    }
+    const child = fixture.read(root.budget);
+    assert.equal(child.reason, expected);
+    assert.deepEqual(child.nodes, []);
+    assert.equal(reads, 0);
+    assert.equal(JSON.stringify(child).includes("DO_NOT_LEAK"), false);
+  });
+}
+
+test("outer owner privacy applies before reading a nested grandchild", (t) => {
+  const fixture = childOwnerFixture(t, 2);
+  const root = fixture.root();
+  fixture.owners[0].attributes["data-nova-sensitive"] = "";
+  let reads = 0;
+  Object.defineProperty(fixture.documents[2], "body", { get() { reads += 1; return {}; } });
+  assert.equal(fixture.read(root.budget).reason, "sensitive_owner");
+  assert.equal(reads, 0);
+});
+
+test("node, complete JSON, UTF-8 and visit budgets are shared across documents", (t) => {
+  const fixture = childOwnerFixture(t, 1,
+    Array.from({ length: 1000 }, () => branch("p", ["界".repeat(490)])));
+  for (const options of [{ maxNodes: 2 }, { maxChars: 1024 }, { maxNodes: 1000, maxChars: 500_000 }]) {
+    const root = fixture.root(options);
+    const child = fixture.read(root.budget);
+    const aggregate = { ...root.result, nodes: [...root.result.nodes, ...child.nodes] };
+    assert.ok(aggregate.nodes.length <= (options.maxNodes ?? 500));
+    assert.ok(JSON.stringify(aggregate).length <= (options.maxChars ?? 100_000));
+    assert.ok(new TextEncoder().encode(JSON.stringify(aggregate)).byteLength <= 1024 * 1024 - 4096);
+    assert.ok(root.budget.remaining <= 10_000);
+    assert.equal(root.budget.truncated, true);
+  }
+  const root = fixture.root();
+  root.budget.remaining = 1;
+  assert.equal(fixture.read(root.budget).reason, "budget_exhausted");
+  assert.equal(root.budget.remaining, 0);
+});
+
+test("an expired shared deadline never reads child semantics", (t) => {
+  const fixture = childOwnerFixture(t);
+  const root = fixture.root();
+  root.budget.deadline = Date.now() - 1;
+  Object.defineProperty(fixture.documents[1], "body", { get() { assert.fail("expired child read"); } });
+  assert.equal(fixture.read(root.budget).reason, "budget_exhausted");
+  assert.equal(root.budget.truncated, true);
+});
+
 test("explicit roles use the first valid token", () => {
   const element = new FakeElement("div", { attributes: { role: "unknown BUTTON link" } });
   assert.equal(semantic.explicitRole(element), "button");
