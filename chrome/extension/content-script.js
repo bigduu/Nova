@@ -14,6 +14,7 @@
 
   let trustedRoute = null;
   let currentSnapshot = null;
+  let mutationRevision = 0;
   let registerTimer = null;
   let enabled = true;
   let registration = null;
@@ -50,6 +51,7 @@
           resolve({ ok: false, code: response?.code ?? "content_unavailable" });
           return;
         }
+        if (!baseRouteMatches(response.route)) mutationRevision += 1;
         trustedRoute = response.route;
         resolve(response);
       },
@@ -70,6 +72,7 @@
     if (message.action === "read") {
       // Invalidate before touching the DOM so even a failed read cannot leave an
       // older snapshot actionable.
+      mutationRevision += 1;
       currentSnapshot = null;
       const snapshot = NovaSemantic.createSnapshot(document, {
         maxNodes: message.args?.maxNodes,
@@ -101,8 +104,15 @@
     // One read authorizes at most one mutation. This is intentionally consumed
     // before dispatch, including when the DOM operation fails.
     currentSnapshot = null;
+    const authorizedRevision = mutationRevision;
     try {
-      const result = await NovaSemantic.performAction(handle, message.action, message.args);
+      const result = await NovaSemantic.performAction(handle, message.action, message.args, () => {
+        if (!enabled) throw Object.assign(new Error("Page access was revoked; enable and pair the page again"), { code: "page_access_revoked" });
+        if (!baseRouteMatches(message.route)) throw Object.assign(new Error("content route mismatch"), { code: "route_mismatch" });
+        if (mutationRevision !== authorizedRevision) {
+          throw Object.assign(new Error("Page authority or snapshot changed; read again before retrying"), { code: "stale_snapshot" });
+        }
+      });
       return { ok: true, action: message.action, route: message.route, result };
     } catch (error) {
       return {
@@ -123,6 +133,7 @@
       return false;
     }
     if (message.type === "revoke_access") {
+      mutationRevision += 1;
       enabled = false;
       clearTimeout(registerTimer);
       currentSnapshot = null;
@@ -146,6 +157,7 @@
 
   function unregister() {
     if (!trustedRoute) return;
+    mutationRevision += 1;
     chrome.runtime.sendMessage({
       channel: CHANNEL,
       type: "unregister_top_frame",

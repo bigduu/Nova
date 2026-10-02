@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { webcrypto } from "node:crypto";
+import { createHash, webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -11,6 +11,205 @@ function invoke(listener, message, sender) {
   return new Promise((resolve, reject) => {
     const keepAlive = listener(message, sender, resolve);
     if (keepAlive !== true) reject(new Error("listener did not keep the response channel alive"));
+  });
+}
+
+async function valueReceiptFixture(crypto = webcrypto) {
+  const rect = { x: 1, y: 2, width: 20, height: 15 };
+  const document = {
+    readyState: "complete", title: "Value receipt handler", addEventListener() {},
+    defaultView: { Event, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+  };
+  function element(tagName, attributes = {}) {
+    return {
+      nodeType: 1, tagName, attributes, isConnected: true, ownerDocument: document,
+      getAttribute(name) { return this.attributes[name] ?? null; },
+      hasAttribute(name) { return Object.hasOwn(this.attributes, name); }, closest: () => null,
+      getClientRects: () => [rect], getBoundingClientRect: () => rect,
+    };
+  }
+  const body = element("BODY");
+  const host = element("DIV");
+  const fields = ["First initial ✓", "Second initial 🪷"].map((value) => {
+    const field = element("INPUT", { "aria-label": "Shared message" });
+    field.value = value;
+    field.events = [];
+    field.dispatchEvent = (event) => { field.events.push(event.type); return true; };
+    field.focus = () => { document.activeElement = field; };
+    field.parentElement = host;
+    return field;
+  });
+  fields[0].nextSibling = fields[1];
+  host.firstChild = fields[0];
+  host.parentElement = body;
+  body.firstChild = host;
+  document.body = body;
+  let listener;
+  const route = { tabId: 67, documentId: "receipt-document", nonce: null };
+  const runtime = {
+    id: "nova-receipt-test", lastError: null,
+    onMessage: { addListener(value) { listener = value; } },
+    sendMessage(message, callback) {
+      if (message.type !== "register_top_frame") return;
+      route.nonce = message.nonce;
+      callback({ ok: true, route: { ...route } });
+    },
+  };
+  const window = {};
+  window.top = window;
+  const events = new Map();
+  const context = vm.createContext({
+    addEventListener(type, callback) { events.set(type, callback); },
+    chrome: { runtime }, crypto, document, location: { href: "http://ordinary.example/" },
+    window, TextEncoder, setTimeout, clearTimeout,
+  });
+  vm.runInContext(semanticSource, context);
+  await vm.runInContext(contentSource, context);
+  const sender = { id: runtime.id };
+  const envelope = () => ({ channel: "nova-extension-v1", type: "semantic_command", route: { ...route, epoch: 7 } });
+  return {
+    fields, host, context, route,
+    read: () => invoke(listener, { ...envelope(), action: "read", args: {} }, sender),
+    command: (message) => invoke(listener, message, sender),
+    mutation: (snapshot, value, index = 1) => ({ ...envelope(), action: "set_value", args: {
+      snapshotId: snapshot.result.snapshotId, nodeId: snapshot.result.nodes[index].nodeId, value,
+    } }),
+    enable: () => context.NovaContentBridge.enable(),
+    pagehide: () => events.get("pagehide")(),
+    revoke() {
+      let response;
+      listener({ channel: "nova-extension-v1", type: "revoke_access" }, sender, (value) => { response = value; });
+      assert.equal(response.ok, true);
+    },
+  };
+}
+
+function pendingReceipt() {
+  let started;
+  let release;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const pending = new Promise((resolve) => { release = resolve; });
+  return {
+    ready, release,
+    crypto: {
+      getRandomValues: (bytes) => webcrypto.getRandomValues(bytes),
+      subtle: {
+        async digest(algorithm, bytes) {
+          assert.equal(algorithm, "SHA-256");
+          started();
+          await pending;
+          return webcrypto.subtle.digest(algorithm, bytes);
+        },
+      },
+    },
+  };
+}
+
+test("missing crypto.subtle rejects a value receipt before writing or emitting events", async () => {
+  const fixture = await valueReceiptFixture({ getRandomValues: (bytes) => webcrypto.getRandomValues(bytes) });
+  const snapshot = await fixture.read();
+  const value = "Attempt 中文 🪷 ✓";
+  const mutation = fixture.mutation(snapshot, value);
+  const response = await fixture.command(mutation);
+  assert.equal(fixture.fields[1].value, "Second initial 🪷", "receipt failure must precede mutation");
+  assert.equal(fixture.fields[0].value, "First initial ✓");
+  assert.deepEqual(fixture.fields.map((field) => field.events), [[], []]);
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "value_receipt_unavailable");
+  assert.equal(JSON.stringify(response).includes(value), false);
+  assert.equal((await fixture.command(mutation)).code, "stale_snapshot");
+  const fresh = await fixture.read();
+  assert.equal(fresh.result.nodes[1].value.text, "Second initial 🪷");
+});
+
+test("receipt preparation failures are constant errors without mutation or plaintext", async (t) => {
+  const value = "Attempt 中文 🪷 ✓";
+  const cases = [
+    ["throws", () => { throw new Error(value); }],
+    ["rejects", () => Promise.reject(new Error(value))],
+    ["invalid receipt", () => Promise.resolve(new ArrayBuffer(8))],
+  ];
+  for (const [name, digest] of cases) {
+    await t.test(name, async () => {
+      const fixture = await valueReceiptFixture({ getRandomValues: (bytes) => webcrypto.getRandomValues(bytes), subtle: { digest } });
+      const snapshot = await fixture.read();
+      const mutation = fixture.mutation(snapshot, value);
+      const response = await fixture.command(mutation);
+      assert.equal(response.code, "value_receipt_unavailable");
+      assert.equal(JSON.stringify(response).includes(value), false);
+      assert.equal(fixture.fields[1].value, "Second initial 🪷");
+      assert.deepEqual(fixture.fields.map((field) => field.events), [[], []]);
+      assert.equal((await fixture.command(mutation)).code, "stale_snapshot");
+    });
+  }
+});
+
+test("pending receipt writes only its exact target and prepared value after unchanged registration", async () => {
+  const receipt = pendingReceipt();
+  const fixture = await valueReceiptFixture(receipt.crypto);
+  const snapshot = await fixture.read();
+  assert.equal(snapshot.result.nodes[0].name, snapshot.result.nodes[1].name);
+  assert.notEqual(snapshot.result.nodes[0].nodeId, snapshot.result.nodes[1].nodeId);
+  const value = "Prepared Unicode 🪷 ✓";
+  const mutation = fixture.mutation(snapshot, value);
+  const responsePromise = fixture.command(mutation);
+  await receipt.ready;
+  assert.equal(fixture.fields[1].value, "Second initial 🪷");
+  assert.deepEqual(fixture.fields.map((field) => field.events), [[], []]);
+  assert.equal((await fixture.command(mutation)).code, "stale_snapshot", "the attempt is consumed while preparation waits");
+  await fixture.enable(); // A new object for the same route is not a revocation.
+  mutation.args.value = "Later argument must not replace prepared input";
+  receipt.release();
+  const response = await responsePromise;
+  assert.equal(response.ok, true);
+  assert.equal(response.result.valueSha256, createHash("sha256").update(value).digest("hex"));
+  assert.equal(response.result.valueUtf8Bytes, new TextEncoder().encode(value).byteLength);
+  assert.equal(JSON.stringify(response).includes(value), false);
+  assert.equal(fixture.fields[1].value, value);
+  assert.equal(fixture.fields[0].value, "First initial ✓");
+  assert.deepEqual(fixture.fields.map((field) => field.events), [[], ["input", "change"]]);
+  assert.equal((await fixture.command(mutation)).code, "stale_snapshot");
+  assert.equal((await fixture.read()).result.nodes[1].value.text, value);
+});
+
+for (const [name, code, invalidate] of [
+  ["revocation", "page_access_revoked", (fixture) => fixture.revoke()],
+  ["revocation then same-document enable", "stale_snapshot", async (fixture) => { fixture.revoke(); await fixture.enable(); }],
+  ["pagehide", "route_mismatch", (fixture) => fixture.pagehide()],
+  ["pagehide then enable", "stale_snapshot", async (fixture) => { fixture.pagehide(); await fixture.enable(); }],
+  ["replacement document route", "route_mismatch", async (fixture) => { fixture.route.documentId = "replacement-document"; await fixture.enable(); }],
+  ["new private host", "sensitive_control", (fixture) => { fixture.host.attributes["data-private"] = ""; }],
+  ["disconnected target", "stale_node", (fixture) => { fixture.fields[1].isConnected = false; }],
+  ["fresh read", "stale_snapshot", async (fixture) => { assert.equal((await fixture.read()).ok, true); }],
+  ["failed read", "stale_snapshot", async (fixture) => {
+    const document = fixture.context.document;
+    const body = document.body;
+    Object.defineProperty(document, "body", { configurable: true, get() { throw new Error("controlled read failure"); } });
+    assert.equal((await fixture.read()).code, "content_failure");
+    Object.defineProperty(document, "body", { configurable: true, value: body });
+  }],
+  ["read then another consumed action (ABA)", "stale_snapshot", async (fixture) => {
+    const fresh = await fixture.read();
+    const focus = fixture.mutation(fresh, "unused", 0);
+    focus.action = "focus";
+    assert.equal((await fixture.command(focus)).result.focused, true);
+  }],
+]) {
+  test(`pending receipt rejects ${name} before any value or events`, async () => {
+    const receipt = pendingReceipt();
+    const fixture = await valueReceiptFixture(receipt.crypto);
+    const snapshot = await fixture.read();
+    const value = "Must not write 中文 🪷 ✓";
+    const responsePromise = fixture.command(fixture.mutation(snapshot, value));
+    await receipt.ready;
+    await invalidate(fixture);
+    receipt.release();
+    const response = await responsePromise;
+    assert.equal(response.ok, false);
+    assert.equal(response.code, code);
+    assert.equal(JSON.stringify(response).includes(value), false);
+    assert.deepEqual(fixture.fields.map((field) => field.value), ["First initial ✓", "Second initial 🪷"]);
+    assert.deepEqual(fixture.fields.map((field) => field.events), [[], []]);
   });
 }
 
