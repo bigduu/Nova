@@ -11,8 +11,11 @@
   },
   "minimum_chrome_version": "106",
   "permissions": [
-    "nativeMessaging"
+    "nativeMessaging",
+    "activeTab",
+    "scripting"
   ],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"
@@ -25,14 +28,5 @@
     },
     "default_title": "Nova",
     "default_popup": "popup.html"
-  },
-  "content_scripts": [
-    {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["lib/semantic-runtime.js", "content-script.js"],
-      "all_frames": false,
-      "match_about_blank": false,
-      "run_at": "document_start"
-    }
-  ]
+  }
 }

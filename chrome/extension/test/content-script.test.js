@@ -15,6 +15,7 @@ function invoke(listener, message, sender) {
 
 test("content routing requires an exact route and consumes snapshots after one mutation", async () => {
   let runtimeListener;
+  let listenerCount = 0;
   let actionCalls = 0;
   const handle = { element: {}, actions: ["set_value"] };
   const route = { tabId: 4, documentId: "document-4", nonce: null };
@@ -23,6 +24,7 @@ test("content routing requires an exact route and consumes snapshots after one m
     lastError: null,
     onMessage: {
       addListener(listener) {
+        listenerCount += 1;
         runtimeListener = listener;
       },
     },
@@ -64,7 +66,8 @@ test("content routing requires an exact route and consumes snapshots after one m
     TextEncoder,
     window,
   };
-  vm.runInNewContext(contentSource, context);
+  const installedContext = vm.createContext(context);
+  await vm.runInContext(contentSource, installedContext);
   assert.equal(typeof runtimeListener, "function");
 
   const sender = { id: runtime.id };
@@ -84,6 +87,10 @@ test("content routing requires an exact route and consumes snapshots after one m
   const read = await invoke(runtimeListener, { ...envelope, action: "read" }, sender);
   assert.equal(read.ok, true);
   assert.equal(read.result.snapshotId, "snapshot-1");
+  const nonce = route.nonce;
+  await vm.runInContext(contentSource, installedContext);
+  assert.equal(route.nonce, nonce, "repeated bootstrap must reuse the document nonce");
+  assert.equal(listenerCount, 1, "repeated bootstrap must not create a second listener");
 
   const mutation = {
     ...envelope,
@@ -97,6 +104,18 @@ test("content routing requires an exact route and consumes snapshots after one m
   const replay = await invoke(runtimeListener, mutation, sender);
   assert.equal(replay.ok, false);
   assert.equal(replay.code, "stale_snapshot");
+  assert.equal(actionCalls, 1);
+  let revoked;
+  runtimeListener({ channel: "nova-extension-v1", type: "revoke_access" }, sender,
+    (response) => { revoked = response; });
+  assert.equal(revoked.ok, true);
+  const denied = await invoke(runtimeListener, { ...envelope, action: "read" }, sender);
+  assert.equal(denied.code, "page_access_revoked");
+  await vm.runInContext(contentSource, installedContext);
+  assert.equal(route.nonce, nonce);
+  assert.equal(listenerCount, 1);
+  const oldSnapshot = await invoke(runtimeListener, mutation, sender);
+  assert.equal(oldSnapshot.code, "stale_snapshot");
   assert.equal(actionCalls, 1);
 });
 
