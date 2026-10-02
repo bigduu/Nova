@@ -325,6 +325,13 @@ absent or partial, use focused-window `ocr` for rendered text; use
 use the pixel space of the most recent screenshot; `cursor_position` instead
 reports OS-global logical coordinates.
 
+Semantic reads (`ax_read` and its `read_ui` alias) include supported control
+state and identify scroll containers with `scrollable=true` in `all`/`content`
+mode, including unnamed containers. Containers alone receive no action mark.
+The target includes its window title and, when the selected macOS window
+exposes `AXDocument`/`AXURL`, an optional `url`. Unsupported URL/state attributes
+are omitted; Windows uses supported cached UIA states and ScrollPattern metadata.
+
 Native text writes (`type_text`, `write_clipboard`, batch typing, and
 `ax_set_value`) omit the submitted text from tracing and acknowledgements.
 Write diagnostics retain character/UTF-8 byte counts and native operation

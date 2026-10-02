@@ -6,8 +6,8 @@
 //! Accessibility granted and Screen Recording denied.
 
 use super::attrs::{
-    ax_bool, ax_pid, ax_role, ax_title, ax_window_id, element_array, element_attribute,
-    element_rect, process_is_trusted,
+    ax_bool, ax_document_url, ax_pid, ax_role, ax_title, ax_window_id, element_array,
+    element_attribute, element_rect, process_is_trusted,
 };
 use crate::platform::{UiBounds, UiReadError, UiReadErrorKind, UiTarget};
 use accessibility::AXUIElement;
@@ -32,6 +32,7 @@ struct RunningApp {
 }
 
 struct WindowCandidate {
+    element: AXUIElement,
     title: String,
     raw_frame: Option<UiBounds>,
     window_id: Option<u32>,
@@ -269,6 +270,7 @@ fn target_from_app(
             let window_id = ax_window_id(&window);
             let global_frame = window_id.and_then(global_window_bounds);
             Some(WindowCandidate {
+                element: window,
                 title,
                 raw_frame,
                 window_id,
@@ -305,6 +307,7 @@ fn target_from_app(
             pid,
             app_name: app_name.to_string(),
             window_title: candidate.title,
+            document_url: ax_document_url(&candidate.element),
             window_id: candidate.window_id.map(u64::from),
             bounds: candidate.global_frame,
         }));
@@ -318,6 +321,7 @@ fn target_from_app(
             pid,
             app_name: app_name.to_string(),
             window_title: String::new(),
+            document_url: ax_document_url(&app),
             window_id: None,
             bounds: None,
         }));

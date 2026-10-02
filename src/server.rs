@@ -1354,6 +1354,7 @@ fn format_ax_node(line: &AxLine) -> String {
         ("selected", line.node.states.selected),
         ("checked", line.node.states.checked),
         ("expanded", line.node.states.expanded),
+        ("scrollable", line.node.states.scrollable),
     ]
     .into_iter()
     .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
@@ -1382,12 +1383,68 @@ fn format_ax_snapshot(
         .iter()
         .filter(|line| filter.is_none_or(|filter| ax_line_matches(line, filter)))
         .collect();
+    let document_url = built
+        .target
+        .document_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| format!(",url=\"{}\"", sanitize_ax_field(url, 512)))
+        .unwrap_or_default();
+    let header = |rendered_count: usize, render_truncated: bool| {
+        let truncated = built.truncated || render_truncated;
+        let reason = if render_truncated {
+            Some("character_limit")
+        } else {
+            built
+                .partial_reason
+                .map(crate::platform::UiPartialReason::as_str)
+        };
+        let filter_note = filter
+            .map(|_| {
+                format!(
+                    " filter_applied=true shown={}/{}",
+                    rendered_count,
+                    built.lines.len()
+                )
+            })
+            .unwrap_or_else(|| format!(" shown={rendered_count}/{}", built.lines.len()));
+        let mut header = format!(
+            "capability=ax:read snapshot_id=\"{}\" mode={} coverage={} truncated={}{} \
+             target={{pid={},app=\"{}\",window=\"{}\"{}}}{}",
+            sanitize_ax_field(snapshot_id, 128),
+            mode.as_str(),
+            built.coverage.as_str(),
+            truncated,
+            reason
+                .map(|reason| format!(" partial_reason={reason}"))
+                .unwrap_or_default(),
+            built.target.pid,
+            sanitize_ax_field(&built.target.app_name, 256),
+            sanitize_ax_field(&built.target.window_title, 512),
+            document_url,
+            filter_note,
+        );
+        if built.coverage != crate::platform::UiReadCoverage::Complete {
+            header.push_str(
+                " fallback=use_focused_ocr_for_missing_rendered_text_then_screenshot_or_zoom_for_\
+                 visual_only_state",
+            );
+        }
+        header.push_str(
+            ". Action: call ax_activate(snapshot_id, node_id) for an actionable node. Every activation \
+             attempt consumes the generation before provider dispatch; rerun ax_read after any result.",
+        );
+        header
+    };
+    // Include escaped target metadata and either truncation/reason outcome.
+    // `shown.len()` reserves the widest possible rendered-count field.
+    let header_budget = header(shown.len(), false)
+        .chars()
+        .count()
+        .max(header(shown.len(), true).chars().count());
+    let body_budget = max_chars.saturating_sub(header_budget);
     let mut body = String::new();
     let mut rendered_count = 0usize;
-    // Reserve enough room for the bounded metadata header and fallback
-    // instruction, so the final hard guard cannot silently invalidate the
-    // header's explicit `truncated` flag.
-    let body_budget = max_chars.saturating_sub(1_600);
     for line in &shown {
         let rendered = format_ax_node(line);
         let added = rendered.chars().count() + 1;
@@ -1398,49 +1455,7 @@ fn format_ax_snapshot(
         body.push_str(&rendered);
         rendered_count += 1;
     }
-    let render_truncated = rendered_count < shown.len();
-    let truncated = built.truncated || render_truncated;
-    let reason = if render_truncated {
-        Some("character_limit")
-    } else {
-        built
-            .partial_reason
-            .map(crate::platform::UiPartialReason::as_str)
-    };
-    let filter_note = filter
-        .map(|_| {
-            format!(
-                " filter_applied=true shown={}/{}",
-                rendered_count,
-                built.lines.len()
-            )
-        })
-        .unwrap_or_else(|| format!(" shown={rendered_count}/{}", built.lines.len()));
-    let mut output = format!(
-        "capability=ax:read snapshot_id=\"{}\" mode={} coverage={} truncated={}{} \
-         target={{pid={},app=\"{}\",window=\"{}\"}}{}",
-        sanitize_ax_field(snapshot_id, 128),
-        mode.as_str(),
-        built.coverage.as_str(),
-        truncated,
-        reason
-            .map(|reason| format!(" partial_reason={reason}"))
-            .unwrap_or_default(),
-        built.target.pid,
-        sanitize_ax_field(&built.target.app_name, 256),
-        sanitize_ax_field(&built.target.window_title, 512),
-        filter_note,
-    );
-    if built.coverage != crate::platform::UiReadCoverage::Complete {
-        output.push_str(
-            " fallback=use_focused_ocr_for_missing_rendered_text_then_screenshot_or_zoom_for_\
-             visual_only_state",
-        );
-    }
-    output.push_str(
-        ". Action: call ax_activate(snapshot_id, node_id) for an actionable node. Every activation \
-         attempt consumes the generation before provider dispatch; rerun ax_read after any result.",
-    );
+    let mut output = header(rendered_count, rendered_count < shown.len());
     output.push_str(&body);
     if output.chars().count() > max_chars {
         output = output.chars().take(max_chars.saturating_sub(1)).collect();
@@ -3355,6 +3370,7 @@ mod tests {
             pid: 42,
             app_name: "Example".to_string(),
             window_title: "Login".to_string(),
+            document_url: None,
             window_id: Some(7),
             bounds: shared_bounds,
         };
@@ -3410,6 +3426,7 @@ mod tests {
             pid: 1,
             app_name: "Example".to_string(),
             window_title: String::new(),
+            document_url: None,
             window_id: None,
             bounds: None,
         };
@@ -3435,6 +3452,254 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct FakeElementHandle;
+
+    fn semantic_metadata_snapshot(
+        nodes: Vec<crate::platform::CollectedUiNode>,
+    ) -> crate::platform::UiSnapshot {
+        crate::platform::UiSnapshot {
+            target: crate::platform::UiTarget {
+                pid: 42,
+                app_name: "Example".into(),
+                window_title: "Document".into(),
+                document_url: None,
+                window_id: Some(7),
+                bounds: None,
+            },
+            nodes,
+            coverage: crate::platform::UiReadCoverage::Complete,
+            truncated: false,
+            partial_reason: None,
+        }
+    }
+
+    #[test]
+    fn semantic_metadata_window_and_url_escape_without_forging_lines() {
+        let mut snapshot = semantic_metadata_snapshot(Vec::new());
+        snapshot.target.window_title = "Notes \"一\"\nnext\\section".into();
+        snapshot.target.document_url = Some("file:///tmp/一?quote=\"x\"\nnext\\section".into());
+        let built = build_ax_entries(snapshot);
+        let output = format_ax_snapshot(
+            "ax-metadata",
+            &built,
+            crate::platform::UiReadMode::All,
+            None,
+            20_000,
+        );
+        assert!(
+            output.contains("window=\"Notes \\\"一\\\" next\\\\section\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("url=\"file:///tmp/一?quote=\\\"x\\\" next\\\\section\""),
+            "{output}"
+        );
+        assert_eq!(output.lines().count(), 1, "{output}");
+    }
+
+    #[test]
+    fn semantic_metadata_unsupported_states_are_omitted_and_supported_false_remains() {
+        let mut line = ax_line(
+            "n1",
+            "Button",
+            "Save",
+            crate::platform::UiNodeValue::Absent,
+            None,
+        );
+        let unknown = format_ax_node(&line);
+        assert!(!unknown.contains("states="), "{unknown}");
+        line.node.states = crate::platform::UiNodeStates {
+            enabled: Some(false),
+            focused: Some(true),
+            checked: Some(false),
+            scrollable: Some(true),
+            ..crate::platform::UiNodeStates::default()
+        };
+        let supported = format_ax_node(&line);
+        assert!(supported.contains("enabled=false"), "{supported}");
+        assert!(supported.contains("focused=true"), "{supported}");
+        assert!(supported.contains("checked=false"), "{supported}");
+        assert!(supported.contains("scrollable=true"), "{supported}");
+        assert!(!supported.contains("selected="), "{supported}");
+        assert!(!supported.contains("expanded="), "{supported}");
+        let mut snapshot = semantic_metadata_snapshot(Vec::new());
+        for document_url in [None, Some(String::new())] {
+            snapshot.target.document_url = document_url;
+            let built = build_ax_entries(snapshot.clone());
+            let output = format_ax_snapshot(
+                "ax-unknown",
+                &built,
+                crate::platform::UiReadMode::All,
+                None,
+                20_000,
+            );
+            assert!(!output.contains("url="), "{output}");
+        }
+    }
+
+    #[test]
+    fn semantic_metadata_scroll_containers_before_actions_preserve_marks_and_handles() {
+        let mut nodes = Vec::new();
+        for name in ["Open", "Save"] {
+            let mut scroll = ax_line(
+                "",
+                "ScrollArea",
+                "",
+                crate::platform::UiNodeValue::Absent,
+                None,
+            )
+            .node;
+            scroll.states.scrollable = Some(true);
+            nodes.push(crate::platform::CollectedUiNode {
+                node: scroll,
+                handle: None,
+            });
+            let mut action = ax_line(
+                "",
+                "Button",
+                name,
+                crate::platform::UiNodeValue::Absent,
+                None,
+            )
+            .node;
+            action.actionable = true;
+            action.actions = vec!["Invoke".into()];
+            nodes.push(crate::platform::CollectedUiNode {
+                node: action,
+                handle: Some(Box::new(FakeElementHandle)),
+            });
+        }
+        let built = build_ax_entries(semantic_metadata_snapshot(nodes));
+        assert_eq!(
+            built.lines.iter().map(|line| line.mark).collect::<Vec<_>>(),
+            [None, Some(1), None, Some(2)]
+        );
+        assert_eq!(built.cached.len(), 2);
+        assert_eq!(built.cached[0].0, "n2");
+        assert_eq!(built.cached[0].1.number, 1);
+        assert_eq!(built.cached[1].0, "n4");
+        assert_eq!(built.cached[1].1.number, 2);
+        assert_eq!(built.cached[0].1.handle.click().unwrap(), "FakeInvoke");
+        assert_eq!(built.cached[1].1.handle.click().unwrap(), "FakeInvoke");
+        for mode in [
+            crate::platform::UiReadMode::All,
+            crate::platform::UiReadMode::Content,
+        ] {
+            let output = format_ax_snapshot("ax-scroll", &built, mode, None, 20_000);
+            assert!(
+                output.contains(
+                    "[n1] depth=1 role=\"ScrollArea\" actionable=false states={scrollable=true}"
+                ),
+                "{output}"
+            );
+            assert!(output.contains("[n2 mark=1]"), "{output}");
+            assert!(output.contains("[n4 mark=2]"), "{output}");
+        }
+        let filtered = format_ax_snapshot(
+            "ax-scroll",
+            &built,
+            crate::platform::UiReadMode::All,
+            Some("save"),
+            20_000,
+        );
+        assert!(filtered.contains("[n4 mark=2]"), "{filtered}");
+        assert!(!filtered.contains("mark=1"), "{filtered}");
+    }
+
+    #[test]
+    fn semantic_metadata_url_reserves_space_in_the_unicode_render_budget() {
+        let node = ax_line(
+            "",
+            "Text",
+            "body",
+            crate::platform::UiNodeValue::Text("中".repeat(3_000)),
+            None,
+        )
+        .node;
+        let mut snapshot = semantic_metadata_snapshot(vec![crate::platform::CollectedUiNode {
+            node,
+            handle: None,
+        }]);
+        snapshot.target.document_url = Some(format!("https://example.test/{}", "\"".repeat(1_000)));
+        let built = build_ax_entries(snapshot);
+        let output = format_ax_snapshot(
+            "ax-budget",
+            &built,
+            crate::platform::UiReadMode::All,
+            None,
+            4_096,
+        );
+        assert!(output.contains("url=\"https://example.test/"), "{output}");
+        assert!(output.contains("truncated=true"), "{output}");
+        assert!(
+            output.contains("partial_reason=character_limit"),
+            "{output}"
+        );
+        assert!(output.chars().count() <= 4_096);
+        assert!(!output.contains("[n1]"), "{output}");
+    }
+
+    #[test]
+    fn semantic_metadata_long_header_preserves_complete_lines_and_accurate_truncation() {
+        let nodes = [
+            ("intro", crate::platform::UiNodeValue::Absent),
+            (
+                "body",
+                crate::platform::UiNodeValue::Text("中".repeat(1_200)),
+            ),
+            ("end", crate::platform::UiNodeValue::Absent),
+        ]
+        .into_iter()
+        .map(|(name, value)| crate::platform::CollectedUiNode {
+            node: ax_line("", "Text", name, value, None).node,
+            handle: None,
+        })
+        .collect();
+        let mut snapshot = semantic_metadata_snapshot(nodes);
+        snapshot.target.app_name = "\"".repeat(512);
+        snapshot.target.window_title = "\\".repeat(1_024);
+        snapshot.target.document_url = Some(format!("https://example.test/{}", "\"".repeat(1_024)));
+        snapshot.coverage = crate::platform::UiReadCoverage::Partial;
+        snapshot.partial_reason = Some(crate::platform::UiPartialReason::ProviderPartial);
+        let built = build_ax_entries(snapshot);
+        let snapshot_id = "\"".repeat(256);
+        let first_line = format_ax_node(&built.lines[0]);
+        let output = format_ax_snapshot(
+            &snapshot_id,
+            &built,
+            crate::platform::UiReadMode::Interactive,
+            Some("text"),
+            4_096,
+        );
+        assert!(output.chars().count() <= 4_096);
+        assert!(output.contains("truncated=true"), "{output}");
+        assert!(
+            output.contains("partial_reason=character_limit"),
+            "{output}"
+        );
+        assert!(output.contains("filter_applied=true shown=1/3"), "{output}");
+        assert!(output.contains("fallback=use_focused_ocr"), "{output}");
+        assert_eq!(output.lines().skip(1).collect::<Vec<_>>(), [first_line]);
+        let complete = format_ax_snapshot(
+            &snapshot_id,
+            &built,
+            crate::platform::UiReadMode::Interactive,
+            Some("text"),
+            20_000,
+        );
+        assert!(complete.contains("truncated=false"), "{complete}");
+        assert!(
+            complete.contains("partial_reason=provider_partial"),
+            "{complete}"
+        );
+        assert!(
+            complete.contains("filter_applied=true shown=3/3"),
+            "{complete}"
+        );
+        assert_eq!(
+            complete.lines().skip(1).collect::<Vec<_>>(),
+            built.lines.iter().map(format_ax_node).collect::<Vec<_>>()
+        );
+    }
 
     impl crate::platform::ElementHandle for FakeElementHandle {
         fn click(&self) -> Result<&'static str, String> {
@@ -3526,6 +3791,7 @@ mod tests {
                 pid: 42,
                 app_name: "Example".to_string(),
                 window_title: "Document".to_string(),
+                document_url: None,
                 window_id: None,
                 bounds: None,
             },
@@ -3838,6 +4104,7 @@ mod tests {
             pid: 1,
             app_name: "Example".to_string(),
             window_title: String::new(),
+            document_url: None,
             window_id: None,
             bounds: None,
         };
@@ -4279,6 +4546,7 @@ mod input_redaction_tests {
                 pid: 42,
                 app_name: "fixture".into(),
                 window_title: "fixture".into(),
+                document_url: None,
                 window_id: None,
                 bounds: None,
             })

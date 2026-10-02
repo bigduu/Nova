@@ -55,7 +55,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_InvokePatternId,
     UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
     UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
-    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_IsScrollPatternAvailablePropertyId,
     UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
     UIA_IsValuePatternAvailablePropertyId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
     UIA_MenuBarControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_NamePropertyId,
@@ -245,6 +245,7 @@ pub(super) fn build_snapshot_cache_request(
             UIA_IsExpandCollapsePatternAvailablePropertyId,
             UIA_IsSelectionItemPatternAvailablePropertyId,
             UIA_IsValuePatternAvailablePropertyId,
+            UIA_IsScrollPatternAvailablePropertyId,
             UIA_SelectionItemIsSelectedPropertyId,
             UIA_ToggleToggleStatePropertyId,
             UIA_ExpandCollapseExpandCollapseStatePropertyId,
@@ -365,7 +366,15 @@ pub(super) fn build_snapshot_condition(
         }
         let control = automation.ControlViewCondition()?;
         let content = automation.ContentViewCondition()?;
-        let semantic = automation.CreateOrCondition(&control, &content)?;
+        let scrollable = automation.CreatePropertyCondition(
+            UIA_IsScrollPatternAvailablePropertyId,
+            &VARIANT::from(true),
+        )?;
+        let semantic = automation.CreateOrConditionFromNativeArray(&[
+            Some(control),
+            Some(content),
+            Some(scrollable),
+        ])?;
         if mode == UiReadMode::Content {
             Ok(semantic)
         } else {
@@ -443,8 +452,9 @@ pub(super) fn cached_bool_property(
     el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
     property: UIA_PROPERTY_ID,
 ) -> Option<bool> {
-    // SAFETY: `build_cache_request` adds every property passed by callers.
-    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
+    // SAFETY: the cache request includes this property. Ignoring UIA defaults
+    // preserves its unsupported sentinel, which cannot convert to a bool.
+    let value = unsafe { el.GetCachedPropertyValueEx(property, true) }.ok()?;
     bool::try_from(&value).ok()
 }
 
@@ -455,7 +465,7 @@ pub(super) fn cached_i32_property(
     property: UIA_PROPERTY_ID,
 ) -> Option<i32> {
     // SAFETY: see `cached_bool_property`.
-    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
+    let value = unsafe { el.GetCachedPropertyValueEx(property, true) }.ok()?;
     i32::try_from(&value).ok()
 }
 

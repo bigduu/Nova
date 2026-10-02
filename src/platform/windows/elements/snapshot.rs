@@ -27,8 +27,10 @@ use windows::Win32::Foundation::{E_ACCESSDENIED, HWND};
 use windows::Win32::UI::Accessibility::{
     IUIAutomation, IUIAutomationCacheRequest, IUIAutomationCondition, IUIAutomationElement,
     TreeScope_Descendants, UIA_ExpandCollapseExpandCollapseStatePropertyId,
-    UIA_SelectionItemIsSelectedPropertyId, UIA_ToggleToggleStatePropertyId, UIA_CONTROLTYPE_ID,
-    UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_E_TIMEOUT,
+    UIA_HasKeyboardFocusPropertyId, UIA_IsEnabledPropertyId,
+    UIA_IsScrollPatternAvailablePropertyId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_ToggleToggleStatePropertyId, UIA_CONTROLTYPE_ID, UIA_E_ELEMENTNOTAVAILABLE,
+    UIA_E_NOTSUPPORTED, UIA_E_TIMEOUT,
 };
 
 /// A defensive local-processing bound. UIA's `FindAllBuildCache` itself has no
@@ -78,6 +80,7 @@ fn target_from_window(window: WindowHandle) -> UiTarget {
         pid: window.pid,
         app_name: window.app_name,
         window_title: window.title,
+        document_url: None,
         window_id: (window.id != 0).then_some(window.id),
         bounds: (window.width > 0.0 && window.height > 0.0).then_some(UiBounds {
             x: window.x,
@@ -432,10 +435,14 @@ fn node_from_cached(
     let control_type = unsafe { element.CachedControlType() }.unwrap_or(UIA_CONTROLTYPE_ID(0));
     let role = control_type_name(control_type);
     let actions = cached_actions(&element);
+    let scrollable = cached_bool_property(&element, UIA_IsScrollPatternAvailablePropertyId)
+        .filter(|available| *available);
     let actionable =
         is_actionable_control_type(control_type) || actions.iter().any(|a| is_click_action(a));
-    let readable =
-        !name.is_empty() || !description.is_empty() || !value.as_filter_text().is_empty();
+    let readable = !name.is_empty()
+        || !description.is_empty()
+        || !value.as_filter_text().is_empty()
+        || scrollable == Some(true);
     let include = match mode {
         UiReadMode::Interactive => actionable,
         UiReadMode::Content => readable,
@@ -452,16 +459,12 @@ fn node_from_cached(
         value,
         actions,
         states: UiNodeStates {
-            // SAFETY: both specialized properties are cached.
-            enabled: unsafe { element.CachedIsEnabled() }
-                .ok()
-                .map(|value| value.as_bool()),
-            focused: unsafe { element.CachedHasKeyboardFocus() }
-                .ok()
-                .map(|value| value.as_bool()),
+            enabled: cached_bool_property(&element, UIA_IsEnabledPropertyId),
+            focused: cached_bool_property(&element, UIA_HasKeyboardFocusPropertyId),
             selected: cached_bool_property(&element, UIA_SelectionItemIsSelectedPropertyId),
             checked: checked_state(&element),
             expanded: expanded_state(&element),
+            scrollable,
         },
         bounds: cached_bounds(&element),
         // FindAllBuildCache returns a flat provider array. Zero is the honest
