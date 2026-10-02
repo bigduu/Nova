@@ -151,6 +151,13 @@ enum Commands {
     /// Nova.app (install it separately); on Windows/Linux, serve over stdio.
     Mcp,
 
+    /// Manage the current user's Google Chrome native messaging host.
+    #[cfg(windows)]
+    ChromeHost {
+        #[command(subcommand)]
+        command: ChromeHostCommand,
+    },
+
     /// Run the pinned official Chrome DevTools MCP server over transparent
     /// stdio, with Nova's privacy-oriented defaults.
     ///
@@ -158,6 +165,24 @@ enum Commands {
     /// Chrome; URL allow patterns require Chrome 149+, and WebMCP requires
     /// Chrome 150+.
     ChromeDevtools(nova::chrome_devtools::ChromeDevtoolsArgs),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+enum ChromeHostCommand {
+    /// Copy an already-built host and register one exact extension ID.
+    Install {
+        #[arg(long)]
+        host_binary: std::path::PathBuf,
+        #[arg(long)]
+        extension_id: String,
+        #[arg(long)]
+        pipe: Option<std::path::PathBuf>,
+    },
+    /// Inspect owned files and registration without contacting the broker.
+    Status,
+    /// Remove verified owned objects; preserve unrelated files and registry data.
+    Uninstall,
 }
 
 fn main() -> Result<()> {
@@ -190,6 +215,23 @@ fn main() -> Result<()> {
     // responsible-process and TCC attribution for the processes involved.
     if let Some(Commands::ChromeDevtools(options)) = cli.command.as_ref() {
         return nova::chrome_devtools::run(options);
+    }
+
+    #[cfg(windows)]
+    if let Some(Commands::ChromeHost { command }) = cli.command.as_ref() {
+        let report = match command {
+            ChromeHostCommand::Install {
+                host_binary,
+                extension_id,
+                pipe,
+            } => {
+                nova_chrome_bridge::install_chrome_host(host_binary, extension_id, pipe.as_deref())
+            }
+            ChromeHostCommand::Status => nova_chrome_bridge::chrome_host_status(),
+            ChromeHostCommand::Uninstall => nova_chrome_bridge::uninstall_chrome_host(),
+        }?;
+        println!("{report:#}");
+        return Ok(());
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1030,6 +1072,43 @@ fn log_platform_permissions() {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn chrome_host_commands_are_explicit_and_cannot_select_other_targets() {
+        for action in ["status", "uninstall"] {
+            assert!(matches!(
+                Cli::try_parse_from(["nova", "chrome-host", action])
+                    .unwrap()
+                    .command,
+                Some(Commands::ChromeHost { .. })
+            ));
+        }
+        assert!(matches!(
+            Cli::try_parse_from([
+                "nova",
+                "chrome-host",
+                "install",
+                "--host-binary",
+                r"C:\host.exe",
+                "--extension-id",
+                "abcdefghijklmnopabcdefghijklmnop"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::ChromeHost {
+                command: ChromeHostCommand::Install { .. }
+            })
+        ));
+        for arguments in [
+            vec!["nova", "chrome-host", "install"],
+            vec!["nova", "--http", "chrome-host", "status"],
+            vec!["nova", "chrome-host", "status", "--registry-path", "test"],
+            vec!["nova", "chrome-host", "uninstall", "--force"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
 
     #[test]
     fn managed_mcp_is_an_explicit_subcommand() {

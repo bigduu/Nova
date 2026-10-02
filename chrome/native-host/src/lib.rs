@@ -9,10 +9,15 @@ pub mod app;
 pub mod framing;
 pub mod protocol;
 
+#[cfg(windows)]
+mod registration;
 #[cfg(unix)]
 mod socket;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(windows)]
+pub use registration::{chrome_host_status, install_chrome_host, uninstall_chrome_host};
 
 #[cfg(unix)]
 pub(crate) use socket::configured_socket_path;
