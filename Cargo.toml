@@ -197,6 +197,7 @@ windows = { version = "0.58", features = [
     "Win32_Storage_Xps",
     "Win32_UI_Accessibility",
     "Win32_System_Com",
+    "Win32_System_Variant",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage_Streams",

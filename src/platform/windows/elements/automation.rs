@@ -45,6 +45,7 @@ use windows::core::{Interface, VARIANT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::Variant::{VT_BOOL, VT_BSTR};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
     IUIAutomationCondition, UIA_BoundingRectanglePropertyId, UIA_ButtonControlTypeId,
@@ -469,13 +470,22 @@ pub(super) fn cached_i32_property(
     i32::try_from(&value).ok()
 }
 
-fn cached_string_property(
-    el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-    property: UIA_PROPERTY_ID,
-) -> Option<String> {
-    // SAFETY: see `cached_bool_property`.
-    let value = unsafe { el.GetCachedPropertyValue(property) }.ok()?;
-    let value = windows::core::BSTR::try_from(&value).ok()?.to_string();
+fn cached_bool_value(value: &VARIANT) -> Option<bool> {
+    // SAFETY: the type tag is valid for every initialized VARIANT. Password
+    // classification must not coerce empty or non-boolean provider values.
+    if unsafe { value.as_raw().Anonymous.Anonymous.vt } != VT_BOOL.0 {
+        return None;
+    }
+    bool::try_from(value).ok()
+}
+
+fn cached_string_value(value: &VARIANT) -> Option<String> {
+    // SAFETY: see `cached_bool_value`. BSTR::try_from also converts numbers
+    // and other VARIANT types, which are not a supported UIA string value.
+    if unsafe { value.as_raw().Anonymous.Anonymous.vt } != VT_BSTR.0 {
+        return None;
+    }
+    let value = windows::core::BSTR::try_from(value).ok()?.to_string();
     (!value.is_empty()).then_some(value)
 }
 
@@ -486,14 +496,38 @@ fn cached_string_property(
 pub(super) fn cached_node_value(
     el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
 ) -> UiNodeValue {
-    match cached_password_state(el) {
+    cached_node_value_with(|property| {
+        // SAFETY: the semantic value cache includes these properties. Keep
+        // unsupported properties as their sentinel instead of UIA defaults.
+        unsafe { el.GetCachedPropertyValueEx(property, true) }
+    })
+}
+
+fn cached_node_value_with(
+    mut property: impl FnMut(UIA_PROPERTY_ID) -> windows::core::Result<VARIANT>,
+) -> UiNodeValue {
+    let password = property(UIA_IsPasswordPropertyId)
+        .ok()
+        .as_ref()
+        .and_then(cached_bool_value);
+    match password {
         Some(true) => return UiNodeValue::Redacted,
         Some(false) => {}
         // Fail closed: an unclassifiable value must not be read and possibly
         // expose a secure field through a broken/custom provider.
         None => return UiNodeValue::Redacted,
     }
-    cached_string_property(el, UIA_ValueValuePropertyId)
+    let available = property(UIA_IsValuePatternAvailablePropertyId)
+        .ok()
+        .as_ref()
+        .and_then(cached_bool_value);
+    if available != Some(true) {
+        return UiNodeValue::Absent;
+    }
+    property(UIA_ValueValuePropertyId)
+        .ok()
+        .as_ref()
+        .and_then(cached_string_value)
         .map(UiNodeValue::Text)
         .unwrap_or(UiNodeValue::Absent)
 }
@@ -503,10 +537,8 @@ pub(super) fn cached_password_state(
     el: &windows::Win32::UI::Accessibility::IUIAutomationElement,
 ) -> Option<bool> {
     // SAFETY: IsPassword is included in both semantic cache requests.
-    match unsafe { el.CachedIsPassword() } {
-        Ok(value) => Some(value.as_bool()),
-        Err(_) => None,
-    }
+    let value = unsafe { el.GetCachedPropertyValueEx(UIA_IsPasswordPropertyId, true) }.ok()?;
+    cached_bool_value(&value)
 }
 
 /// Deterministic action list derived entirely from the cached property blob.
@@ -630,4 +662,123 @@ pub(super) fn value_pattern(
     // SAFETY: documented COM call; the returned pattern is used immediately
     // by the caller (not stored), on the same live element reference.
     unsafe { el.GetCurrentPatternAs(UIA_ValuePatternId) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Error;
+    use windows::Win32::Foundation::E_FAIL;
+
+    fn value_fixture(
+        password: windows::core::Result<VARIANT>,
+        available: windows::core::Result<VARIANT>,
+        value: windows::core::Result<VARIANT>,
+    ) -> (UiNodeValue, Vec<UIA_PROPERTY_ID>) {
+        let mut properties = [
+            (UIA_IsPasswordPropertyId, Some(password)),
+            (UIA_IsValuePatternAvailablePropertyId, Some(available)),
+            (UIA_ValueValuePropertyId, Some(value)),
+        ];
+        let mut reads = Vec::new();
+        let value = cached_node_value_with(|property| {
+            reads.push(property);
+            properties
+                .iter_mut()
+                .find(|(id, _)| *id == property)
+                .and_then(|(_, value)| value.take())
+                .expect("each supported fixture property is read at most once")
+        });
+        (value, reads)
+    }
+
+    #[test]
+    fn windows_cached_value_preserves_text_field_text_area_and_combo_values() {
+        for text in [
+            "账户🙂 café e\u{301}",
+            "line one\n第二行\r\n🙂",
+            "Tokyo / Zürich — selected combo value",
+            "  leading and trailing whitespace  ",
+        ] {
+            let (value, reads) = value_fixture(
+                Ok(VARIANT::from(false)),
+                Ok(VARIANT::from(true)),
+                Ok(VARIANT::from(text)),
+            );
+            assert_eq!(value, UiNodeValue::Text(text.into()));
+            assert_eq!(
+                reads,
+                [
+                    UIA_IsPasswordPropertyId,
+                    UIA_IsValuePatternAvailablePropertyId,
+                    UIA_ValueValuePropertyId,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn windows_cached_value_empty_unsupported_failed_and_nonstring_values_are_absent() {
+        for value in [
+            Ok(VARIANT::from("")),
+            Ok(VARIANT::new()),
+            Err(Error::from(E_FAIL)),
+            Ok(VARIANT::from(42_i32)),
+            Ok(VARIANT::from(true)),
+            Ok(VARIANT::from(1.25_f64)),
+        ] {
+            let (value, reads) =
+                value_fixture(Ok(VARIANT::from(false)), Ok(VARIANT::from(true)), value);
+            assert_eq!(value, UiNodeValue::Absent);
+            assert_eq!(
+                reads,
+                [
+                    UIA_IsPasswordPropertyId,
+                    UIA_IsValuePatternAvailablePropertyId,
+                    UIA_ValueValuePropertyId,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn windows_cached_value_without_a_known_value_pattern_never_reads_value() {
+        for available in [
+            Ok(VARIANT::from(false)),
+            Ok(VARIANT::new()),
+            Err(Error::from(E_FAIL)),
+            Ok(VARIANT::from("true")),
+            Ok(VARIANT::from(1_i32)),
+        ] {
+            let (value, reads) = value_fixture(
+                Ok(VARIANT::from(false)),
+                available,
+                Err(Error::from(E_FAIL)),
+            );
+            assert_eq!(value, UiNodeValue::Absent);
+            assert_eq!(
+                reads,
+                [
+                    UIA_IsPasswordPropertyId,
+                    UIA_IsValuePatternAvailablePropertyId
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn windows_cached_value_secure_or_unknown_password_never_reads_pattern_or_value() {
+        for password in [
+            Ok(VARIANT::from(true)),
+            Ok(VARIANT::new()),
+            Err(Error::from(E_FAIL)),
+            Ok(VARIANT::from("false")),
+            Ok(VARIANT::from(0_i32)),
+        ] {
+            let (value, reads) =
+                value_fixture(password, Err(Error::from(E_FAIL)), Err(Error::from(E_FAIL)));
+            assert_eq!(value, UiNodeValue::Redacted);
+            assert_eq!(reads, [UIA_IsPasswordPropertyId]);
+        }
+    }
 }
