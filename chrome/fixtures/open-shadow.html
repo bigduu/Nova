@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova open shadow fixture</title>
+<style>body { margin:28px; font:18px/1.7 system-ui; max-width:840px; } button,input { font:inherit; padding:5px; } #open-widget { border:1px solid #aaa; padding:12px; } </style>
+<h1>Nova open-shadow 验收</h1>
+<p>Outside beginning</p>
+<div id="open-widget"><span slot="a">Slotted A</span><span slot="b">Slotted B</span><span>EXCLUDE_UNASSIGNED_LIGHT_TEXT</span></div>
+<div id="private-widget" data-private></div>
+<div id="closed-widget"></div>
+<p>Outside ending</p>
+<script>
+const host=document.getElementById('open-widget');
+const shadow=host.attachShadow({mode:'open'});
+shadow.innerHTML=`<style>button,input {font:inherit;padding:5px;} .hidden{display:none}</style><p>Shadow 开头 🪷</p><label for="message">Shadow message</label><input id="message" value="Shadow Unicode ✓"><button id="increment"><span>Shadow increment</span></button><output id="counter">Shadow count 0</output><p>Slots: <slot name="b"></slot> / <slot name="a"></slot></p><div id="nested"></div><p class="hidden">EXCLUDE_SHADOW_HIDDEN</p><div data-private><p>EXCLUDE_SHADOW_PRIVATE</p></div><p>Shadow ending</p>`;
+let count=0;
+shadow.getElementById('increment').onclick=()=>{shadow.getElementById('counter').textContent=`Shadow count ${++count}`;};
+shadow.getElementById('nested').attachShadow({mode:'open'}).innerHTML='<p>Nested shadow text</p><button aria-label="Nested shadow button">Nested action</button>';
+document.getElementById('private-widget').attachShadow({mode:'open'}).innerHTML='<p>EXCLUDE_SHADOW_HOST_PRIVATE</p><input value="EXCLUDE_SHADOW_HOST_VALUE">';
+document.getElementById('closed-widget').attachShadow({mode:'closed'}).innerHTML='<p>Closed shadow opaque text</p>';
+</script>

@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova shadow controls fixture</title>
+<style>body {margin:28px; font:18px/1.6 system-ui; max-width:1050px} button,input {font:inherit; padding:5px} .host {border:1px solid #aaa;padding:12px;margin:16px 0} </style>
+<h1>Nova shadow controls 验收</h1>
+<span id="local-label" hidden>EXCLUDE_DOCUMENT_LOOKALIKE_LABEL</span>
+<div id="controls-host" class="host"><span slot="private">EXCLUDE_ASSIGNED_PRIVATE_SLOT</span><span slot="inert">EXCLUDE_ASSIGNED_INERT_SLOT</span><span slot="aria-hidden">EXCLUDE_ASSIGNED_ARIA_SLOT</span><span slot="hidden">EXCLUDE_ASSIGNED_HIDDEN_SLOT</span></div>
+<button id="make-sensitive">Mark controls host private</button>
+<button id="build-large">Build large shadow fixture</button>
+<button id="build-deep">Build deep shadow fixture</button>
+<div id="budget-host" class="host"></div>
+<p>Outside shadow ending</p>
+<script>
+const host=document.getElementById('controls-host');
+const root=host.attachShadow({mode:'open'});
+root.innerHTML=`<style>button,input {font:inherit;padding:5px} .private-slot{display:none}</style><p id="local-label">Root-local input label 🪷</p><input id="field" aria-labelledby="local-label" value="Initial Unicode ✓"><output id="focus">Shadow focused false</output><p><button id="first" aria-label="Same shadow action">First</button><output id="first-count">First actions 0</output> <button id="second" aria-label="Same shadow action">Second</button><output id="second-count">Second actions 0</output></p><p><slot name="empty">Fallback slot text</slot></p><div data-private><slot name="private">EXCLUDE_PRIVATE_FALLBACK</slot></div><div inert><slot name="inert"></slot></div><div aria-hidden="true"><slot name="aria-hidden"></slot></div><div hidden><slot name="hidden"></slot></div><p>Controls shadow ending</p>`;
+const field=root.getElementById('field');
+field.onfocus=()=>{root.getElementById('focus').textContent=`Shadow focused ${root.activeElement===field && document.activeElement===host}`;};
+let first=0,second=0;
+root.getElementById('first').onclick=()=>{root.getElementById('first-count').textContent=`First actions ${++first}`;};
+root.getElementById('second').onclick=()=>{root.getElementById('second-count').textContent=`Second actions ${++second}`;};
+document.getElementById('make-sensitive').onclick=()=>{host.setAttribute('data-private','');};
+const budgetRoot=document.getElementById('budget-host').attachShadow({mode:'open'});
+document.getElementById('build-large').onclick=()=>{
+  budgetRoot.replaceChildren();
+  const fragment=document.createDocumentFragment();
+  for(let index=0;index<1200;index+=1){const p=document.createElement('p');p.textContent=`Shadow large ${index} 中文 🪷 `+'bounded text '.repeat(24);fragment.appendChild(p);}
+  budgetRoot.appendChild(fragment);
+};
+document.getElementById('build-deep').onclick=()=>{
+  budgetRoot.replaceChildren();let parent=budgetRoot;
+  for(let index=0;index<200;index+=1){const next=document.createElement('div');parent.appendChild(next);parent=next.attachShadow({mode:'open'});}
+  const p=document.createElement('p');p.textContent='EXCLUDE_BEYOND_SHADOW_DEPTH';parent.appendChild(p);
+};
+</script>

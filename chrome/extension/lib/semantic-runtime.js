@@ -128,6 +128,10 @@
     return typeof value === "string" ? value : null;
   }
 
+  function composedParent(node) {
+    return node?.assignedSlot || node?.parentElement || node?.parentNode?.host || null;
+  }
+
   function validBooleanAria(value, allowMixed = false) {
     if (typeof value !== "string") return null;
     const normalized = value.trim().toLowerCase();
@@ -207,16 +211,27 @@
     if (includeAncestors && element.closest?.("[data-nova-sensitive], [data-private], [data-sensitive]")) {
       return true;
     }
+    if (includeAncestors) {
+      let depth = 0;
+      for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+        if (++depth > MAX_DEPTH || isSensitiveElement(parent, false)) return true;
+      }
+    }
     return false;
   }
 
   function isAriaHidden(element, budget) {
     let current = element;
+    let depth = 0;
     while (current?.getAttribute) {
       if (budget && !visit(budget)) return true;
+      if (++depth > MAX_DEPTH) {
+        if (budget) budget.truncated = true;
+        return true;
+      }
       const value = validBooleanAria(attr(current, "aria-hidden"));
       if (value === "true") return true;
-      current = current.parentElement;
+      current = composedParent(current);
     }
     return false;
   }
@@ -254,10 +269,10 @@
       .filter(Boolean)
       .slice(0, 16);
     if (ids.length === 0) return "";
-    const document = element.ownerDocument;
+    const treeRoot = element.getRootNode?.() ?? element.ownerDocument;
     return read.clip(
       ids
-        .map((id) => document?.getElementById?.(id))
+        .map((id) => treeRoot?.getElementById?.(id))
         .filter((node) => node && !isAriaHidden(node, read.budget))
         .map((node) => read.text(node))
         .join(" "),
@@ -395,37 +410,66 @@
     return true;
   }
 
+  function childCursor(node) {
+    if (node.nodeType === 1) {
+      const shadow = node.shadowRoot;
+      if (shadow) return { next: shadow.firstChild };
+      if (String(node.tagName).toLowerCase() === "slot" && typeof node.assignedNodes === "function") {
+        // The browser materializes this result. Consume it by index without
+        // flattening recursively or copying the assignments into our stack.
+        const assigned = node.assignedNodes();
+        if (assigned.length) return { assigned, index: 0 };
+      }
+    }
+    return { next: node.firstChild };
+  }
+
   function* textTree(root, budget, suppressNamedText = false) {
     // Label references can start inside a hidden/sensitive ancestor. Check
     // their context, with the same budget as the main snapshot traversal.
     let depth = 0;
-    for (let parent = root?.parentElement; parent; parent = parent.parentElement) {
+    for (let child = root, parent = composedParent(root); parent; child = parent, parent = composedParent(parent)) {
       if (!visit(budget)) return;
       if (++depth > MAX_DEPTH) {
         budget.truncated = true;
         return;
       }
       if (excludedTextTree(parent)) return;
-    }
-    const stack = root ? [{ node: root, depth: 0, suppressed: false }] : [];
-    while (stack.length) {
-      if (!visit(budget)) return;
-      const current = stack.pop();
-      const { node } = current;
-      // Store one next sibling per level, not a copy of the whole subtree.
-      if (node !== root && node.nextSibling) {
-        stack.push({ ...current, node: node.nextSibling });
+      // Referenced names must participate in the same composed tree as the
+      // main walk, even when their own computed visibility says "visible".
+      if (child.parentNode === parent) {
+        if (parent.shadowRoot && !child.assignedSlot) return;
+        if (String(parent.tagName).toLowerCase() === "slot" && parent.assignedNodes?.().length) return;
       }
+    }
+    const stack = root ? [{ next: root, single: true, depth: 0, suppressed: false }] : [];
+    const seen = new Set();
+    while (stack.length) {
+      const current = stack.at(-1);
+      const node = current.assigned ? current.assigned[current.index++] : current.next;
+      if (!node) {
+        stack.pop();
+        continue;
+      }
+      if (!current.assigned) current.next = current.single ? null : node.nextSibling;
+      if (!visit(budget)) return;
+      if (seen.has(node)) continue;
+      seen.add(node);
       if (node.nodeType === 1 && excludedTextTree(node)) continue;
-      yield current;
-      if (!node.firstChild) continue;
+      yield { node, suppressed: current.suppressed };
+      if (budget.remaining === 0) {
+        budget.truncated = true;
+        return;
+      }
+      const children = childCursor(node);
+      if (!children.next && !children.assigned) continue;
       if (current.depth >= MAX_DEPTH) {
         budget.truncated = true;
         continue;
       }
       const role = node.nodeType === 1 ? effectiveRole(node) : null;
       stack.push({
-        node: node.firstChild,
+        ...children,
         depth: current.depth + 1,
         suppressed: current.suppressed || Boolean(suppressNamedText &&
           (role === "heading" || ACTIVATABLE_ROLES.has(role) || SETTABLE_ROLES.has(role)) && isVisible(node)),
@@ -434,8 +478,9 @@
   }
 
   function textVisible(node) {
-    if (!node.isConnected || !node.parentElement) return false;
-    const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node.parentElement);
+    const parent = composedParent(node);
+    if (!node.isConnected || !parent) return false;
+    const style = node.ownerDocument?.defaultView?.getComputedStyle?.(parent);
     return style?.visibility !== "hidden" && style?.visibility !== "collapse";
   }
 
@@ -602,7 +647,8 @@
     if (action === "focus") {
       if (typeof element.focus !== "function") throw Object.assign(new Error("node cannot be focused"), { code: "unsupported_action" });
       element.focus({ preventScroll: true });
-      return { focused: element.ownerDocument?.activeElement === element };
+      const treeRoot = element.getRootNode?.() ?? element.ownerDocument;
+      return { focused: treeRoot?.activeElement === element };
     }
     if (action === "set_value") {
       if (typeof args.value !== "string") throw Object.assign(new Error("value must be a string"), { code: "invalid_value" });

@@ -237,3 +237,119 @@ test("real content snapshot rejects text mutations and preserves a fresh control
   assert.equal(activated.result.activated, true);
   assert.equal(clicks, 1);
 });
+
+test("real content handler preserves shadow routes, exact controls and one mutation per snapshot", async () => {
+  const rect = { x: 1, y: 2, width: 20, height: 15 };
+  const document = {
+    nodeType: 9, readyState: "complete", title: "Open shadow handler", addEventListener() {},
+    defaultView: { Event, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+    createRange() {
+      return { setStart() {}, setEnd() {}, getClientRects: () => [rect], getBoundingClientRect: () => rect };
+    },
+  };
+  function element(tagName, attributes = {}) {
+    return {
+      nodeType: 1, tagName, attributes, isConnected: true, ownerDocument: document,
+      getAttribute(name) { return this.attributes[name] ?? null; },
+      hasAttribute(name) { return Object.hasOwn(this.attributes, name); }, closest: () => null,
+      getClientRects: () => [rect], getBoundingClientRect: () => rect,
+      getRootNode() { let node = this; while (node.parentNode) node = node.parentNode; return node; },
+    };
+  }
+  function text(data) { return { nodeType: 3, data, length: data.length, isConnected: true, ownerDocument: document }; }
+  function append(parent, ...children) {
+    parent.firstChild = children[0];
+    children.forEach((child, index) => {
+      child.parentNode = parent;
+      child.parentElement = parent.nodeType === 1 ? parent : null;
+      child.nextSibling = children[index + 1];
+    });
+  }
+  const body = element("BODY");
+  body.parentNode = document;
+  document.body = body;
+  const host = element("DIV");
+  const root = { nodeType: 11, host, getElementById: (id) => id === "message-name" ? label : null };
+  host.shadowRoot = root;
+  const label = element("SPAN");
+  append(label, text("Shadow message 🪷"));
+  const input = element("INPUT", { "aria-labelledby": "message-name" });
+  input.value = "Initial Unicode ✓";
+  input.events = [];
+  input.dispatchEvent = (event) => { input.events.push(event.type); return true; };
+  input.focus = () => { root.activeElement = input; document.activeElement = host; };
+  const first = element("BUTTON");
+  const second = element("BUTTON");
+  append(first, text("Increment"));
+  append(second, text("Increment"));
+  let firstCount = 0;
+  let secondCount = 0;
+  first.click = () => { firstCount += 1; };
+  second.click = () => { secondCount += 1; };
+  const readOnly = text("Shadow read-only 🪷");
+  append(root, readOnly, label, input, first, second);
+  append(body, host);
+
+  let listener;
+  const route = { tabId: 66, documentId: "shadow-document", nonce: null };
+  const runtime = {
+    id: "nova-shadow-test", lastError: null,
+    onMessage: { addListener(value) { listener = value; } },
+    sendMessage(message, callback) { route.nonce = message.nonce; callback({ ok: true, route: { ...route } }); },
+  };
+  const window = {};
+  window.top = window;
+  const context = vm.createContext({
+    addEventListener() {}, chrome: { runtime }, crypto: webcrypto, document,
+    location: { href: "https://shadow.example/" }, window, TextEncoder, setTimeout, clearTimeout,
+  });
+  vm.runInContext(semanticSource, context);
+  await vm.runInContext(contentSource, context);
+  const sender = { id: runtime.id };
+  const envelope = { channel: "nova-extension-v1", type: "semantic_command", route: { ...route, epoch: 7 } };
+  const read = () => invoke(listener, { ...envelope, action: "read", args: {} }, sender);
+  const mutate = (snapshot, action, node, args = {}) => invoke(listener, {
+    ...envelope, action, args: { snapshotId: snapshot.result.snapshotId, nodeId: node.nodeId, ...args },
+  }, sender);
+
+  let snapshot = await read();
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.result.coverage, "top_document");
+  assert.equal(snapshot.result.truncated, false);
+  assert.equal(snapshot.result.nodes.map((node) => node.name).join("|"), "Shadow read-only 🪷|Shadow message 🪷|Shadow message 🪷|Increment|Increment");
+  const buttons = snapshot.result.nodes.filter((node) => node.role === "button");
+  const wrongRoute = await invoke(listener, { ...envelope, route: { ...envelope.route, documentId: "other-document" }, action: "activate",
+    args: { snapshotId: snapshot.result.snapshotId, nodeId: buttons[1].nodeId } }, sender);
+  assert.equal(wrongRoute.code, "route_mismatch");
+  assert.equal((await mutate(snapshot, "activate", buttons[1])).result.activated, true);
+  assert.equal(firstCount, 0);
+  assert.equal(secondCount, 1);
+  assert.equal((await mutate(snapshot, "activate", buttons[0])).code, "stale_snapshot");
+
+  snapshot = await read();
+  let field = snapshot.result.nodes.find((node) => node.role === "textbox");
+  assert.equal((await mutate(snapshot, "focus", field)).result.focused, true);
+  assert.equal(root.activeElement, input);
+  assert.equal(document.activeElement, host);
+  snapshot = await read();
+  field = snapshot.result.nodes.find((node) => node.role === "textbox");
+  const value = "更新 Unicode 🪷 ✓";
+  assert.equal((await mutate(snapshot, "set_value", field, { value })).result.valueUtf8Bytes, new TextEncoder().encode(value).byteLength);
+  assert.equal(input.value, value);
+  assert.deepEqual(input.events, ["input", "change"]);
+  snapshot = await read();
+  assert.equal(snapshot.result.nodes.find((node) => node.role === "textbox").value.text, value);
+  const textNode = snapshot.result.nodes.find((node) => node.name === "Shadow read-only 🪷");
+  assert.equal(textNode.actions.length, 0);
+  assert.equal((await mutate(snapshot, "activate", textNode)).code, "unsupported_action");
+  assert.equal((await mutate(snapshot, "activate", textNode)).code, "stale_snapshot");
+
+  snapshot = await read();
+  const oldButton = snapshot.result.nodes.find((node) => node.role === "button");
+  host.attributes["data-private"] = "";
+  assert.equal((await mutate(snapshot, "activate", oldButton)).code, "sensitive_control");
+  assert.equal((await mutate(snapshot, "activate", oldButton)).code, "stale_snapshot");
+  assert.equal(firstCount, 0);
+  assert.equal(secondCount, 1);
+  assert.equal((await read()).result.nodes.length, 0);
+});

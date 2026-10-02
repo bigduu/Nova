@@ -11,6 +11,8 @@ class FakeElement {
     this.childNodes = [];
     this.nextSibling = null;
     this.parentNode = null;
+    this.assignedSlot = null;
+    this.shadowRoot = null;
     this.tagName = tagName.toUpperCase();
     this.attributes = { ...(options.attributes ?? {}) };
     this.textContent = options.textContent ?? "";
@@ -66,6 +68,29 @@ class FakeElement {
     return child;
   }
 
+  getRootNode() {
+    let root = this;
+    while (root.parentNode) root = root.parentNode;
+    return root.nodeType === 11 || root.nodeType === 9 ? root : this.ownerDocument;
+  }
+
+  attachShadow({ mode = "open" } = {}) {
+    this._shadow = new FakeShadowRoot(this, mode);
+    if (mode === "open") this.shadowRoot = this._shadow;
+    return this._shadow;
+  }
+
+  assign(...nodes) {
+    this.assignments = nodes;
+    for (const node of nodes) node.assignedSlot = this;
+  }
+
+  assignedNodes(options) {
+    assert.equal(options, undefined, "the runtime must not request recursive flattening");
+    this.assignmentReads = (this.assignmentReads ?? 0) + 1;
+    return this.assignments ?? [];
+  }
+
   getAttribute(name) {
     return Object.hasOwn(this.attributes, name) ? String(this.attributes[name]) : null;
   }
@@ -99,7 +124,14 @@ class FakeElement {
   }
 
   focus() {
-    this.ownerDocument.activeElement = this;
+    let target = this;
+    let root = this.getRootNode();
+    while (root) {
+      root.activeElement = target;
+      if (!root.host) break;
+      target = root.host;
+      root = target.getRootNode();
+    }
   }
 
   dispatchEvent(event) {
@@ -110,6 +142,28 @@ class FakeElement {
   scrollBy(options) {
     this.scrolls.push(options);
   }
+}
+
+class FakeShadowRoot {
+  constructor(host, mode) {
+    this.nodeType = 11;
+    this.host = host;
+    this.mode = mode;
+    this.childNodes = [];
+    this.byId = new Map();
+    this.activeElement = null;
+  }
+  get firstChild() { return this.childNodes[0] ?? null; }
+  appendChild(child) {
+    const previous = this.childNodes.at(-1);
+    if (previous) previous.nextSibling = child;
+    child.parentNode = this;
+    child.parentElement = null;
+    child.ownerDocument = this.host.ownerDocument;
+    this.childNodes.push(child);
+    return child;
+  }
+  getElementById(id) { return this.byId.get(id) ?? null; }
 }
 
 class FakeText {
@@ -160,8 +214,12 @@ class FakeDocument {
       const node = pending.pop();
       if (!node) continue;
       node.ownerDocument = this;
-      if (node.nodeType === 1 && node.hasAttribute("id")) this.byId.set(node.getAttribute("id"), node);
+      if (node.nodeType === 1 && node.hasAttribute("id")) {
+        const root = node.getRootNode();
+        (root?.byId ?? this.byId).set(node.getAttribute("id"), node);
+      }
       for (const child of node.childNodes ?? []) pending.push(child);
+      if (node._shadow) pending.push(node._shadow);
     }
   }
 
@@ -567,6 +625,256 @@ test("deep external label references use the snapshot budget without reading ter
   assert.equal(snapshot.result.truncated, true);
   assert.equal(JSON.stringify(snapshot.result).includes("EXCLUDE_DEEP_LABEL"), false);
   assert.equal(terminal.reads, 0);
+});
+
+test("open and nested roots read text and controls in composed slot order exactly once", () => {
+  const slottedA = branch("span", ["Slotted A"]);
+  const slottedB = branch("span", ["Slotted B"]);
+  const unassigned = new FakeText("EXCLUDE_UNASSIGNED");
+  const host = branch("div", [slottedA, slottedB, unassigned]);
+  const root = host.attachShadow();
+  root.appendChild(new FakeText("Shadow 开头 🪷"));
+  const label = root.appendChild(branch("label", ["Shadow message"]));
+  const input = root.appendChild(new FakeElement("input", { value: "Shadow Unicode 🪷 ✓", labels: [label] }));
+  const button = root.appendChild(branch("button", [branch("span", ["Shadow increment"])]));
+  const fallback = new FakeText("EXCLUDE_UNUSED_FALLBACK");
+  const slotB = branch("slot", [fallback]);
+  const slotA = branch("slot", []);
+  slotB.assign(slottedB);
+  slotA.assign(slottedA);
+  root.appendChild(branch("p", ["Slots:", slotB, "/", slotA]));
+  root.appendChild(branch("slot", ["Fallback 🪷"]));
+  const nested = root.appendChild(new FakeElement("div"));
+  const nestedRoot = nested.attachShadow();
+  nestedRoot.appendChild(branch("p", ["Nested shadow text"]));
+  const nestedButton = nestedRoot.appendChild(branch("button", ["Nested action"], { attributes: { "aria-label": "Nested shadow button" } }));
+  const closed = new FakeElement("div");
+  const closedText = new FakeText("EXCLUDE_CLOSED_ROOT");
+  closed.attachShadow({ mode: "closed" }).appendChild(closedText);
+  const { result, handles } = semantic.createSnapshot(page(
+    branch("p", ["Outside beginning"]), host, closed, branch("p", ["Outside ending"]),
+  ));
+  assert.deepEqual(result.nodes.map((node) => node.name), [
+    "Outside beginning", "Shadow 开头 🪷", "Shadow message", "Shadow message", "Shadow increment",
+    "Slots:", "Slotted B", "/", "Slotted A", "Fallback 🪷", "Nested shadow text", "Nested shadow button", "Outside ending",
+  ]);
+  assert.equal(result.truncated, false);
+  assert.equal(result.coverage, "top_document");
+  const field = result.nodes.find((node) => node.role === "textbox");
+  assert.deepEqual(field.value, { kind: "text", text: "Shadow Unicode 🪷 ✓" });
+  assert.equal(handles.get(field.nodeId).element, input);
+  for (const target of [button, nestedButton]) {
+    const handle = [...handles.values()].find(({ element }) => element === target);
+    assert.ok(handle.actions.includes("activate"));
+  }
+  for (const text of [unassigned, fallback, closedText]) {
+    assert.equal(text.reads, 0);
+    assert.equal([...handles.values()].some(({ element }) => element === text), false);
+  }
+});
+
+test("shadow aria-labelledby stays in its own root without borrowing same-ID document labels", () => {
+  const outside = branch("span", ["EXCLUDE_OUTSIDE_LABEL"], { hidden: true, attributes: { id: "name" } });
+  const host = new FakeElement("div");
+  const root = host.attachShadow();
+  const label = root.appendChild(branch("span", ["Root-local 名称 🪷"], { attributes: { id: "name" } }));
+  const field = root.appendChild(new FakeElement("input", { attributes: { "aria-labelledby": "name" } }));
+  const nested = root.appendChild(new FakeElement("div"));
+  const nestedRoot = nested.attachShadow();
+  const missing = nestedRoot.appendChild(new FakeElement("input", { attributes: { "aria-labelledby": "name", placeholder: "Own-root fallback" } }));
+  const light = new FakeElement("input", { attributes: { "aria-labelledby": "name", placeholder: "Light fallback" } });
+  const document = page(outside, host, light);
+  assert.equal(semantic.accessibleName(field), "Root-local 名称 🪷");
+  assert.equal(semantic.accessibleName(missing), "Own-root fallback");
+  const { result, handles } = semantic.createSnapshot(document);
+  assert.equal(result.nodes.find((node) => handles.get(node.nodeId).element === field).name, "Root-local 名称 🪷");
+  assert.equal(result.nodes.find((node) => handles.get(node.nodeId).element === missing).name, "Own-root fallback");
+  assert.equal(result.nodes.find((node) => handles.get(node.nodeId).element === light).name, "Light fallback");
+  assert.equal(root.getElementById("name"), label);
+  assert.equal(outside.firstChild.reads, 0);
+  assert.equal(JSON.stringify(result).includes("EXCLUDE_OUTSIDE_LABEL"), false);
+});
+
+test("referenced label roots omit unassigned light children and unused slot fallback before text reads", () => {
+  const lightLabel = branch("span", ["EXCLUDE_UNASSIGNED_LABEL"], { attributes: { id: "light-name", slot: "missing" } });
+  const lightField = new FakeElement("input", { attributes: { "aria-labelledby": "light-name", placeholder: "Unassigned label fallback" } });
+  const lightHost = branch("div", [lightLabel, lightField]);
+  const shown = branch("slot", []);
+  shown.assign(lightField);
+  lightHost.attachShadow().appendChild(shown);
+
+  const assigned = branch("span", ["Assigned visible child"]);
+  const fallbackLabel = branch("span", ["EXCLUDE_UNUSED_FALLBACK_LABEL"], { attributes: { id: "fallback-name" } });
+  const fallbackSlot = branch("slot", [fallbackLabel]);
+  fallbackSlot.assign(assigned);
+  const fallbackHost = branch("div", [assigned]);
+  const fallbackRoot = fallbackHost.attachShadow();
+  fallbackRoot.appendChild(fallbackSlot);
+  fallbackRoot.appendChild(new FakeElement("input", { attributes: { "aria-labelledby": "fallback-name", placeholder: "Unused fallback safe name" } }));
+
+  const { result, handles } = semantic.createSnapshot(page(lightHost, fallbackHost));
+  assert.deepEqual(result.nodes.filter((node) => node.role === "textbox").map((node) => node.name), [
+    "Unassigned label fallback", "Unused fallback safe name",
+  ]);
+  assert.equal(JSON.stringify(result).includes("EXCLUDE_"), false);
+  assert.equal(lightLabel.firstChild.reads, 0);
+  assert.equal(fallbackLabel.firstChild.reads, 0);
+  assert.equal([...handles.values()].some(({ element }) => element === lightLabel || element === fallbackLabel), false);
+});
+
+test("host and slot privacy filters run before shadow names, values or handle storage", () => {
+  const blocked = [
+    ["div", { hidden: true }], ["div", { attributes: { inert: "" } }],
+    ["div", { attributes: { "aria-hidden": "true" } }], ["div", { attributes: { "data-private": "" } }],
+    ["div", { attributes: { "data-sensitive": "" } }], ["div", { attributes: { "data-nova-sensitive": "" } }],
+    ["div", { style: { display: "none" } }], ["div", { style: { opacity: "0" } }],
+    ["input", { type: "password" }], ["div", { attributes: { autocomplete: "current-password" } }],
+  ];
+  const markers = [];
+  const controls = [];
+  function secretControl() {
+    const input = new FakeElement("input");
+    const getAttribute = input.getAttribute.bind(input);
+    input.getAttribute = (name) => {
+      assert.notEqual(name, "aria-label", "blocked control name getter must not run");
+      return getAttribute(name);
+    };
+    Object.defineProperty(input, "value", { get() { assert.fail("blocked value getter must not run"); } });
+    controls.push(input);
+    const text = new FakeText("EXCLUDE_SHADOW_SECRET");
+    markers.push(text);
+    return [input, text];
+  }
+  const hosts = blocked.map(([tag, options]) => {
+    const host = new FakeElement(tag, options);
+    const root = host.attachShadow();
+    for (const child of secretControl()) root.appendChild(child);
+    return host;
+  });
+  const slottedHost = new FakeElement("div");
+  const root = slottedHost.attachShadow();
+  const slots = blocked.filter(([tag]) => tag === "div").map(([, options]) => {
+    const slot = branch("slot", [], options);
+    const assigned = branch("div", secretControl());
+    slottedHost.appendChild(assigned);
+    slot.assign(assigned);
+    root.appendChild(slot);
+    return slot;
+  });
+  const labelHost = new FakeElement("div", { attributes: { "data-private": "" } });
+  const hiddenLabel = labelHost.attachShadow().appendChild(branch("span", secretControl()));
+  const named = new FakeElement("input", { labels: [hiddenLabel], attributes: { placeholder: "Safe fallback" } });
+  const { result, handles } = semantic.createSnapshot(page(...hosts, slottedHost, labelHost, named));
+  assert.deepEqual(result.nodes.map((node) => node.name), ["Safe fallback"]);
+  for (const text of markers) assert.equal(text.reads, 0);
+  for (const control of controls) assert.equal([...handles.values()].some(({ element }) => element === control), false);
+  for (const slot of slots) assert.equal(slot.assignmentReads ?? 0, 0);
+});
+
+test("shadow actions keep exact same-named handles, own-root focus and Unicode values", async () => {
+  const host = new FakeElement("div");
+  const root = host.attachShadow();
+  const first = root.appendChild(branch("button", ["Increment"]));
+  const nested = root.appendChild(new FakeElement("div"));
+  const nestedRoot = nested.attachShadow();
+  const second = nestedRoot.appendChild(branch("button", ["Increment"]));
+  const input = nestedRoot.appendChild(new FakeElement("input", { attributes: { "aria-label": "Message" } }));
+  const text = nestedRoot.appendChild(new FakeText("Read only shadow 🪷"));
+  const document = page(host);
+  const { result, handles } = semantic.createSnapshot(document);
+  const buttons = result.nodes.filter((node) => node.role === "button");
+  assert.equal(buttons.length, 2);
+  assert.notEqual(buttons[0].nodeId, buttons[1].nodeId);
+  await semantic.performAction(handles.get(buttons[1].nodeId), "activate");
+  assert.equal(first.clicks, 0);
+  assert.equal(second.clicks, 1);
+  const field = result.nodes.find((node) => node.role === "textbox");
+  assert.deepEqual(await semantic.performAction(handles.get(field.nodeId), "focus"), { focused: true });
+  assert.equal(nestedRoot.activeElement, input);
+  assert.equal(root.activeElement, nested);
+  assert.equal(document.activeElement, host);
+  const value = "更新 🪷 Unicode ✓";
+  const ack = await semantic.performAction(handles.get(field.nodeId), "set_value", { value });
+  assert.equal(input.value, value);
+  assert.equal(ack.valueUtf8Bytes, new TextEncoder().encode(value).byteLength);
+  assert.deepEqual(input.events, ["input", "change"]);
+  const textNode = result.nodes.find((node) => handles.get(node.nodeId).element === text);
+  for (const action of ["activate", "focus", "set_value", "scroll"]) {
+    await assert.rejects(semantic.performAction(handles.get(textNode.nodeId), action), (error) => error.code === "unsupported_action");
+  }
+});
+
+test("previously read shadow and assigned targets reject newly sensitive host or slot ancestry", async () => {
+  const host = new FakeElement("div");
+  const root = host.attachShadow();
+  const button = root.appendChild(branch("button", ["Button"]));
+  const input = root.appendChild(new FakeElement("input", { value: "unchanged", attributes: { "aria-label": "Input" } }));
+  const assigned = host.appendChild(branch("button", ["Assigned"]));
+  const slot = root.appendChild(branch("slot", []));
+  slot.assign(assigned);
+  const document = page(host);
+  const { handles } = semantic.createSnapshot(document);
+  host.attributes["data-private"] = "";
+  for (const [element, action] of [[button, "activate"], [input, "set_value"], [assigned, "focus"]]) {
+    const handle = [...handles.values()].find((entry) => entry.element === element);
+    await assert.rejects(semantic.performAction(handle, action, { value: "must not set" }), (error) => error.code === "sensitive_control");
+  }
+  assert.equal(button.clicks, 0);
+  assert.equal(input.value, "unchanged");
+  delete host.attributes["data-private"];
+  slot.attributes["data-sensitive"] = "";
+  const assignedHandle = [...handles.values()].find((entry) => entry.element === assigned);
+  await assert.rejects(semantic.performAction(assignedHandle, "activate"), (error) => error.code === "sensitive_control");
+  assert.equal(assigned.clicks, 0);
+});
+
+test("node, complete JSON and UTF-8 limits apply across open roots and slot assignments", () => {
+  const host = new FakeElement("div");
+  const root = host.attachShadow();
+  const slot = root.appendChild(branch("slot", []));
+  const assigned = branch("div", Array.from({ length: 800 }, () => branch("p", ["界".repeat(512)])));
+  host.appendChild(assigned);
+  slot.assign(assigned);
+  const document = page(host);
+  for (const limits of [{ maxNodes: 2 }, { maxChars: 1024 }, { maxNodes: 1000, maxChars: 500_000 }]) {
+    const { result, handles } = semantic.createSnapshot(document, limits);
+    const json = JSON.stringify(result);
+    assert.equal(result.truncated, true);
+    assert.ok(result.nodes.length <= (limits.maxNodes ?? 500));
+    assert.ok(json.length <= (limits.maxChars ?? 100_000));
+    assert.ok(new TextEncoder().encode(json).byteLength <= 1024 * 1024 - 4096);
+    assert.equal(handles.size, result.nodes.length);
+    assert.ok(result.nodes.every((node) => node.name.isWellFormed()));
+  }
+});
+
+test("deep roots and large native slot assignments share visit bounds without copying or flattening", () => {
+  const host = new FakeElement("div");
+  let current = host;
+  for (let index = 0; index < 200; index += 1) current = current.attachShadow().appendChild(new FakeElement("div"));
+  const terminal = current.appendChild(new FakeText("EXCLUDE_DEEP_SHADOW"));
+  const deep = semantic.createSnapshot(page(host));
+  assert.equal(deep.result.truncated, true);
+  assert.equal(terminal.reads, 0);
+  assert.equal(deep.handles.size, 0);
+
+  const assignedHost = new FakeElement("div");
+  const slot = assignedHost.attachShadow().appendChild(branch("slot", []));
+  const assigned = Array.from({ length: 12_000 }, () => assignedHost.appendChild(new FakeElement("div")));
+  let indexedReads = 0;
+  slot.assignments = new Proxy(assigned, {
+    get(target, key) {
+      assert.notEqual(key, Symbol.iterator, "do not copy or iterate the full browser assignment list");
+      assert.notEqual(key, "slice");
+      if (/^\d+$/u.test(String(key))) indexedReads += 1;
+      return Reflect.get(target, key);
+    },
+  });
+  const large = semantic.createSnapshot(page(assignedHost));
+  assert.equal(large.result.truncated, true);
+  assert.equal(slot.assignmentReads, 1);
+  assert.ok(indexedReads < 10_000);
+  assert.equal(large.handles.size, 0);
 });
 
 test("activate clicks an authorized live semantic node", async () => {
