@@ -52,10 +52,13 @@ function callListener(listener, message, sender) {
 }
 
 async function waitForValue(read, description) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
     const value = read();
     if (value) return value;
-    await new Promise((resolve) => setImmediate(resolve));
+    // A native/Web Crypto reply needs elapsed I/O time, not a fixed number
+    // of event-loop turns. Retain the fixture's existing one-second bound.
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
   assert.fail(`timed out waiting for ${description}`);
 }
