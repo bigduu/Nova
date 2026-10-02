@@ -499,11 +499,38 @@ impl AppBridgeConnection {
 
     pub fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let name = pipe_name(path.as_ref())?;
-        // SAFETY: local name, no inherited handle, identity-only client SQOS.
-        let handle = unsafe {
-            CreateFileW(PCWSTR(name.as_ptr()), GENERIC_READ.0 | GENERIC_WRITE.0, FILE_SHARE_MODE(0), None,
-                OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
-        }.context("Chrome pipe is unavailable; start the configured managed nova mcp in the same user session")?;
+        let deadline = Instant::now() + FRAME_TIMEOUT;
+        let handle = loop {
+            // Readiness does not reserve an instance; another client may win the
+            // next open. Every BUSY retry shares this one original deadline.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("Chrome pipe connection deadline exceeded; the current broker has not resumed accepting clients");
+            }
+            // SAFETY: local name, no inherited handle, identity-only client SQOS.
+            match unsafe {
+                CreateFileW(PCWSTR(name.as_ptr()), GENERIC_READ.0 | GENERIC_WRITE.0, FILE_SHARE_MODE(0), None,
+                    OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
+            } {
+                Ok(handle) => break handle,
+                Err(error) if error.code() == ERROR_PIPE_BUSY.to_hresult() => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        bail!("Chrome pipe connection deadline exceeded; the current broker has not resumed accepting clients");
+                    }
+                    // Only BUSY can be the ordinary disconnect/re-arm interval.
+                    // SAFETY: name stays live; a nonzero bounded wait avoids the
+                    // zero/default-wait sentinel and never changes pipe ownership.
+                    match unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), remaining.as_millis().max(1) as u32) }.ok() {
+                        Err(error) if error.code() == ERROR_SEM_TIMEOUT.to_hresult() => {
+                            return Err(anyhow!(error).context("Chrome pipe connection deadline exceeded; the current broker has not resumed accepting clients"));
+                        }
+                        result => result.context("waiting for the busy Chrome pipe failed")?,
+                    }
+                }
+                Err(error) => return Err(anyhow!(error).context("Chrome pipe is unavailable; start the configured managed nova mcp in the same user session")),
+            }
+        };
         let pipe = Arc::new(Pipe {
             handle: Handle(handle),
             identity: Identity::current()?,
@@ -824,10 +851,12 @@ mod tests {
         drop(server);
         drop(client);
         assert!(AppBridgeListener::bind(listener.path()).is_err());
+        assert!(listener.try_accept().unwrap().is_none());
         let early = AppBridgeConnection::connect(listener.path()).unwrap();
         drop(early);
         // Closing before accept must reset this instance without releasing it.
         drop(listener.try_accept());
+        assert!(listener.try_accept().unwrap().is_none());
         let _client = AppBridgeConnection::connect(listener.path()).unwrap();
         let server = listener.accept().unwrap();
         assert!(AppBridgeListener::bind(listener.path()).is_err());
@@ -836,6 +865,26 @@ mod tests {
         let path = listener.path().to_owned();
         drop(listener);
         assert!(AppBridgeListener::bind(path).is_ok());
+    }
+
+    #[test]
+    fn windows_pipe_busy_connect_deadline_preserves_the_occupied_or_disconnected_owner() {
+        for disconnect in [false, true] {
+            let (listener, client, server) = connected();
+            if disconnect {
+                drop(server);
+                drop(client);
+            }
+            let started = Instant::now();
+            let error = AppBridgeConnection::connect(listener.path())
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("connection deadline"), "{error}");
+            assert!(started.elapsed() >= Duration::from_millis(300));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(AppBridgeListener::bind(listener.path()).is_err());
+        }
     }
 
     #[test]
@@ -893,6 +942,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(server);
         drop(client);
+        assert!(listener.try_accept().unwrap().is_none());
         let mut client = AppBridgeConnection::connect(listener.path()).unwrap();
         let mut server = listener.accept().unwrap();
         client

@@ -184,6 +184,16 @@ fn windows_launched_host_preserves_fragmented_concatenated_and_binary_frames() {
     drop(app);
     assert!(host.wait().success());
     assert!(host.input.is_some());
+    // The same singleton is disconnected until the broker re-arms accept. A
+    // launched reconnect must wait through this ordinary readiness interval.
+    let mut next = Host::spawn(listener.path());
+    std::thread::sleep(Duration::from_millis(75));
+    assert!(next.child.try_wait().unwrap().is_none());
+    assert!(AppBridgeListener::bind(listener.path()).is_err());
+    let mut app = accept(&listener);
+    assert_eq!(app.receive().unwrap().unwrap()["kind"], "host_hello");
+    drop(app);
+    assert!(next.wait().success());
 }
 
 #[test]
