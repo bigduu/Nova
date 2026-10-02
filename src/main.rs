@@ -261,6 +261,13 @@ fn main() -> Result<()> {
         // app-service listener then creates an independent MCP session for
         // every authenticated same-UID connector.
         log_platform_permissions();
+        #[cfg(target_os = "macos")]
+        if nova::app_service::is_bundled_executable() {
+            return nova::platform::mac::event_loop::run_app_process(
+                runtime,
+                nova::platform::mac::status_menu::run,
+            );
+        }
         return run_desktop_service(&runtime, nova::app_service::run());
     }
 
@@ -896,24 +903,17 @@ fn run_capture_probe(_app: &str) -> Result<()> {
 
 // ── Per-OS permission/capability diagnostics ──────────────────────────
 
-/// Request Screen Recording access from THIS (server) process before serving —
-/// it surfaces the first-run system prompt and is a no-op once granted. Done
-/// here, not in the headless capture worker (which can't show a prompt). Also
-/// logs the TCC attribution picture once at startup: when nova is a child of
-/// another app, `responsible/parent=` shows whose Screen Recording grant the
-/// OS actually checks — if that parent is ad-hoc-signed, its grant won't
-/// persist across rebuilds and `preflight=false` here even though nova is
-/// signed.
+/// Passive diagnostics only. Nova.app's menu owns explicit permission requests;
+/// merely starting or reconnecting a server must not prompt for either grant.
 #[cfg(target_os = "macos")]
 fn log_platform_permissions() {
-    let screen_ok = nova::platform::mac::geometry::request_screen_recording_access();
+    let screen_ok = nova::platform::mac::geometry::preflight_screen_capture();
     tracing::info!(
         "Screen Recording access: {}",
         if screen_ok {
             "granted"
         } else {
-            "not granted — accept the prompt, or add the nova binary in System \
-             Settings → Privacy & Security → Screen Recording"
+            "not granted — use Nova's menu or System Settings → Privacy & Security → Screen Recording"
         }
     );
     tracing::info!(
