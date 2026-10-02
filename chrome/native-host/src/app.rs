@@ -1,12 +1,12 @@
 //! App-side broker for Nova's private Chrome semantic bridge.
 //!
 //! [`ChromeBridge`] is deliberately a small, cloneable command handle. A
-//! single background thread owns the Unix listener, the native-host stream,
+//! single background thread owns the local listener, the native-host stream,
 //! the current exact page route, and the request/receipt state machine. This
 //! keeps every MCP session in Nova.app on one serialized authority boundary.
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod runtime {
     use crate::protocol::{validate_message, ACTIONS, PROTOCOL_VERSION};
     use crate::{configured_socket_path, AppBridgeConnection, AppBridgeListener};
     use anyhow::{anyhow, bail, Context, Result};
@@ -47,7 +47,7 @@ mod unix {
     }
 
     impl ChromeBridge {
-        /// Bind the standard private per-user `chrome.sock` endpoint.
+        /// Bind the standard private per-user local endpoint.
         pub fn bind_default() -> Result<Self> {
             Self::bind(configured_socket_path()?)
         }
@@ -873,10 +873,10 @@ mod unix {
     }
 }
 
-#[cfg(unix)]
-pub use unix::ChromeBridge;
+#[cfg(any(unix, windows))]
+pub use runtime::ChromeBridge;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod unsupported {
     use anyhow::{bail, Result};
     use serde_json::Value;
@@ -937,5 +937,5 @@ mod unsupported {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub use unsupported::ChromeBridge;

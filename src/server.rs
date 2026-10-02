@@ -57,7 +57,10 @@ pub fn ok_image(base64_data: String, mime_type: &str) -> rmcp::model::CallToolRe
     )])
 }
 
+#[cfg(not(windows))]
 const CHROME_APP_SERVICE_ONLY: &str = "Chrome semantic bridge is available only through the independent Nova.app service; configure the Nova.app connector and install the native host";
+#[cfg(windows)]
+const CHROME_APP_SERVICE_ONLY: &str = "Chrome semantic bridge is not configured for this transport; use nova mcp with the exact NOVA_CHROME_EXTENSION_ID and the matching native host";
 
 fn chrome_call_result(result: Result<serde_json::Value>) -> rmcp::model::CallToolResult {
     match result {
@@ -106,7 +109,7 @@ pub struct NovaServer {
     interaction_action_gate: std::sync::Arc<std::sync::Mutex<()>>,
     /// App-owned, least-privilege semantic channel to one explicitly paired
     /// Chrome document. Ordinary stdio/HTTP sessions deliberately leave this
-    /// unset; only the independent Nova.app service injects it.
+    /// unset; only Nova.app or explicitly configured Windows managed MCP injects it.
     chrome_bridge: Option<nova_chrome_bridge::ChromeBridge>,
     // Private, per-server adapters keep write-handler tests off the desktop.
     #[cfg(test)]
@@ -238,15 +241,15 @@ impl NovaServer {
         Self::default()
     }
 
-    /// Attach the app-owned Secure Chrome Bridge to this MCP session.
+    /// Attach the explicitly owned Secure Chrome Bridge to this MCP session.
     pub fn with_chrome_bridge(mut self, chrome_bridge: nova_chrome_bridge::ChromeBridge) -> Self {
         self.chrome_bridge = Some(chrome_bridge);
         self
     }
 
     /// Run a synchronous Chrome bridge operation without blocking the async MCP
-    /// transport. Sessions not hosted by Nova.app fail with one stable message
-    /// rather than attempting to discover or open the privileged socket.
+    /// transport. Sessions without an injected bridge return setup guidance
+    /// without attempting to discover or acquire another broker's endpoint.
     async fn run_chrome_action<F>(&self, action: F) -> rmcp::model::CallToolResult
     where
         F: FnOnce(&nova_chrome_bridge::ChromeBridge) -> Result<serde_json::Value> + Send + 'static,
@@ -2761,7 +2764,7 @@ impl NovaServer {
 
     #[tool(
         name = "chrome_status",
-        description = "Report whether Nova.app's Chrome Native Messaging host is connected and whether one exact top-level document is currently paired. Call this before Chrome semantic work; it never inspects page content."
+        description = "Report whether Nova's Chrome Native Messaging host is connected and whether one exact top-level document is currently paired. Call this before Chrome semantic work; it never inspects page content."
     )]
     #[tracing::instrument(skip_all, level = "info")]
     async fn chrome_status(&self) -> rmcp::model::CallToolResult {
@@ -2875,13 +2878,24 @@ impl ServerHandler for NovaServer {
 
 /// Run the MCP server over stdio.
 pub async fn run_stdio() -> Result<()> {
+    run_stdio_with_server(NovaServer::new()).await
+}
+
+/// Run the explicitly configured Windows managed MCP session with its one
+/// process-owned Chrome broker. Bare stdio and HTTP never acquire this authority.
+#[cfg(windows)]
+pub async fn run_stdio_with_chrome(bridge: nova_chrome_bridge::ChromeBridge) -> Result<()> {
+    run_stdio_with_server(NovaServer::new().with_chrome_bridge(bridge)).await
+}
+
+async fn run_stdio_with_server(server: NovaServer) -> Result<()> {
     tracing::info!("Starting Nova MCP server on stdio...");
 
     // `serve` only completes the initialize handshake and returns a running
     // service handle; the serve loop lives on that handle. Dropping it cancels
     // the service (RunningService's Drop), so we must await `waiting()` to keep
     // the process alive until the client disconnects.
-    let service = NovaServer::new()
+    let service = server
         .serve(rmcp::transport::io::stdio())
         .await
         .context("stdio server failed to initialize")?;
