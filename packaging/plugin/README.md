@@ -155,9 +155,10 @@ Nova needs two TCC-gated macOS permissions:
 - **Screen Recording** — for `screenshot`, `ocr`, `list_windows`.
 - **Accessibility** — for `ax_read`, semantic activation, and input.
 
-`ax_read` does not require Screen Recording. The current app preview can
-request Screen Recording when it starts; granting it is needed for the capture
-tools above. A future permission UI can make that request more contextual.
+`ax_read` does not require Screen Recording. Startup and **Refresh Status**
+only check current permissions. Use **Request Accessibility…** or
+**Request Screen Recording…** in Nova's menu to request each permission
+explicitly. Screen Recording is needed for the capture tools above.
 
 Grant these permissions to **Nova.app**, which runs independently through macOS
 LaunchServices. The plugin's `nova mcp` process only forwards MCP bytes; it does
@@ -167,10 +168,10 @@ chain.
 1. Open **System Settings → Privacy & Security → Accessibility**, add the
    installed Nova.app if needed, and enable it. Do the same under **Screen
    Recording** when using capture tools.
-2. Retry the Nova tool. If macOS requires the application to restart, quit and
-   reopen **Nova.app**, then reconnect/reload only the **Nova MCP server** in
-   the client. **Bodhi's main window can stay open.** Interrupted MCP requests
-   are not replayed automatically.
+2. Choose **Refresh Status** in Nova's menu and retry the Nova tool. If macOS
+   requires the application to restart, quit and reopen **Nova.app**, then
+   reconnect/reload only the **Nova MCP server** in the client. **Bodhi's main
+   window can stay open.** Interrupted MCP requests are not replayed automatically.
 3. If the app cannot be found, check its installation path and open it once.
    Remove a development `NOVA_APP_SOCKET` override for normal use; an override
    deliberately disables automatic app launch. Do not switch the plugin back
