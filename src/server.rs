@@ -946,6 +946,9 @@ fn click_cached_mark(
     };
     let click = input.left_click_at(cx, cy, target);
     if let Some((sx, sy)) = saved {
+        #[cfg(target_os = "macos")]
+        let _ = crate::platform::mac::cursor_overlay::without_feedback(|| input.mouse_move(sx, sy));
+        #[cfg(not(target_os = "macos"))]
         let _ = input.mouse_move(sx, sy); // restore the user's pointer
     }
     click.map_err(|e| {
