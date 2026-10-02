@@ -3,6 +3,12 @@
 
   const MAX_NAME = 512;
   const MAX_VALUE = 1024;
+  const MAX_TEXT_SCAN = 4096;
+  const MAX_VISITED = 10_000;
+  const MAX_DEPTH = 128;
+  // protocol.js permits 1 MiB on the wire; leave room for its route envelope.
+  const MAX_SNAPSHOT_BYTES = 1024 * 1024 - 4096;
+  const NON_TEXT_TAGS = new Set(["head", "script", "style", "template", "noscript", "iframe", "object"]);
   const MAX_SET_VALUE_BYTES = 256 * 1024;
   const VALID_ROLES = new Set([
     "alert",
@@ -108,11 +114,13 @@
 
   function clipped(value, max) {
     if (typeof value !== "string") return "";
-    return value
+    const normalized = value
       .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
       .replace(/\s+/gu, " ")
-      .trim()
-      .slice(0, max);
+      .trim();
+    const result = normalized.slice(0, max);
+    // A name boundary must not split a supplementary Unicode character.
+    return /[\uD800-\uDBFF]$/u.test(result) ? result.slice(0, -1) : result;
   }
 
   function attr(element, name) {
@@ -183,7 +191,7 @@
       .filter(Boolean);
   }
 
-  function isSensitiveElement(element) {
+  function isSensitiveElement(element, includeAncestors = true) {
     if (!element || typeof element !== "object") return true;
     const tag = String(element.tagName ?? "").toLowerCase();
     if (tag === "input") {
@@ -193,15 +201,19 @@
     if (autocompleteTokens(element).some((token) => SENSITIVE_AUTOCOMPLETE.has(token))) {
       return true;
     }
-    if (element.closest?.("[data-nova-sensitive], [data-private], [data-sensitive]")) {
+    if (["data-nova-sensitive", "data-private", "data-sensitive"].some((name) => element.hasAttribute?.(name))) {
+      return true;
+    }
+    if (includeAncestors && element.closest?.("[data-nova-sensitive], [data-private], [data-sensitive]")) {
       return true;
     }
     return false;
   }
 
-  function isAriaHidden(element) {
+  function isAriaHidden(element, budget) {
     let current = element;
     while (current?.getAttribute) {
+      if (budget && !visit(budget)) return true;
       const value = validBooleanAria(attr(current, "aria-hidden"));
       if (value === "true") return true;
       current = current.parentElement;
@@ -235,56 +247,65 @@
     return true;
   }
 
-  function labelledByName(element) {
-    const ids = String(attr(element, "aria-labelledby") ?? "")
+  function labelledByName(element, read) {
+    const ids = read.clip(String(attr(element, "aria-labelledby") ?? ""), MAX_TEXT_SCAN)
       .trim()
       .split(/\s+/u)
       .filter(Boolean)
       .slice(0, 16);
     if (ids.length === 0) return "";
     const document = element.ownerDocument;
-    return clipped(
+    return read.clip(
       ids
         .map((id) => document?.getElementById?.(id))
-        .filter((node) => node && !isAriaHidden(node))
-        .map((node) => node.textContent ?? "")
+        .filter((node) => node && !isAriaHidden(node, read.budget))
+        .map((node) => read.text(node))
         .join(" "),
       MAX_NAME,
     );
   }
 
-  function associatedLabelName(element) {
+  function associatedLabelName(element, read) {
     if (element.labels && typeof element.labels[Symbol.iterator] === "function") {
-      return clipped(
-        Array.from(element.labels, (label) => label.textContent ?? "").join(" "),
-        MAX_NAME,
-      );
+      const names = [];
+      for (const label of element.labels) {
+        if (names.length === 16) {
+          read.truncate();
+          break;
+        }
+        names.push(read.text(label));
+      }
+      return read.clip(names.join(" "), MAX_NAME);
     }
     return "";
   }
 
-  function accessibleName(element) {
-    const ariaLabel = clipped(attr(element, "aria-label") ?? "", MAX_NAME);
+  function accessibleName(element, read = {
+    clip: clipped,
+    text: (node) => node.textContent ?? "",
+    truncate() {},
+  }) {
+    const ariaLabel = read.clip(attr(element, "aria-label") ?? "", MAX_NAME);
     if (ariaLabel) return ariaLabel;
-    const labelledBy = labelledByName(element);
+    const labelledBy = labelledByName(element, read);
     if (labelledBy) return labelledBy;
-    const label = associatedLabelName(element);
+    const label = associatedLabelName(element, read);
     if (label) return label;
-    const alt = clipped(attr(element, "alt") ?? "", MAX_NAME);
+    const alt = read.clip(attr(element, "alt") ?? "", MAX_NAME);
     if (alt) return alt;
     const tag = String(element.tagName ?? "").toLowerCase();
     if (tag === "input") {
       const type = String(element.type || "text").toLowerCase();
       if (["button", "submit", "reset"].includes(type)) {
-        const value = clipped(String(element.value ?? ""), MAX_NAME);
+        const value = read.clip(String(element.value ?? ""), MAX_NAME);
         if (value) return value;
       }
-      const placeholder = clipped(attr(element, "placeholder") ?? "", MAX_NAME);
+      const placeholder = read.clip(attr(element, "placeholder") ?? "", MAX_NAME);
       if (placeholder) return placeholder;
     }
-    const title = clipped(attr(element, "title") ?? "", MAX_NAME);
+    const title = read.clip(attr(element, "title") ?? "", MAX_NAME);
     if (title) return title;
-    return clipped(element.textContent ?? "", MAX_NAME);
+    return read.clip(read.text(element), MAX_NAME);
   }
 
   function ariaStates(element) {
@@ -329,10 +350,10 @@
     return actions;
   }
 
-  function safeValue(element, role) {
+  function safeValue(element, role, clip = clipped) {
     if (isSensitiveElement(element) || !SETTABLE_ROLES.has(role)) return undefined;
     if (typeof element.value !== "string") return undefined;
-    return clipped(element.value, MAX_VALUE);
+    return clip(element.value, MAX_VALUE);
   }
 
   function bounds(element) {
@@ -354,70 +375,190 @@
     return `${prefix}-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
   }
 
+  function excludedTextTree(element) {
+    if (
+      !element.isConnected || element.hidden || element.hasAttribute?.("inert") ||
+      validBooleanAria(attr(element, "aria-hidden")) === "true" ||
+      NON_TEXT_TAGS.has(String(element.tagName ?? "").toLowerCase()) ||
+      isSensitiveElement(element, false)
+    ) return true;
+    const style = element.ownerDocument?.defaultView?.getComputedStyle?.(element);
+    return style?.display === "none" || Number.parseFloat(style?.opacity) === 0;
+  }
+
+  function visit(budget) {
+    if (budget.remaining === 0) {
+      budget.truncated = true;
+      return false;
+    }
+    budget.remaining -= 1;
+    return true;
+  }
+
+  function* textTree(root, budget, suppressNamedText = false) {
+    // Label references can start inside a hidden/sensitive ancestor. Check
+    // their context, with the same budget as the main snapshot traversal.
+    let depth = 0;
+    for (let parent = root?.parentElement; parent; parent = parent.parentElement) {
+      if (!visit(budget)) return;
+      if (++depth > MAX_DEPTH) {
+        budget.truncated = true;
+        return;
+      }
+      if (excludedTextTree(parent)) return;
+    }
+    const stack = root ? [{ node: root, depth: 0, suppressed: false }] : [];
+    while (stack.length) {
+      if (!visit(budget)) return;
+      const current = stack.pop();
+      const { node } = current;
+      // Store one next sibling per level, not a copy of the whole subtree.
+      if (node !== root && node.nextSibling) {
+        stack.push({ ...current, node: node.nextSibling });
+      }
+      if (node.nodeType === 1 && excludedTextTree(node)) continue;
+      yield current;
+      if (!node.firstChild) continue;
+      if (current.depth >= MAX_DEPTH) {
+        budget.truncated = true;
+        continue;
+      }
+      const role = node.nodeType === 1 ? effectiveRole(node) : null;
+      stack.push({
+        node: node.firstChild,
+        depth: current.depth + 1,
+        suppressed: current.suppressed || Boolean(suppressNamedText &&
+          (role === "heading" || ACTIVATABLE_ROLES.has(role) || SETTABLE_ROLES.has(role)) && isVisible(node)),
+      });
+    }
+  }
+
+  function textVisible(node) {
+    if (!node.isConnected || !node.parentElement) return false;
+    const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node.parentElement);
+    return style?.visibility !== "hidden" && style?.visibility !== "collapse";
+  }
+
+  function textBounds(node) {
+    if (!textVisible(node)) return null;
+    const range = node.ownerDocument?.createRange?.();
+    if (!range) return null;
+    // Limit the range too: a very long text node can have many line boxes.
+    range.setStart(node, 0);
+    range.setEnd(node, Math.min(node.length, MAX_TEXT_SCAN));
+    const rects = range.getClientRects();
+    let rendered = false;
+    for (let index = 0; index < rects.length; index += 1) {
+      if (rects[index].width > 0 && rects[index].height > 0) {
+        rendered = true;
+        break;
+      }
+    }
+    return rendered ? bounds(range) : null;
+  }
+
   function createSnapshot(document, { maxNodes = 500, maxChars = 100_000 } = {}) {
-    const nodeLimit = Math.max(1, Math.min(Number(maxNodes) || 500, 1000));
-    const charLimit = Math.max(1024, Math.min(Number(maxChars) || 100_000, 500_000));
+    const nodeLimit = Math.floor(Math.max(1, Math.min(Number(maxNodes) || 500, 1000)));
+    const charLimit = Math.floor(Math.max(1024, Math.min(Number(maxChars) || 100_000, 500_000)));
     const snapshotId = randomToken("snapshot");
     const nodes = [];
     const handles = new Map();
-    let characters = 0;
-    let truncated = false;
+    const result = { snapshotId, nodes, truncated: false, coverage: "top_document" };
+    let characters = JSON.stringify(result).length;
+    let bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+    const budget = { remaining: MAX_VISITED, truncated: false };
+    const read = {
+      budget,
+      clip(value, max) {
+        if (typeof value !== "string") return "";
+        const normalized = clipped(value.slice(0, MAX_TEXT_SCAN), Infinity)
+          .replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
+        if (value.length > MAX_TEXT_SCAN || normalized.length > max) budget.truncated = true;
+        return clipped(normalized, max);
+      },
+      text(element) {
+        let value = "";
+        for (const { node } of textTree(element, budget)) {
+          if (node.nodeType !== 3 || !textVisible(node)) continue;
+          const remaining = MAX_TEXT_SCAN - value.length;
+          value += node.data.slice(0, remaining);
+          if (node.length > remaining || value.length === MAX_TEXT_SCAN) {
+            budget.truncated = true;
+            break;
+          }
+        }
+        return value;
+      },
+      truncate() { budget.truncated = true; },
+    };
+    function append(node, element) {
+      const serialized = JSON.stringify(node);
+      const comma = nodes.length ? 1 : 0;
+      const length = serialized.length + comma;
+      const byteLength = new TextEncoder().encode(serialized).byteLength + comma;
+      if (nodes.length >= nodeLimit || characters + length > charLimit || bytes + byteLength > MAX_SNAPSHOT_BYTES) {
+        budget.truncated = true;
+        return false;
+      }
+      nodes.push(node);
+      handles.set(node.nodeId, { element, actions: node.actions, sensitive: false });
+      characters += length;
+      bytes += byteLength;
+      return true;
+    }
 
     const scrollingElement = document.scrollingElement || document.documentElement;
-    if (scrollingElement && isScrollable(scrollingElement)) {
+    if (scrollingElement && !isSensitiveElement(scrollingElement) && isScrollable(scrollingElement)) {
       const node = {
         nodeId: "root",
         role: "document",
-        name: clipped(document.title || "Page", MAX_NAME),
+        name: read.clip(document.title || "Page", MAX_NAME),
         actions: ["scroll"],
         states: {},
       };
-      nodes.push(node);
-      handles.set("root", { element: scrollingElement, actions: node.actions, sensitive: false });
-      characters += JSON.stringify(node).length;
+      append(node, scrollingElement);
     }
 
-    const all = document.querySelectorAll?.("*") ?? [];
-    for (const element of all) {
+    const root = document.body || document.documentElement || document;
+    for (const { node: element, suppressed } of textTree(root, budget, true)) {
       if (nodes.length >= nodeLimit || characters >= charLimit) {
-        truncated = true;
+        budget.truncated = true;
         break;
       }
+      if (element.nodeType === 3) {
+        if (suppressed) continue;
+        const rect = textBounds(element);
+        if (!rect) continue;
+        const name = read.clip(element.data, MAX_NAME);
+        if (!name) continue;
+        if (!append({
+          nodeId: `n${nodes.length + 1}`, role: "text", name,
+          actions: [], states: {}, bounds: rect,
+        }, element)) break;
+        continue;
+      }
+      if (element.nodeType !== 1) continue;
       if (!isVisible(element) || isSensitiveElement(element)) continue;
       const role = effectiveRole(element);
       if (!role) continue;
       const actions = capabilities(element, role);
-      const name = accessibleName(element);
+      const name = accessibleName(element, read);
       if (!name && actions.length === 0 && !["main", "navigation", "form", "heading"].includes(role)) {
         continue;
       }
       const nodeId = `n${nodes.length + 1}`;
       const node = { nodeId, role, name, actions, states: ariaStates(element) };
-      const value = safeValue(element, role);
+      const value = safeValue(element, role, read.clip);
       if (value !== undefined) node.value = { kind: "text", text: value };
-      const description = clipped(attr(element, "aria-description") ?? "", MAX_NAME);
+      const description = read.clip(attr(element, "aria-description") ?? "", MAX_NAME);
       if (description) node.description = description;
       const rect = bounds(element);
       if (rect) node.bounds = rect;
-      const serializedLength = JSON.stringify(node).length;
-      if (characters + serializedLength > charLimit) {
-        truncated = true;
-        break;
-      }
-      nodes.push(node);
-      handles.set(nodeId, { element, actions, sensitive: false });
-      characters += serializedLength;
+      if (!append(node, element)) break;
     }
 
-    return {
-      result: {
-        snapshotId,
-        nodes,
-        truncated,
-        coverage: "top_document",
-      },
-      handles,
-    };
+    result.truncated = budget.truncated;
+    return { result, handles };
   }
 
   async function sha256Text(value) {

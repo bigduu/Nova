@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova static text fixture</title>
+<style>
+  body { margin: 28px; max-width: 840px; font: 18px/1.6 system-ui, sans-serif; }
+  input, button { font: inherit; padding: 6px 10px; }
+  .hidden { display: none; }
+  #generated { margin-top: 18px; }
+</style>
+<h1>Nova 静态文本验收</h1>
+<p id="paragraph">段落开头 <em>强调文本</em> 段落结尾 ✓</p>
+<div id="mixed">混合开头 <a href="#destination">可见链接</a> 混合结尾</div>
+<label for="message">消息字段标签</label>
+<input id="message" value="可见字段 Unicode ✓">
+<p><label><input id="checked" type="checkbox" checked> 已选状态标签</label></p>
+<button id="increment"><span>增加计数</span></button>
+<output id="counter">计数 0</output>
+<p hidden>EXCLUDE_STATIC_HIDDEN</p>
+<p class="hidden">EXCLUDE_STATIC_DISPLAY_NONE</p>
+<div aria-hidden="true"><p>EXCLUDE_STATIC_ARIA_HIDDEN</p></div>
+<div inert><p>EXCLUDE_STATIC_INERT</p></div>
+<div data-private><p>EXCLUDE_STATIC_PRIVATE</p></div>
+<p data-nova-sensitive>EXCLUDE_STATIC_SENSITIVE</p>
+<input type="password" value="EXCLUDE_STATIC_PASSWORD" aria-label="Password fixture">
+<template>EXCLUDE_STATIC_TEMPLATE</template>
+<p id="destination">结束文本</p>
+<button id="large">Build large text fixture</button>
+<button id="deep">Build deep text fixture</button>
+<div id="generated"></div>
+<script>
+  let count = 0;
+  document.getElementById("increment").onclick = () => {
+    document.getElementById("counter").textContent = `计数 ${++count}`;
+  };
+  document.getElementById("large").onclick = () => {
+    const output = document.getElementById("generated");
+    output.replaceChildren();
+    for (let i = 0; i < 1200; i++) {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = `Large fixture ${i}: 中文 Unicode ✓ ${"content ".repeat(12)}`;
+      output.appendChild(paragraph);
+    }
+  };
+  document.getElementById("deep").onclick = () => {
+    const output = document.getElementById("generated");
+    output.replaceChildren();
+    let parent = output;
+    for (let i = 0; i < 200; i++) {
+      const child = document.createElement("div");
+      parent.appendChild(child);
+      parent = child;
+    }
+    parent.textContent = "Deep fixture terminal text";
+  };
+  // EXCLUDE_STATIC_SCRIPT is test source text, never rendered page text.
+</script>
