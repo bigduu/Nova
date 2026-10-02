@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+import { CONTENT_TIMEOUT_MS } from "../lib/protocol.js";
 
 function eventHook() {
   const listeners = [];
@@ -689,6 +693,7 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
   const originalChrome = globalThis.chrome;
   const extensionMessages = eventHook();
   const nativeMessages = eventHook();
+  const nativeDisconnect = eventHook();
   const posted = [];
   const injections = [];
   const contentMessages = [];
@@ -706,7 +711,7 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
       id: sender.id,
       getManifest: () => ({ version: "0.1.0" }),
       connectNative: () => ({
-        onMessage: nativeMessages, onDisconnect: eventHook(),
+        onMessage: nativeMessages, onDisconnect: nativeDisconnect,
         postMessage: (message) => posted.push(structuredClone(message)),
       }),
       onMessage: extensionMessages,
@@ -747,8 +752,8 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
   const popupSender = { id: chrome.runtime.id, url: `chrome-extension://${chrome.runtime.id}/popup.html` };
   const popup = (type, details = {}) => callListener(listener,
     { channel: "nova-extension-v1", type, ...details }, popupSender);
-  const request = (requestId, action, route) => nativeMessages.emit({
-    protocolVersion: 1, kind: "request", requestId, action, args: {}, ...(route ? { route } : {}),
+  const request = (requestId, action, route, args = {}) => nativeMessages.emit({
+    protocolVersion: 1, kind: "request", requestId, action, args, ...(route ? { route } : {}),
   });
   t.after(async () => {
     await popup("deny_pair"); // clear pending pair timers without reconnecting a fake host
@@ -769,6 +774,7 @@ async function consentFixture(t, url = "https://consent.example:8443/review") {
   };
   return { chrome, tab, sender, posted, injections, contentMessages, grants, popup, enable,
     candidate, pair, request,
+    disconnect: () => nativeDisconnect.emit(),
     denyAccess: () => { denied = true; },
     deferRead: (reply) => { readReply = reply; },
     removeSite(pattern) {
@@ -902,6 +908,7 @@ test("a late denied permission probe cannot revoke a newer pairing in the same d
   assert.equal(confirmed.route.documentId, oldRoute.documentId);
   assert.equal(confirmed.route.nonce, oldRoute.nonce);
   assert.notEqual(confirmed.route.epoch, oldRoute.epoch);
+  const revocationsBeforeLateFailure = fixture.contentMessages.filter((message) => message.type === "revoke_access").length;
 
   rejectProbe();
   const result = await waitForValue(() => fixture.posted.find((message) => message.requestId === "old-permission-probe"), "old probe result");
@@ -910,5 +917,238 @@ test("a late denied permission probe cannot revoke a newer pairing in the same d
   const current = await fixture.popup("popup_state");
   assert.equal(current.status.paired, true);
   assert.deepEqual(current.status.route, confirmed.route);
-  assert.equal(fixture.contentMessages.some((message) => message.type === "revoke_access"), false);
+  assert.equal(fixture.contentMessages.filter((message) => message.type === "revoke_access").length, revocationsBeforeLateFailure,
+    "the old failed probe must not deliver another revocation to the repaired pairing");
 });
+
+async function pendingValueWorkerFixture(t) {
+  const fixture = await consentFixture(t);
+  const timers = new Set();
+  const setTimer = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (...args) => { const timer = setTimer(...args); timers.add(timer); return timer; });
+  t.after(() => { for (const timer of timers) clearTimeout(timer); });
+  const rect = { x: 1, y: 2, width: 20, height: 15 };
+  const document = {
+    readyState: "complete", title: "Pending receipt worker", addEventListener() {},
+    defaultView: { Event, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+  };
+  const field = {
+    nodeType: 1, tagName: "INPUT", ownerDocument: document, isConnected: true, value: "Initial ✓", events: [],
+    getAttribute: (name) => name === "aria-label" ? "Message" : null, hasAttribute: () => false, closest: () => null,
+    getClientRects: () => [rect], getBoundingClientRect: () => rect,
+    dispatchEvent(event) { this.events.push(event.type); return true; },
+  };
+  document.body = {
+    ...field, tagName: "BODY", firstChild: field, getAttribute: () => null,
+  };
+  field.parentElement = document.body;
+  let digestStarted;
+  let resumeDigest;
+  const ready = new Promise((resolve) => { digestStarted = resolve; });
+  const hold = new Promise((resolve) => { resumeDigest = resolve; });
+  const crypto = {
+    getRandomValues: (bytes) => webcrypto.getRandomValues(bytes),
+    subtle: { async digest(algorithm, bytes) { digestStarted(); await hold; return webcrypto.subtle.digest(algorithm, bytes); } },
+  };
+  const workerListener = fixture.chrome.runtime.onMessage.listeners[0];
+  let contentListener;
+  const contentRuntime = {
+    id: fixture.chrome.runtime.id, lastError: null,
+    onMessage: { addListener(value) { contentListener = value; } },
+    sendMessage(message, callback) {
+      void callListener(workerListener, message, fixture.sender).then((reply) => callback?.(reply));
+    },
+  };
+  const window = {};
+  window.top = window;
+  const context = vm.createContext({
+    addEventListener() {}, chrome: { runtime: contentRuntime }, crypto, document,
+    location: { href: fixture.tab.url }, window, TextEncoder, setTimeout, clearTimeout,
+  });
+  const [semanticSource, contentSource] = await Promise.all([
+    readFile(new URL("../lib/semantic-runtime.js", import.meta.url), "utf8"),
+    readFile(new URL("../content-script.js", import.meta.url), "utf8"),
+  ]);
+  vm.runInContext(semanticSource, context);
+  await vm.runInContext(contentSource, context);
+  fixture.chrome.scripting.executeScript = async ({ target }) => {
+    assert.equal(target.tabId, fixture.tab.id);
+    if (target.documentIds) assert.equal(target.documentIds[0], fixture.sender.documentId);
+    await context.NovaContentBridge.enable();
+    return [{ frameId: 0, documentId: fixture.sender.documentId, result: { ok: true } }];
+  };
+  let startRevocation;
+  let deliverRevocation;
+  let failTransport;
+  const revocationReady = new Promise((resolve) => { startRevocation = resolve; });
+  const transportFailure = new Promise((_, reject) => { failTransport = () => reject(Object.assign(new Error("controlled transport timeout"), { code: "content_timeout" })); });
+  let revocationHold = null;
+  const targets = [];
+  const valueReplies = [];
+  fixture.chrome.tabs.sendMessage = async (tabId, message, options) => {
+    targets.push({ tabId, type: message.type, documentId: options.documentId });
+    if (message.type === "revoke_access") {
+      startRevocation();
+      if (revocationHold) await revocationHold;
+    }
+    const reply = callListener(contentListener, message, { id: contentRuntime.id });
+    if (message.action !== "set_value") return reply;
+    const captured = reply.then((value) => { valueReplies.push(value); return value; });
+    return Promise.race([captured, transportFailure]);
+  };
+  return { ...fixture, field, ready, resumeDigest, revocationReady, targets, valueReplies, failTransport,
+    delayRevocation() { revocationHold = new Promise((resolve) => { deliverRevocation = resolve; }); },
+    deliverRevocation: () => deliverRevocation(),
+  };
+}
+
+for (const mode of ["native release", "popup release", "native disconnect", "content timeout"]) {
+  test(`${mode} forwards old exact-document revocation before a pending value write resumes`, async (t) => {
+    const fixture = await pendingValueWorkerFixture(t);
+    const route = await fixture.pair();
+    fixture.request("receipt-read", "read", route);
+    const read = await waitForValue(() => fixture.posted.find((message) => message.requestId === "receipt-read"), "initial receipt snapshot");
+    fixture.request("receipt-write", "set_value", route, {
+      snapshotId: read.result.snapshotId, nodeId: read.result.nodes[0].nodeId, value: "Must not write 🪷",
+    });
+    await fixture.ready;
+    assert.equal(fixture.field.value, "Initial ✓");
+    assert.deepEqual(fixture.field.events, []);
+    fixture.delayRevocation();
+    let popupReleased = false;
+    let popupReply;
+    if (mode === "native release") fixture.request("receipt-release", "release", route);
+    if (mode === "popup release") popupReply = fixture.popup("release_pair").then((response) => { popupReleased = true; return response; });
+    if (mode === "native disconnect") fixture.disconnect();
+    if (mode === "content timeout") fixture.failTransport();
+    await fixture.revocationReady;
+    const revocation = fixture.targets.find((target) => target.type === "revoke_access");
+    assert.deepEqual(revocation, { tabId: route.tabId, type: "revoke_access", documentId: route.documentId });
+    assert.equal(fixture.targets.filter((target) => target.type === "revoke_access").length, 1);
+    assert.equal(fixture.posted.some((message) => message.requestId === "receipt-release"), false);
+    assert.equal(popupReleased, false);
+    fixture.deliverRevocation();
+    if (mode === "native release") {
+      const released = await waitForValue(() => fixture.posted.find((message) => message.requestId === "receipt-release"), "native release after invalidation");
+      assert.equal(released.status, "ok");
+    }
+    if (mode === "popup release") assert.equal((await popupReply).ok, true);
+    if (mode === "content timeout") {
+      const timeout = await waitForValue(() => fixture.posted.find((message) => message.requestId === "receipt-write"), "timeout after invalidation");
+      assert.equal(timeout.error.code, "ambiguous_content_timeout");
+    }
+    fixture.resumeDigest();
+    const reply = await waitForValue(() => fixture.valueReplies[0], "held hash response after forwarded revoke");
+    assert.equal(reply.code, "page_access_revoked");
+    assert.equal(fixture.field.value, "Initial ✓");
+    assert.deepEqual(fixture.field.events, []);
+
+    if (mode === "native release" || mode === "popup release") {
+      assert.equal((await fixture.enable()).ok, true);
+      fixture.request("receipt-repair", "pair");
+      const candidate = await fixture.popup("popup_state");
+      const repaired = await fixture.popup("confirm_pair", { candidateId: candidate.candidateId });
+      assert.equal(repaired.ok, true);
+      assert.equal(repaired.route.documentId, route.documentId);
+      assert.equal(repaired.route.nonce, route.nonce);
+      assert.notEqual(repaired.route.epoch, route.epoch);
+      fixture.request("repaired-read", "read", repaired.route);
+      const fresh = await waitForValue(() => fixture.posted.find((message) => message.requestId === "repaired-read"), "repaired snapshot");
+      fixture.request("repaired-write", "set_value", repaired.route, {
+        snapshotId: fresh.result.snapshotId, nodeId: fresh.result.nodes[0].nodeId, value: "Fresh authorized 🪷 ✓",
+      });
+      const written = await waitForValue(() => fixture.posted.find((message) => message.requestId === "repaired-write"), "repaired authorized write");
+      assert.equal(written.status, "ok");
+      assert.equal(fixture.field.value, "Fresh authorized 🪷 ✓");
+      assert.deepEqual(fixture.field.events, ["input", "change"]);
+      assert.equal(fixture.targets.filter((target) => target.type === "revoke_access").length, 1,
+        "late completion must not revoke the newer pairing");
+    }
+  });
+}
+
+test("a late old value timeout never forwards revocation to a newly paired document", async (t) => {
+  const fixture = await consentFixture(t);
+  const oldRoute = await fixture.pair();
+  const send = fixture.chrome.tabs.sendMessage;
+  let rejectTransport;
+  fixture.chrome.tabs.sendMessage = (tabId, message, options) => {
+    if (message.action === "set_value") return new Promise((_, reject) => { rejectTransport = reject; });
+    return send(tabId, message, options);
+  };
+  fixture.request("old-value-timeout", "set_value", oldRoute, { snapshotId: "old-snapshot", nodeId: "old-node", value: "controlled value" });
+  await waitForValue(() => rejectTransport, "old value transport");
+  assert.equal((await fixture.popup("release_pair")).ok, true);
+  fixture.sender.documentId = "newly-paired-document";
+  assert.equal((await fixture.enable()).ok, true);
+  fixture.request("replacement-document-pair", "pair");
+  const candidate = await fixture.popup("popup_state");
+  const repaired = await fixture.popup("confirm_pair", { candidateId: candidate.candidateId });
+  assert.equal(repaired.ok, true);
+  assert.notEqual(repaired.route.documentId, oldRoute.documentId);
+  const revocations = fixture.contentMessages.filter((message) => message.type === "revoke_access").length;
+  rejectTransport(Object.assign(new Error("controlled late timeout"), { code: "content_timeout" }));
+  await waitForValue(() => fixture.posted.find((message) => message.requestId === "old-value-timeout"), "old timeout response");
+  assert.equal(fixture.contentMessages.filter((message) => message.type === "revoke_access").length, revocations);
+  const current = await fixture.popup("popup_state");
+  assert.equal(current.status.paired, true);
+  assert.deepEqual(current.status.route, repaired.route);
+});
+
+for (const mode of ["native release", "popup release", "content timeout"]) {
+  test(`${mode} completes when exact-document revocation remains unanswered`, async (t) => {
+    const fixture = await consentFixture(t);
+    const route = await fixture.pair();
+    const send = fixture.chrome.tabs.sendMessage;
+    const targets = [];
+    fixture.chrome.tabs.sendMessage = (tabId, message, options) => {
+      if (message.type === "revoke_access") {
+        targets.push({ tabId, documentId: options.documentId });
+        return new Promise(() => {});
+      }
+      if (mode === "content timeout" && message.action === "set_value") {
+        return Promise.reject(Object.assign(new Error("controlled content timeout"), { code: "content_timeout" }));
+      }
+      return send(tabId, message, options);
+    };
+    const deadlines = [];
+    const setTimer = globalThis.setTimeout;
+    const clearTimer = globalThis.clearTimeout;
+    t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+      if (delay !== CONTENT_TIMEOUT_MS) return setTimer(callback, delay, ...args);
+      const deadline = { callback, cleared: false };
+      deadlines.push(deadline);
+      return deadline;
+    });
+    t.mock.method(globalThis, "clearTimeout", (timer) => {
+      if (deadlines.includes(timer)) timer.cleared = true;
+      else clearTimer(timer);
+    });
+    let popupResult;
+    let popupReply;
+    if (mode === "native release") fixture.request("unanswered-release", "release", route);
+    if (mode === "popup release") {
+      popupReply = fixture.popup("release_pair").then((response) => { popupResult = response; return response; });
+      void popupReply.catch(() => {});
+    }
+    if (mode === "content timeout") {
+      fixture.request("unanswered-value", "set_value", route, { snapshotId: "snapshot", nodeId: "node", value: "controlled fixture" });
+    }
+    await waitForValue(() => targets.length, "unanswered revocation attempt");
+    assert.deepEqual(targets, [{ tabId: route.tabId, documentId: route.documentId }]);
+    assert.equal(popupResult, undefined);
+    assert.equal(fixture.posted.some((message) => ["unanswered-release", "unanswered-value"].includes(message.requestId)), false);
+    const pending = deadlines.filter((deadline) => !deadline.cleared);
+    assert.equal(pending.length, 1, "revocation must retain the existing content deadline");
+    pending[0].callback();
+    if (mode === "popup release") assert.equal((await popupReply).ok, true);
+    else {
+      const requestId = mode === "native release" ? "unanswered-release" : "unanswered-value";
+      const result = await waitForValue(() => fixture.posted.find((message) => message.requestId === requestId), "bounded terminal response");
+      if (mode === "native release") assert.equal(result.result.released, true);
+      else assert.equal(result.error.code, "ambiguous_content_timeout");
+    }
+    assert.equal(pending[0].cleared, true);
+    assert.equal((await fixture.popup("popup_state")).status.paired, false);
+  });
+}

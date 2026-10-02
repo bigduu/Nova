@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nova HTTP value receipts fixture</title>
+<style>
+  body { margin: 28px; max-width: 850px; font: 18px/1.7 system-ui; }
+  section { border: 1px solid #aaa; margin: 18px 0; padding: 14px; }
+  input { width: 90%; padding: 7px; font: inherit; }
+  output { display: block; overflow-wrap: anywhere; }
+</style>
+<h1>Nova HTTP value receipts 验收</h1>
+<p>Two same-named inputs contain only controlled fixture data. Use a fresh snapshot to target the second input.</p>
+<output id="environment"></output>
+<section>
+  <h2>First input</h2>
+  <label for="first">Shared message</label>
+  <input id="first" aria-label="Shared message" value="First initial ✓">
+  <output id="first-status" aria-live="polite"></output>
+</section>
+<section>
+  <h2>Second input</h2>
+  <label for="second">Shared message</label>
+  <input id="second" aria-label="Shared message" value="Second initial 🪷">
+  <output id="second-status" aria-live="polite"></output>
+</section>
+<p>Acceptance value: <strong>Updated 中文 🪷 ✓</strong></p>
+<script>
+document.getElementById('environment').textContent =
+  `Origin: ${location.origin} · secure context: ${isSecureContext} · crypto.subtle: ${Boolean(crypto.subtle)}`;
+for (const id of ['first', 'second']) {
+  const field = document.getElementById(id);
+  const status = document.getElementById(`${id}-status`);
+  const counts = { input: 0, change: 0 };
+  const render = () => {
+    status.textContent = `Value: ${JSON.stringify(field.value)} · input events: ${counts.input} · change events: ${counts.change}`;
+  };
+  for (const type of ['input', 'change']) {
+    field.addEventListener(type, () => { counts[type] += 1; render(); });
+  }
+  render();
+}
+</script>

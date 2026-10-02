@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 await import("../lib/semantic-runtime.js");
@@ -898,16 +899,23 @@ test("focus reports whether the target became active", async () => {
 
 test("set_value dispatches input/change but returns only size and hash", async () => {
   const element = attach(new FakeElement("input", { type: "text" }));
-  const value = "private draft";
+  const value = "private draft 中文 🪷 ✓";
+  let authorizationChecks = 0;
   const result = await semantic.performAction(
     { element, actions: ["set_value"], sensitive: false },
     "set_value",
     { value },
+    () => {
+      authorizationChecks += 1;
+      assert.equal(element.value, "", "authority is checked before the value write");
+      assert.deepEqual(element.events, []);
+    },
   );
   assert.equal(element.value, value);
   assert.deepEqual(element.events, ["input", "change"]);
   assert.equal(result.valueUtf8Bytes, new TextEncoder().encode(value).byteLength);
-  assert.match(result.valueSha256, /^[0-9a-f]{64}$/u);
+  assert.equal(result.valueSha256, createHash("sha256").update(value).digest("hex"));
+  assert.equal(authorizationChecks, 1);
   assert.equal(JSON.stringify(result).includes(value), false);
 });
 

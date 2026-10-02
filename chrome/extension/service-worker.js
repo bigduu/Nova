@@ -66,12 +66,12 @@ function postNative(message) {
   }
 }
 
-function postEvent(name, details = {}) {
+function postEvent(name, details = {}, epoch = state.epoch) {
   postNative({
     protocolVersion: PROTOCOL_VERSION,
     kind: "event",
     name,
-    epoch: state.epoch,
+    epoch,
     details,
   });
 }
@@ -92,10 +92,12 @@ function connectNative() {
     port.onMessage.addListener(onNativeMessage);
     port.onDisconnect.addListener(() => {
       if (nativePort !== port) return;
+      const previousRoute = state.paired?.route;
       nativePort = null;
       clearTimeout(pairTimer);
       invalidatePairingCandidate();
       state.disconnectNative();
+      void revokeContentRoute(previousRoute);
       scheduleReconnect();
     });
     postNative({
@@ -110,6 +112,23 @@ function connectNative() {
     nativePort = null;
     state.disconnectNative();
     scheduleReconnect();
+  }
+}
+
+async function revokeContentRoute(route) {
+  if (!route) return;
+  let timer;
+  try {
+    await Promise.race([
+      chrome.tabs.sendMessage(route.tabId, { channel: CHANNEL, type: "revoke_access" },
+        { documentId: route.documentId }),
+      new Promise((resolve) => { timer = setTimeout(resolve, CONTENT_TIMEOUT_MS); }),
+    ]);
+  } catch {
+    // A removed/unreachable document cannot acknowledge this best-effort
+    // invalidation. Worker authority is already revoked independently.
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -167,8 +186,11 @@ async function dispatchRequest(request) {
   }
 
   if (decision.response) {
+    if (request.action === "release" && decision.response.result?.released) {
+      await revokeContentRoute(decision.response.result.previousRoute);
+    }
     postNative(decision.response);
-    if (request.action === "release") postEvent("route_revoked", { reason: "released" });
+    if (request.action === "release") postEvent("route_revoked", { reason: "released" }, decision.response.epoch);
     return;
   }
   if (decision.pendingPair) {
@@ -213,6 +235,7 @@ async function dispatchRequest(request) {
       ? "ambiguous_content_timeout"
       : "ambiguous_content_transport";
     const beforeEpoch = state.epoch;
+    const previousRoute = state.paired?.route;
     const response = state.failTransportAmbiguity(
       request.requestId,
       request.action,
@@ -222,13 +245,17 @@ async function dispatchRequest(request) {
         ? "content response timed out; the action may have completed"
         : "content transport failed; the action may have completed",
     );
+    const revoked = state.epoch !== beforeEpoch;
+    if (revoked) {
+      await revokeContentRoute(previousRoute);
+    }
     postNative(response);
-    if (state.epoch !== beforeEpoch) {
+    if (revoked) {
       postEvent("route_revoked", {
         reason: "content_transport_ambiguous",
         errorCode,
         previousRoute: decision.route,
-      });
+      }, response.epoch);
     }
   }
 }
@@ -600,7 +627,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const previous = state.status().route;
     if (previous) {
       state.revoke("popup_release");
-      postEvent("route_revoked", { reason: "popup_release", previousRoute: previous });
+      const revokedEpoch = state.epoch;
+      void revokeContentRoute(previous).then(() => {
+        postEvent("route_revoked", { reason: "popup_release", previousRoute: previous }, revokedEpoch);
+        sendResponse({ ok: true });
+      });
+      return true;
     }
     sendResponse({ ok: true });
     return false;

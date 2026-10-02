@@ -606,10 +606,17 @@
     return { result, handles };
   }
 
-  async function sha256Text(value) {
-    const bytes = new TextEncoder().encode(value);
-    const digest = await global.crypto.subtle.digest("SHA-256", bytes);
-    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  async function sha256Bytes(bytes) {
+    try {
+      if (typeof global.crypto?.subtle?.digest !== "function") throw new Error();
+      const digest = new Uint8Array(await global.crypto.subtle.digest("SHA-256", bytes));
+      if (digest.byteLength !== 32) throw new Error();
+      return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    } catch {
+      throw Object.assign(new Error(
+        "SHA256 value receipt unavailable; no value was written. Use HTTPS or a trusted loopback origin and read again before retrying",
+      ), { code: "value_receipt_unavailable" });
+    }
   }
 
   function setNativeValue(element, value) {
@@ -633,7 +640,7 @@
     }
   }
 
-  async function performAction(handle, action, args = {}) {
+  async function performAction(handle, action, args = {}, assertCurrent = () => {}) {
     validateNodeTarget(handle, action);
     const element = handle.element;
     if (Object.hasOwn(args, "x") || Object.hasOwn(args, "y") || Object.hasOwn(args, "coordinates")) {
@@ -652,18 +659,24 @@
     }
     if (action === "set_value") {
       if (typeof args.value !== "string") throw Object.assign(new Error("value must be a string"), { code: "invalid_value" });
-      const encoded = new TextEncoder().encode(args.value);
+      const value = args.value;
+      const encoded = new TextEncoder().encode(value);
       if (encoded.byteLength > MAX_SET_VALUE_BYTES) {
         throw Object.assign(new Error("value is too large"), { code: "value_too_large" });
       }
-      setNativeValue(element, args.value);
+      // Prepare the existing receipt before any value/event side effect. The
+      // await must not let a revoked snapshot or newly sensitive node write.
+      const valueSha256 = await sha256Bytes(encoded);
+      assertCurrent();
+      validateNodeTarget(handle, action);
+      setNativeValue(element, value);
       const view = element.ownerDocument?.defaultView ?? global;
       const InputEventCtor = view.InputEvent ?? view.Event;
       element.dispatchEvent(new InputEventCtor("input", { bubbles: true, inputType: "insertText" }));
       element.dispatchEvent(new view.Event("change", { bubbles: true }));
       return {
         valueUtf8Bytes: encoded.byteLength,
-        valueSha256: await sha256Text(args.value),
+        valueSha256,
       };
     }
     if (action === "scroll") {
