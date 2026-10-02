@@ -510,6 +510,25 @@ the host keeping a stable signing identity.
 
 ## Coordinate grounding
 
+In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
+also show a purple virtual arrow at the supplied logical point. Click rings
+and scroll direction cues fade after 400 ms; the arrow clears after 1.2 seconds
+of inactivity. The panel passes through mouse input and cannot take keyboard
+focus. Foreground input still moves the real pointer; PID/background delivery
+keeps its existing behavior. Batch uses the same native backend. Internal
+pointer restoration after element-center fallback leaves the cue at that click.
+Feedback marks an input attempt; it does not confirm the target accepted it.
+Semantic-only AX actions and browser DOM actions do not infer cursor positions;
+direct no-UI transports and pure connectors do not create this overlay.
+
+Display and region captures exclude the reserved cursor window only when its
+owner resolves to the same Nova executable, including updates to a warm capture
+stream. Other-app single-window captures keep their existing filter. Rendering,
+click-through, focus/pointer behavior, batch, cold/warm screenshot exclusion and
+Quit cleanup still require controlled real desktop acceptance; automated tests
+do not establish those GUI results. Multi-display and full-screen behavior also
+need live verification on the available setup.
+
 A general LLM judging pixel coordinates off a downscaled screenshot is the main
 source of mis-clicks — so the primary path avoids pixels entirely.
 

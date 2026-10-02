@@ -94,7 +94,7 @@ accessibility = "0.2"
 accessibility-sys = "0.2"            # raw AXValueGetValue for AXPosition/AXSize
 core-foundation = "0.10"            # CFString/CFType — must match accessibility's
 # Running-app enumeration for AX-only target resolution.
-objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "NSEvent", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "NSEvent", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "NSWindow", "NSPanel", "NSScreen", "NSColor", "NSBezierPath", "NSGraphics", "objc2-core-foundation"] }
 
 # Apple Vision OCR (VNRecognizeTextRequest) — native, on-device, no model files.
 objc2 = "0.6"
