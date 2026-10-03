@@ -2096,7 +2096,9 @@ fn default_duration() -> f64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
-    /// Ordered list of input actions to execute in a single call.
+    /// Up to 64 ordered input actions. Larger batches are rejected before any
+    /// action runs. Execution stops at the first failure.
+    #[schemars(length(max = crate::tools::batch::MAX_BATCH_ACTIONS))]
     pub actions: Vec<crate::tools::batch::BatchAction>,
 }
 
@@ -2849,8 +2851,11 @@ impl NovaServer {
         name = "batch_actions",
         description = "Execute a sequence of input actions (mouse_move, left_click, right_click, \
                        double_click, scroll, key_combo, type_text, wait) in one call to reduce \
-                       round-trips. Coordinates are in screenshot space. Afterwards use ax_read \
-                       for semantic outcomes or a screenshot only for visual outcomes."
+                       round-trips, at most 64 actions. Coordinates are in screenshot space. \
+                       Stops at the first failure and returns completed indices/results, \
+                       failed_index/reason, and a not_executed half-open range. The failed action \
+                       may have partial side effects. No retry or rollback. Get fresh ax_read \
+                       state before deciding what to retry; use a screenshot for visual outcomes."
     )]
     #[tracing::instrument(skip_all, fields(count = %p.actions.len()), level = "info")]
     async fn batch_actions(
@@ -2872,7 +2877,9 @@ impl NovaServer {
         .await
         {
             Ok(results) => ok_text(results.join("\n")),
-            Err(e) => err_result(&e.to_string()),
+            Err(progress) => {
+                rmcp::model::CallToolResult::structured_error(serde_json::json!(progress))
+            }
         }
     }
 
@@ -4841,6 +4848,7 @@ mod input_redaction_tests {
     #[derive(Debug, Default)]
     pub(super) struct FakeInput {
         received: Mutex<Option<String>>,
+        calls: Mutex<Vec<&'static str>>,
         fail: bool,
     }
     impl crate::platform::InputInjector for FakeInput {
@@ -4856,6 +4864,7 @@ mod input_redaction_tests {
             _: f64,
             _: crate::tools::input::InputTarget,
         ) -> crate::error::Result<()> {
+            self.calls.lock().unwrap().push("left_click");
             Ok(())
         }
         fn right_click_at(
@@ -4895,6 +4904,7 @@ mod input_redaction_tests {
             text: &str,
             _: crate::tools::input::InputTarget,
         ) -> crate::error::Result<()> {
+            self.calls.lock().unwrap().push("type_text");
             *self.received.lock().unwrap() = Some(text.to_string());
             if self.fail {
                 Err(crate::error::NovaError::Input(format!(
@@ -5102,8 +5112,91 @@ mod input_redaction_tests {
             assert_safe(&trace);
             if fail {
                 assert!(output.contains("input route=hid failed"));
+                let progress = result.structured_content.as_ref().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(output).unwrap(),
+                    *progress
+                );
+                assert_eq!(progress["completed"], serde_json::json!([]));
+                assert_eq!(progress["failed_index"], 0);
+                assert_eq!(
+                    progress["not_executed"],
+                    serde_json::json!({"start": 1, "end_exclusive": 1})
+                );
+                assert_safe(&serde_json::to_string(&result).unwrap());
+            } else {
+                assert_eq!(output, "typed input (chars=9, bytes=13)");
+                assert!(result.structured_content.is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn batch_handler_reports_completed_click_and_never_dispatches_after_failure() {
+        use crate::tools::batch::BatchAction;
+        let (server, fixture) = fixture_server(true);
+        let (writer, _guard) = trace_capture();
+        let result = server
+            .batch_actions(Parameters(BatchParams {
+                actions: vec![
+                    BatchAction::LeftClick { x: 0.0, y: 0.0 },
+                    BatchAction::TypeText {
+                        text: SECRET.into(),
+                    },
+                    BatchAction::LeftClick { x: 0.0, y: 0.0 },
+                ],
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let progress = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            progress["completed"],
+            serde_json::json!([{"index": 0, "result": "left clicked at (0, 0)"}])
+        );
+        assert_eq!(progress["failed_index"], 1);
+        assert_eq!(
+            progress["not_executed"],
+            serde_json::json!({"start": 2, "end_exclusive": 3})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(result_text(&result)).unwrap(),
+            *progress
+        );
+        assert_safe(&serde_json::to_string(&result).unwrap());
+        assert_safe(&trace_text(&writer));
+        assert_eq!(
+            *fixture.input.calls.lock().unwrap(),
+            ["left_click", "type_text"]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_handler_rejects_oversize_before_input_and_advertises_matching_limit() {
+        use crate::tools::batch::{BatchAction, MAX_BATCH_ACTIONS};
+        let schema = schemars::schema_for!(BatchParams);
+        assert_eq!(
+            schema.as_value()["properties"]["actions"]["maxItems"],
+            MAX_BATCH_ACTIONS
+        );
+        let (server, fixture) = fixture_server(false);
+        let result = server
+            .batch_actions(Parameters(BatchParams {
+                actions: vec![BatchAction::LeftClick { x: 0.0, y: 0.0 }; MAX_BATCH_ACTIONS + 1],
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let progress = result.structured_content.as_ref().unwrap();
+        assert_eq!(progress["completed"], serde_json::json!([]));
+        assert!(progress["failed_index"].is_null());
+        assert!(progress["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no actions ran"));
+        assert_eq!(
+            progress["not_executed"],
+            serde_json::json!({"start": 0, "end_exclusive": MAX_BATCH_ACTIONS + 1})
+        );
+        assert!(fixture.input.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

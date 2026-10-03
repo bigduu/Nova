@@ -35,6 +35,20 @@ stdio or Streamable HTTP.
 | `batch_actions` | Run a sequence of input actions in one call. |
 | `wait` | Pause for a specified number of seconds. |
 
+`batch_actions` runs at most 64 actions sequentially and stops at the first
+failure, without retry or rollback. Success keeps the newline-separated status
+lines. Failure sets MCP `isError=true` and returns the same JSON in text content
+and `structuredContent`: `completed: [{index, result}]`, `failed_index`, `reason`,
+and `not_executed: {start, end_exclusive}`. Indices are zero-based; the half-open
+range includes only actions after the failed step, which may already have partial
+side effects. More than 64 actions is rejected before any action runs, with
+`failed_index: null` and the whole batch marked unexecuted. Each acknowledgement
+or reason is limited to 512 Unicode characters, retaining its beginning and end
+with `…` in the middle when shortened. Typed text keeps character/UTF-8 byte
+counts rather than plaintext. Inspect progress and obtain fresh `ax_read` state
+before deciding what to retry; replaying the whole batch could repeat completed
+side effects.
+
 ## Requirements
 
 - **macOS 14+** for the macOS desktop backend. The release archive is universal
