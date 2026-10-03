@@ -27,6 +27,14 @@ document or returns its DOM to Nova. After navigation, enable and pair the new
 document again. File/incognito access remains off by default, and restricted
 Chrome pages are unsupported. No persistent content scripts are registered.
 
+Keep the popup open to receive new Pair requests and authorization changes.
+It refreshes on worker state notifications, without polling or replacing an
+unchanged reviewed candidate. Actions run one at a time; expired or revoked
+controls are disabled, and a new valid state clears an older error. After a
+timeout, navigation, release, or Nova disconnect, request a new pairing.
+See the [isolated popup acceptance](docs/popup-acceptance.md) for the tested
+lifecycle and fixture evidence.
+
 ## Developer setup (macOS)
 
 1. Build the host:

@@ -49,14 +49,22 @@ class FakeElement {
 async function renderPopup(response, permissions = {}) {
   const elements = Object.fromEntries(ids.map((id) => [id, new FakeElement()]));
   const sent = [];
+  const listeners = [];
+  let countdownTick;
   const chrome = {
     permissions,
     runtime: {
+      id: "nova-popup-fixture",
+      onMessage: { addListener: (listener) => listeners.push(listener) },
       lastError: null,
       sendMessage(message, callback) {
         sent.push(message);
         const value = typeof response === "function" ? response(message) : response;
-        callback(structuredClone(value));
+        void Promise.resolve(value).then((result) => callback(structuredClone(result)), (error) => {
+          chrome.runtime.lastError = error;
+          callback();
+          chrome.runtime.lastError = null;
+        });
       },
     },
   };
@@ -66,12 +74,18 @@ async function renderPopup(response, permissions = {}) {
     Date,
     document: { getElementById: (id) => elements[id] },
     Promise,
-    setInterval: () => 1,
+    setInterval: (callback) => { countdownTick = callback; return 1; },
     clearInterval: () => {},
     URL,
   });
   await new Promise((resolve) => setImmediate(resolve));
-  return { elements, sent };
+  return { elements, sent, tick: () => countdownTick?.(),
+    notify(reason, sender = { id: chrome.runtime.id }) {
+      for (const listener of listeners) {
+        listener({ channel: "nova-extension-v1", type: "popup_state_changed", reason }, sender);
+      }
+    },
+  };
 }
 
 const reviewedAccess = {
@@ -105,9 +119,11 @@ test("site request runs directly in the gesture for the already displayed exact 
   inGesture = false;
   assert.deepEqual(requested, [{ origins: ["https://reviewed.example/*"] }]);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(elements["access-status"].textContent, /permission denied/iu);
+  assert.match(elements.error.textContent, /permission denied/iu);
+  assert.equal(elements.error.hidden, false);
   assert.equal(elements["allow-site"].disabled, false);
-  assert.equal(sent.length, 1, "denial neither bootstraps nor confirms a pairing");
+  assert.deepEqual(sent.map((message) => message.type), ["popup_state", "popup_state"],
+    "denial refreshes state but neither bootstraps nor confirms a pairing");
 });
 
 test("tab access passes only the reviewed tab and URL, never pairs implicitly", async () => {
@@ -274,9 +290,11 @@ test("optional frame request is a direct gesture and denial leaves top access av
   inGesture = false;
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(requests, [{ permissions: ["webNavigation"] }]);
-  assert.match(elements["frame-status"].textContent, /denied.*Top-document reads and actions/);
+  assert.match(elements.error.textContent, /denied.*Top-document reads and actions/);
+  assert.equal(elements.error.hidden, false);
   assert.equal(elements["enable-frames"].disabled, false);
-  assert.equal(sent.length, 1);
+  assert.deepEqual(sent.map((message) => message.type), ["popup_state", "popup_state"],
+    "denied metadata access refreshes current state without enabling child frames");
   assert.match(popupMarkup, /across your browser/);
   assert.match(popupMarkup, /queries only the paired tab/);
 });
@@ -307,4 +325,176 @@ test("frame permission removal requests only the optional metadata permission", 
   assert.deepEqual(removed, [{ permissions: ["webNavigation"] }]);
   const unpaired = await renderPopup(consentState(), { request() { assert.fail("unpaired request"); } });
   assert.equal(unpaired.elements["enable-frames"].disabled, true);
+});
+
+test("child metadata permission serializes controls and a late result cannot restore a revoked pairing", async (t) => {
+  for (const granted of [true, false]) {
+    await t.test(granted ? "late grant" : "late denial", async () => {
+      let finishPermission;
+      let inGesture = false;
+      let revoked = false;
+      const fixture = await renderPopup((message) => message.type === "enable_child_frames"
+        ? { ok: false, message: "The old pairing changed" }
+        : revoked ? consentState() : frameState({ permissionGranted: true }), {
+        request(options) {
+          assert.equal(inGesture, true);
+          assert.deepEqual(structuredClone(options), { permissions: ["webNavigation"] });
+          return new Promise((resolve) => { finishPermission = resolve; });
+        },
+      });
+      inGesture = true;
+      const action = fixture.elements["enable-frames"].listeners.get("click")();
+      inGesture = false;
+      for (const id of ["use-tab", "allow-site", "revoke-site", "pair", "deny", "release", "enable-frames", "remove-frame-permission"]) {
+        assert.equal(fixture.elements[id].disabled, true, id);
+      }
+      await fixture.elements.release.listeners.get("click")();
+      await fixture.elements["remove-frame-permission"].listeners.get("click")();
+      assert.equal(fixture.sent.length, 1, "overlapping actions cannot reach the worker or remove permission");
+      revoked = true;
+      fixture.notify("navigation");
+      finishPermission(granted);
+      await action;
+      assert.equal(fixture.elements.paired.hidden, true);
+      assert.equal(fixture.elements["enable-frames"].disabled, true);
+      assert.equal(fixture.elements["remove-frame-permission"].disabled, true);
+      assert.equal(fixture.elements.error.hidden, true);
+      assert.match(fixture.elements.idle.textContent, /page changed/iu);
+    });
+  }
+});
+
+test("a state-read failure also disables controls from the former child pairing", async () => {
+  let fails = false;
+  const fixture = await renderPopup(() => fails ? { ok: false, code: "popup_state_failed" }
+    : frameState({ enabled: true, permissionGranted: true }));
+  assert.equal(fixture.elements["remove-frame-permission"].disabled, false);
+  fails = true;
+  fixture.notify("native_disconnected");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.elements.paired.hidden, true);
+  assert.equal(fixture.elements["enable-frames"].disabled, true);
+  assert.equal(fixture.elements["remove-frame-permission"].disabled, true);
+  assert.equal(fixture.elements.error.hidden, false);
+});
+
+function pendingState() {
+  return {
+    ...consentState(),
+    status: { connected: true, paired: false, pendingPair: { expiresAt: Date.now() + 10_000 } },
+    activePage: { title: "Reviewed page", url: reviewedAccess.url },
+    candidateId: "pair-candidate-current",
+  };
+}
+
+test("a notification replaces a delayed state read without restoring its old candidate", async () => {
+  let finishOldRead;
+  let reads = 0;
+  const fixture = await renderPopup(() => {
+    if (++reads === 1) return new Promise((resolve) => { finishOldRead = resolve; });
+    return consentState();
+  });
+  assert.equal(fixture.elements["use-tab"].disabled, true, "initial loading blocks actions");
+  await fixture.elements["use-tab"].listeners.get("click")();
+  assert.equal(fixture.sent.length, 1);
+  fixture.notify("navigation");
+  finishOldRead(pendingState());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 2);
+  assert.equal(fixture.elements.pending.hidden, true);
+  assert.equal(fixture.elements.pair.disabled, true);
+  assert.match(fixture.elements.idle.textContent, /page changed/iu);
+});
+
+test("permission actions stay in the gesture and block overlapping actions and countdown enabling", async () => {
+  let finishPermission;
+  let inGesture = false;
+  const fixture = await renderPopup(pendingState(), {
+    request() {
+      assert.equal(inGesture, true);
+      return new Promise((resolve) => { finishPermission = resolve; });
+    },
+  });
+  inGesture = true;
+  const action = fixture.elements["allow-site"].listeners.get("click")();
+  inGesture = false;
+  fixture.tick();
+  for (const id of ["use-tab", "allow-site", "pair", "deny", "release"]) {
+    assert.equal(fixture.elements[id].disabled, true, id);
+  }
+  await fixture.elements.pair.listeners.get("click")();
+  await fixture.elements["use-tab"].listeners.get("click")();
+  assert.equal(fixture.sent.length, 1, "overlapping actions cannot reach the worker");
+  finishPermission(false);
+  await action;
+  assert.equal(fixture.elements.error.hidden, false);
+  assert.match(fixture.elements.error.textContent, /permission denied/iu);
+  assert.equal(fixture.elements.pair.disabled, false);
+  fixture.notify("site_permission_added");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.elements.error.hidden, true, "a subsequent successful state change clears the old failure");
+});
+
+test("successful retry clears the old error while a current failure survives its state refresh", async () => {
+  let attempts = 0;
+  const fixture = await renderPopup((message) => message.type === "bootstrap_tab"
+    ? ++attempts === 1 ? { ok: false, message: "Current Chrome access denial" } : { ok: true }
+    : consentState());
+  await fixture.elements["use-tab"].listeners.get("click")();
+  assert.equal(fixture.elements.error.hidden, false);
+  assert.match(fixture.elements.error.textContent, /Current Chrome access denial/u);
+  await fixture.elements["use-tab"].listeners.get("click")();
+  assert.equal(fixture.elements.error.hidden, true);
+});
+
+test("late action success or failure cannot restore revoked consent or a stale error", async (t) => {
+  for (const lateReply of [{ ok: true }, { ok: false, message: "Old confirmation failure" }]) {
+    await t.test(lateReply.ok ? "success" : "failure", async () => {
+      let finishConfirmation;
+      let revoked = false;
+      const fixture = await renderPopup((message) => {
+        if (message.type === "confirm_pair") return new Promise((resolve) => { finishConfirmation = resolve; });
+        return revoked ? consentState() : pendingState();
+      });
+      const action = fixture.elements.pair.listeners.get("click")();
+      revoked = true;
+      fixture.notify("navigation");
+      assert.equal(fixture.elements.pair.disabled, true);
+      assert.equal(fixture.elements.pending.hidden, true, "revoked consent disappears before a delayed action finishes");
+      finishConfirmation(lateReply);
+      await action;
+      assert.equal(fixture.elements.pair.disabled, true);
+      assert.equal(fixture.elements.pending.hidden, true);
+      assert.equal(fixture.elements.paired.hidden, true);
+      assert.equal(fixture.elements.error.hidden, true);
+      assert.match(fixture.elements.idle.textContent, /page changed/iu);
+    });
+  }
+});
+
+test("content-script and foreign notifications cannot trigger popup refreshes", async () => {
+  const fixture = await renderPopup(consentState());
+  fixture.notify("pair_pending", { id: "foreign-extension" });
+  fixture.notify("pair_pending", { id: "nova-popup-fixture", tab: { id: 31 } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.sent.length, 1);
+});
+
+test("a current state-read failure removes old controls and remains visible until recovery", async () => {
+  let fails = false;
+  const fixture = await renderPopup(() => fails ? { ok: false, code: "popup_state_failed" } : pendingState());
+  fails = true;
+  fixture.notify("navigation");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.elements.pending.hidden, true);
+  assert.equal(fixture.elements.pair.disabled, true);
+  assert.equal(fixture.elements["allow-site"].disabled, true);
+  assert.equal(fixture.elements.error.hidden, false);
+  assert.equal(fixture.elements.error.textContent, "popup_state_failed");
+  assert.equal(fixture.elements.connection.textContent, "Nova state unavailable");
+  fails = false;
+  fixture.notify("page_enabled");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.elements.error.hidden, true);
+  assert.equal(fixture.elements.pair.disabled, false);
 });
