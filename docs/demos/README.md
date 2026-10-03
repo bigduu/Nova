@@ -4,8 +4,12 @@
 
 [Static final frame](browser-checklist.png) · [MCP request/results](browser-evidence.json) · [Recording script](record-browser.mjs) · [Local fixture](fixture.html)
 
-This is a **source-checkout demonstration**, recorded from Nova commit
-`d59dbf88ee1de4680af36e8aa1671caea1f255c4` on Linux. The `chrome-devtools` launcher
+This is a **source-checkout demonstration**, recorded on Linux from the runtime
+source at reachable Nova revision
+[`19dfeaa1e49fd186202f731c92d2f7ec9b6539af`](https://github.com/bigduu/Nova/commit/19dfeaa1e49fd186202f731c92d2f7ec9b6539af).
+The original recording workspace included a local, unpublished documentation-only
+commit; it is not a public reproduction ref. The recording script, fixture and
+MCP transcript are preserved in this directory. The `chrome-devtools` launcher
 shown here is **not in the published v0.2.1 release**, despite the source manifest
 still using that version string.
 

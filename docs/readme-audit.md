@@ -1,13 +1,16 @@
 # README audit — 2026-10-03
 
-- Zenith pin and remote HEAD: `19dfeaa1e49fd186202f731c92d2f7ec9b6539af`.
+- Source revision inspected during the initial audit and recording:
+  `19dfeaa1e49fd186202f731c92d2f7ec9b6539af` (then Zenith's pin and remote HEAD).
 - Latest public release redirect: <https://github.com/bigduu/Nova/releases/latest>
   → `v0.2.1`, tag `c36903473022d75a5f0efeba5254be9553ca5739`.
-- Current source is 71 commits after that tag. `Cargo.toml` still reports
+- That explicit source revision is 71 commits after the release tag. `Cargo.toml` still reports
   `0.2.1`; it is not evidence of publication of current code.
 - Checked with `git ls-remote origin HEAD`, `git ls-remote --tags origin`,
-  `git rev-list --count v0.2.1..HEAD`, and public release HTTP redirects.
-  GitHub API access was unavailable through the environment proxy.
+  `git rev-list --count c36903473022d75a5f0efeba5254be9553ca5739..19dfeaa1e49fd186202f731c92d2f7ec9b6539af`,
+  and public release HTTP redirects. The count describes that fixed audit source,
+  not the later documentation commits or moving `HEAD`. GitHub API access was
+  unavailable through the initial recording environment's proxy.
 
 ## Capability evidence
 
