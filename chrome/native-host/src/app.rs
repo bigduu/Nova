@@ -5,8 +5,29 @@
 //! the current exact page route, and the request/receipt state machine. This
 //! keeps every MCP session in Nova.app on one serialized authority boundary.
 
+/// Opaque, process-local intent captured from one existing broker Session.
+/// It is not a wire route, credential, or independent lifetime.
+#[derive(Clone)]
+pub struct PageBinding {
+    session: std::sync::Arc<()>,
+    route: serde_json::Value,
+}
+
+impl std::fmt::Debug for PageBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageBinding").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub struct BoundPageRead {
+    pub result: serde_json::Value,
+    pub binding: PageBinding,
+}
+
 #[cfg(any(unix, windows))]
 mod runtime {
+    use super::{BoundPageRead, PageBinding};
     use crate::protocol::{validate_message, ACTIONS, PROTOCOL_VERSION};
     use crate::{configured_socket_path, AppBridgeConnection, AppBridgeListener};
     use anyhow::{anyhow, bail, Context, Result};
@@ -75,6 +96,18 @@ mod runtime {
         /// broker and never carry a caller-provided route; the broker adds only
         /// the exact route returned by the confirmed pairing result.
         pub fn call(&self, action: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+            self.enqueue(action, args, timeout, None, false)
+                .map(|reply| reply.result)
+        }
+
+        fn enqueue(
+            &self,
+            action: &str,
+            args: Value,
+            timeout: Option<Duration>,
+            binding: Option<PageBinding>,
+            capture_binding: bool,
+        ) -> Result<Reply> {
             validate_tool_args(action, &args)?;
             let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
             if timeout.is_zero() {
@@ -92,6 +125,8 @@ mod runtime {
                     action: action.to_string(),
                     args,
                     expected_route: None,
+                    binding,
+                    capture_binding,
                     deadline: Instant::now() + timeout,
                     reply,
                 })
@@ -127,6 +162,46 @@ mod runtime {
                 json!({ "maxNodes": max_nodes, "maxChars": max_chars }),
                 None,
             )
+        }
+
+        /// Capture the Session and full route at actual read dispatch.
+        pub fn read_bound(
+            &self,
+            max_nodes: u64,
+            max_chars: u64,
+            timeout: Duration,
+        ) -> Result<BoundPageRead> {
+            let reply = self.enqueue(
+                "read",
+                json!({"maxNodes":max_nodes,"maxChars":max_chars}),
+                Some(timeout),
+                None,
+                true,
+            )?;
+            Ok(BoundPageRead {
+                result: reply.result,
+                binding: reply
+                    .binding
+                    .context("paired-page read has no dispatched binding")?,
+            })
+        }
+
+        /// Retain the caller's old intent until the broker checks it at dequeue.
+        pub fn activate_bound(
+            &self,
+            binding: &PageBinding,
+            snapshot_id: &str,
+            node_id: &str,
+            timeout: Duration,
+        ) -> Result<Value> {
+            self.enqueue(
+                "activate",
+                json!({"snapshotId":snapshot_id,"nodeId":node_id}),
+                Some(timeout),
+                Some(binding.clone()),
+                false,
+            )
+            .map(|reply| reply.result)
         }
 
         pub fn activate(&self, snapshot_id: &str, node_id: &str) -> Result<Value> {
@@ -177,16 +252,25 @@ mod runtime {
         }
     }
 
+    #[derive(Debug)]
+    struct Reply {
+        result: Value,
+        binding: Option<PageBinding>,
+    }
+
     struct Command {
-        reply: mpsc::SyncSender<Result<Value>>,
+        reply: mpsc::SyncSender<Result<Reply>>,
         request_id: String,
         action: String,
         deadline: Instant,
         args: Value,
         expected_route: Option<Value>,
+        binding: Option<PageBinding>,
+        capture_binding: bool,
     }
 
     struct Session {
+        identity: Arc<()>,
         host_extension_id: Option<String>,
         connection: AppBridgeConnection,
         route: Option<Value>,
@@ -198,6 +282,7 @@ mod runtime {
         fn new(connection: AppBridgeConnection) -> Self {
             let ownership = crate::peer::ProcessWitness::capture(connection.peer_pid());
             Self {
+                identity: Arc::new(()),
                 host_extension_id: None,
                 connection,
                 route: None,
@@ -434,6 +519,26 @@ mod runtime {
                         continue;
                     }
 
+                    // This local rejection has no wire receipt and must not
+                    // revoke a valid newer Session/pairing. Keep it outside
+                    // build_request's transport/protocol failure path.
+                    if command.binding.as_ref().is_some_and(|binding| {
+                        !Arc::ptr_eq(&binding.session, &active.identity)
+                            || active.route.as_ref() != Some(&binding.route)
+                    }) {
+                        fail_pending(
+                            command,
+                            anyhow!("Chrome paired-page binding is stale; read again"),
+                        );
+                        continue;
+                    }
+                    if command.capture_binding {
+                        command.binding = Some(PageBinding {
+                            session: active.identity.clone(),
+                            route: active.route.clone().expect("routed read was checked"),
+                        });
+                    }
+
                     let request = match build_request(active, &command) {
                         Ok(request) => request,
                         Err(error) => {
@@ -517,7 +622,10 @@ mod runtime {
                         .and_then(|()| active.send_receipt(&message))
                         .and_then(|()| active.broker_result(message, &command.action));
                     let disconnect = delivered.is_err();
-                    let _ = command.reply.send(delivered);
+                    let _ = command.reply.send(delivered.map(|result| Reply {
+                        result,
+                        binding: command.binding,
+                    }));
                     if disconnect {
                         // A malformed route update or an unacknowledged
                         // terminal receipt leaves the two sides with
@@ -531,7 +639,10 @@ mod runtime {
                     let delivered = active
                         .send_receipt(&message)
                         .and_then(|()| active.broker_result(message, &command.action));
-                    let _ = command.reply.send(delivered);
+                    let _ = command.reply.send(delivered.map(|result| Reply {
+                        result,
+                        binding: command.binding,
+                    }));
                     *session = None;
                 }
                 ResultDisposition::RejectThenDisconnect => {
@@ -781,6 +892,8 @@ mod runtime {
                 deadline: Instant::now() + Duration::from_secs(1),
                 args: json!({}),
                 expected_route: None,
+                binding: None,
+                capture_binding: false,
             };
             assert_eq!(build_request(&session, &command).unwrap()["route"], route);
             session
@@ -842,6 +955,8 @@ mod runtime {
                 deadline: Instant::now() + Duration::from_secs(1),
                 args: json!({}),
                 expected_route: None,
+                binding: None,
+                capture_binding: false,
             };
             let wrong = json!({
                 "requestId": "app-2",
@@ -870,6 +985,8 @@ mod runtime {
                 deadline: Instant::now() + Duration::from_secs(1),
                 args: json!({ "snapshotId": "snapshot-1", "nodeId": "node-1" }),
                 expected_route: Some(expected_route.clone()),
+                binding: None,
+                capture_binding: false,
             };
             let matching = json!({
                 "requestId": "app-7",
@@ -917,6 +1034,8 @@ mod runtime {
                 deadline: Instant::now() + Duration::from_secs(1),
                 args: json!({}),
                 expected_route: Some(expected_route.clone()),
+                binding: None,
+                capture_binding: false,
             };
 
             let revoked = json!({
@@ -959,6 +1078,8 @@ mod runtime {
                     "value": "not logged",
                 }),
                 expected_route: None,
+                binding: None,
+                capture_binding: false,
             });
 
             assert!(expire_pending(&mut pending, now));
@@ -1015,6 +1136,23 @@ mod unsupported {
         }
         pub fn read(&self, _max_nodes: Option<u64>, _max_chars: Option<u64>) -> Result<Value> {
             self.call("read", serde_json::json!({}), None)
+        }
+        pub fn read_bound(
+            &self,
+            _max_nodes: u64,
+            _max_chars: u64,
+            _timeout: Duration,
+        ) -> Result<super::BoundPageRead> {
+            bail!("Nova's Chrome semantic bridge is unavailable on this platform")
+        }
+        pub fn activate_bound(
+            &self,
+            _binding: &super::PageBinding,
+            _snapshot_id: &str,
+            _node_id: &str,
+            _timeout: Duration,
+        ) -> Result<Value> {
+            self.call("activate", serde_json::json!({}), None)
         }
         pub fn activate(&self, _snapshot_id: &str, _node_id: &str) -> Result<Value> {
             self.call("activate", serde_json::json!({}), None)
