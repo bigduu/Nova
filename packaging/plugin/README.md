@@ -1,6 +1,6 @@
 # Nova bamboo plugin
 
-This is the [bamboo](https://github.com/bigduu/bamboo) plugin bundle for
+This is the [bamboo](https://github.com/bigduu/Bamboo-agent) plugin bundle for
 [Nova](https://github.com/bigduu/Nova) — a Computer Use MCP server that gives
 an agent AX-first control of macOS and Windows: semantic Accessibility/UIA
 reads and actions, mouse/keyboard, focused screenshots, and OCR fallback.
@@ -16,6 +16,11 @@ The required priority is:
 `read_ui` and `click_mark` remain compatibility aliases. A
 `permission_denied` result must be fixed by granting Accessibility, not hidden
 with a screenshot fallback.
+
+This README describes the **current source template**. The published v0.2.1
+plugin predates the AX-first workflow, managed `mcp` command, Nova.app, and
+Chrome DevTools launcher; installing that release does not enable these additions.
+See the [version guide](../../README.md#choose-a-version) before choosing a bundle.
 
 ## What's in this bundle
 

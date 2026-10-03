@@ -1,19 +1,52 @@
 # Nova
 
-**A Computer Use implementation in Rust.** Nova is a [Model Context
-Protocol](https://modelcontextprotocol.io) server that gives an LLM agent
-AX-first control of macOS and Windows: semantic UI reads/actions, screenshots,
-mouse, keyboard, scrolling, window/app introspection, OCR, and the clipboard —
-the "computer use" capability, built natively in Rust rather than wrapping a
-Python/JS automation stack.
+**Let your agent work with desktop apps through MCP.** Nova provides semantic
+UI reads and actions, screenshots, keyboard/mouse input, OCR, and clipboard
+access on macOS and Windows. Use it when a task needs a real application's UI:
+read a dialog, activate a control, or check the result on screen.
 
-Built directly on native platform APIs (macOS Accessibility/ScreenCaptureKit/
-CoreGraphics and Windows UI Automation/Win32) — a single self-contained binary,
-no runtime to install.
-Connect it to any MCP client (Claude Desktop, an agent runtime, your own) over
-stdio or Streamable HTTP.
+Nova supplies the computer/browser tools; your MCP host supplies the model,
+planning, and approval policy. In [Zenith](https://github.com/bigduu/Zenith),
+[Bamboo](https://github.com/bigduu/Bamboo-agent) is the agent runtime and Nova
+is an optional tool provider, also usable by other MCP clients.
 
-## Tools
+## Watch a browser task from source
+
+![Nova uses real browser MCP actions to check two demo items and prepare a review.](docs/demos/browser-checklist.gif)
+
+[Static image](docs/demos/browser-checklist.png) · [Reproduce and inspect MCP evidence](docs/demos/README.md)
+
+Recorded on Linux from the source checkout, **not the v0.2.1 release**. A dedicated
+fixture page and recording adapter are used; navigation and clicks are real MCP
+calls. No model reasoning, native desktop operation or actual release review is
+implied. The reproduction notes explain the `--npx` adapter and isolated browser.
+
+## Choose a version
+
+| Path | What you get |
+| --- | --- |
+| [Published v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1) | macOS/Windows binaries with the earlier screenshot, mark, and input tools. Start with [Install](#install). |
+| Current source | AX-first `ax_read`/`ax_activate`, managed `nova mcp`, the Nova.app development preview, and the optional Chrome DevTools launcher. Build from source for the workflows described below. |
+
+The source manifest still says `0.2.1`; that does **not** make post-tag features
+available in the released binary. Nova.app is a development preview, not a
+notarized production app. [Audit evidence](docs/readme-audit.md).
+
+## Start with one task
+
+1. [Install or build Nova](#install) for the chosen version and connect it to
+   your [MCP host](#use-it-from-an-mcp-client).
+2. On a supported desktop, open a non-sensitive test window and grant the
+   [required permissions](#requirements).
+3. With current source, ask the agent to read the window with `ax_read`, activate
+   a returned control with `ax_activate`, then read again to verify the result.
+   Use focused OCR or a screenshot when the UI does not expose enough semantics.
+
+Native desktop tools use platform APIs without a Python/JavaScript runtime.
+The optional Chrome DevTools launcher has separate Node/Chrome requirements;
+it is not the paired-page [Chrome bridge](chrome/README.md).
+
+## Tools (current source)
 
 | Tool | What it does |
 | --- | --- |
@@ -37,6 +70,9 @@ stdio or Streamable HTTP.
 
 ## Requirements
 
+- **Linux:** the source builds a headless MCP server for protocol checks; native
+  desktop actions return an unsupported/headless error. This is not Linux
+  desktop automation.
 - **macOS 14+** for the macOS desktop backend. The release archive is universal
   and runs on Apple Silicon and Intel Macs.
 - **Windows x86_64 or ARM64** for the Windows desktop backend. GitHub Releases
@@ -153,6 +189,9 @@ which requires a universal binary and the matching Cargo version as arguments.
 
 ## Use it from an MCP client
 
+For **v0.2.1**, configure `"args": []` for direct stdio. The managed
+configuration below requires current source and, on macOS, Nova.app.
+
 **Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
 config. Claude Desktop uses
 `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS and
@@ -239,8 +278,8 @@ On macOS, a recommended two-server configuration is:
 }
 ```
 
-For a standalone source/release binary, use the same binary path and
-`["chrome-devtools"]`. If a GUI client cannot find `npx`, add
+For a standalone binary built from current source, use its absolute path and
+`["chrome-devtools"]`. Published v0.2.1 does not include this subcommand. If a GUI client cannot find `npx`, add
 `"--npx", "/absolute/path/to/npx"` after the subcommand.
 
 The default launches a new temporary, isolated Chrome profile. Usage
