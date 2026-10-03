@@ -25,6 +25,14 @@ let pairingCandidate = null;
 let pairingCandidateDraftRoute = null;
 let pairingCandidateRevision = 0;
 let childAccessRoute = null;
+// Browser metadata belongs to the same volatile snapshot as the top bridge's
+// private DOM handles. It never grants authority independently of that snapshot.
+let aggregateSnapshot = null;
+
+function frameSignature(frame) {
+  return JSON.stringify([frame.frameId, frame.documentId, frame.parentFrameId,
+    frame.parentDocumentId ?? null, frame.documentLifecycle, frame.errorOccurred, frame.url, frame.frameType]);
+}
 
 function childAccessEnabled(route = state.paired?.route) {
   if (!sameRoute(childAccessRoute, state.paired?.route, true)) childAccessRoute = null;
@@ -138,6 +146,7 @@ function connectNative() {
 
 async function revokeContentRoute(route) {
   if (!route) return;
+  if (sameRoute(aggregateSnapshot?.route, route, true)) aggregateSnapshot = null;
   if (sameRoute(childAccessRoute, route, true)) childAccessRoute = null;
   let timer;
   try {
@@ -154,10 +163,12 @@ async function revokeContentRoute(route) {
   }
 }
 
-async function sendContent(route, action, args, deadline = Date.now() + CONTENT_TIMEOUT_MS, includeChildFrames = false) {
+async function sendContent(route, action, args, deadline = Date.now() + CONTENT_TIMEOUT_MS, includeChildFrames = false,
+  childValidated = null, assertCurrent = () => {}) {
   // Chrome checks the actual document's current host/activeTab access. The
   // packaged bootstrap is idempotent and never reads semantic page content.
   await beforeDeadline(() => bootstrapScripts(route.tabId, route.documentId), deadline);
+  assertCurrent();
   if (action !== "ping" && state.checkPairedRoute(route)) {
     throw new ProtocolError("page_access_revoked", "The paired page was revoked; enable and pair it again");
   }
@@ -169,6 +180,7 @@ async function sendContent(route, action, args, deadline = Date.now() + CONTENT_
     args: args ?? {},
     deadline,
     includeChildFrames,
+    childValidated,
   };
   return beforeDeadline(() => chrome.tabs.sendMessage(route.tabId, message,
     { documentId: route.documentId }), deadline);
@@ -176,6 +188,8 @@ async function sendContent(route, action, args, deadline = Date.now() + CONTENT_
 
 async function readWithChildren(route, args, deadline) {
   const enabled = childAccessEnabled(route);
+  const aggregate = enabled ? { route, snapshotId: null, children: new Map(), consumed: false } : null;
+  aggregateSnapshot = aggregate;
   const content = await sendContent(route, "read", args, deadline, enabled);
   if (!enabled || !content?.ok || content.action !== "read") return content;
   const { result, readBudget: budget } = content;
@@ -183,10 +197,11 @@ async function readWithChildren(route, args, deadline) {
   if (!budget || !coverage || !sameRoute(content.route, route, true)) {
     throw new ProtocolError("content_unavailable", "The page bridge could not share the read budget; enable and pair again");
   }
+  aggregate.snapshotId = result.snapshotId;
   const reasons = new Set();
   let childNodes = [];
   let documents = 1;
-  const current = () => childAccessEnabled(route) && !state.checkPairedRoute(route);
+  const current = () => aggregateSnapshot === aggregate && childAccessEnabled(route) && !state.checkPairedRoute(route);
   const spend = () => {
     if (budget.remaining <= 0 || Date.now() >= deadline) return false;
     budget.remaining -= 1;
@@ -196,8 +211,7 @@ async function readWithChildren(route, args, deadline) {
     if (!current()) throw new ProtocolError("page_access_revoked", "Child access was revoked");
     return beforeDeadline(() => chrome.webNavigation.getAllFrames({ tabId: route.tabId }), deadline);
   };
-  const signature = (frame) => JSON.stringify([frame.frameId, frame.documentId, frame.parentFrameId,
-    frame.parentDocumentId ?? null, frame.documentLifecycle, frame.errorOccurred, frame.url]);
+  const signature = frameSignature;
   try {
     if (!current() || !(await beforeDeadline(() => chrome.permissions.contains({ permissions: ["webNavigation"] }), deadline))) {
       reasons.add("permission_revoked");
@@ -264,7 +278,8 @@ async function readWithChildren(route, args, deadline) {
               if (installed.length === 1 && installed[0].frameId === frame.frameId && installed[0].documentId === frame.documentId && current()) {
                 read = await beforeDeadline(() => chrome.scripting.executeScript({ target, world: "ISOLATED",
                   func: (options) => globalThis.NovaSemantic.readChildDocument(options),
-                  args: [{ frameId: frame.frameId, documentId: frame.documentId, depth, budget }],
+                  args: [{ frameId: frame.frameId, documentId: frame.documentId, depth, budget,
+                    snapshotId: result.snapshotId, route }],
                 }), deadline);
               }
             } catch (error) {
@@ -282,7 +297,15 @@ async function readWithChildren(route, args, deadline) {
             const child = read[0].result;
             Object.assign(budget, child.budget);
             if (child.reason) { reasons.add(child.reason); continue; }
+            const chain = [];
+            for (let ancestor = frame; ancestor; ancestor = byId.get(ancestor.parentFrameId)) {
+              if (!spend()) { reasons.add("budget_exhausted"); break; }
+              chain.push({ frameId: ancestor.frameId, signature: signature(ancestor) });
+            }
+            if (chain.at(-1)?.frameId !== 0) break;
             childNodes.push(...child.nodes);
+            const proof = { frameId: frame.frameId, documentId: frame.documentId, chain };
+            for (const node of child.nodes) aggregate.children.set(node.nodeId, proof);
             documents += 1;
             for (const sibling of [...(children.get(frame.frameId) ?? [])].reverse()) {
               stack.push({ frame: sibling, depth: depth + 1 });
@@ -313,12 +336,110 @@ async function readWithChildren(route, args, deadline) {
     reasons.add(error?.code === "content_timeout" ? "deadline" : "metadata_unavailable");
   }
   if (!current()) { childNodes = []; documents = 1; reasons.add("permission_revoked"); }
+  if (aggregateSnapshot !== aggregate) return { ok: false, action: "read", route,
+    code: "stale_snapshot", message: "A newer snapshot or authority replaced this read" };
+  const included = new Set(childNodes.map((node) => node.nodeId));
+  for (const id of aggregate.children.keys()) if (!included.has(id)) aggregate.children.delete(id);
+  // An exhausted child read retains #76's partial top-only result. Its empty
+  // browser proof cannot authorize any retained, unpublished private handle.
+  if (Date.now() < deadline && current()) {
+    try {
+      const finished = await beforeDeadline(() => chrome.scripting.executeScript({
+        target: { tabId: route.tabId, documentIds: [route.documentId] }, world: "ISOLATED",
+        func: (options) => globalThis.NovaContentBridge.finishChildren(options.snapshotId, options.route, options.nodeIds),
+        args: [{ snapshotId: result.snapshotId, route, nodeIds: [...included] }],
+      }), deadline);
+      if (finished.length !== 1 || finished[0].frameId !== 0 || finished[0].documentId !== route.documentId ||
+          finished[0].result !== true || !current()) return { ok: false, action: "read", route,
+        code: "stale_snapshot", message: "Aggregate snapshot changed; read again" };
+    } catch (error) {
+      childNodes = []; documents = 1; aggregate.children.clear();
+      reasons.add(error?.code === "content_timeout" ? "deadline" : "metadata_unavailable");
+    }
+  }
   result.nodes.push(...childNodes);
   result.truncated ||= budget.truncated || reasons.has("budget_exhausted") || reasons.has("deadline");
   coverage.documents = documents;
   coverage.reasons = [...reasons];
   coverage.status = reasons.size || result.truncated ? "partial" : "complete";
   return content;
+}
+
+async function checkChildBrowser(route, proof, deadline, remainingVisits = 10_000) {
+  const current = () => {
+    if (!childAccessEnabled(route) || state.checkPairedRoute(route)) {
+      throw new ProtocolError("page_access_revoked", "Child authority was revoked");
+    }
+  };
+  current();
+  if (!(await beforeDeadline(() => chrome.permissions.contains({ permissions: ["webNavigation"] }), deadline))) {
+    throw new ProtocolError("page_access_revoked", "Frame metadata permission was removed");
+  }
+  const frames = await beforeDeadline(() => chrome.webNavigation.getAllFrames({ tabId: route.tabId }), deadline);
+  current();
+  if (!Array.isArray(frames) || !Number.isFinite(remainingVisits) || frames.length + proof.chain.length > remainingVisits) {
+    throw new ProtocolError("no_observed_effect", "Child identity could not be proved within the remaining observation budget");
+  }
+  const byId = new Map();
+  for (const frame of frames) {
+    remainingVisits -= 1;
+    if (byId.has(frame.frameId)) throw new ProtocolError("stale_node", "Child browser identity changed");
+    byId.set(frame.frameId, frame);
+  }
+  for (const ancestor of proof.chain) {
+    remainingVisits -= 1;
+    if (!byId.has(ancestor.frameId) || frameSignature(byId.get(ancestor.frameId)) !== ancestor.signature) {
+      throw new ProtocolError("stale_node", "Child browser document or ancestry changed");
+    }
+  }
+  current();
+  return remainingVisits;
+}
+
+async function mutateWithChildren(route, action, args, deadline) {
+  const childId = typeof args?.nodeId === "string" && args.nodeId.startsWith("child:");
+  if (!childAccessEnabled(route)) {
+    if (childId) return { ok: false, action, route, code: "read_only_child", message: "Child activation is not enabled for this pairing" };
+    return sendContent(route, action, args, deadline);
+  }
+  const aggregate = aggregateSnapshot;
+  if (!aggregate || aggregate.consumed || !sameRoute(aggregate.route, route, true) || aggregate.snapshotId !== args?.snapshotId) {
+    return { ok: false, action, route, code: "stale_snapshot", message: "Aggregate snapshot is absent or stale; read again" };
+  }
+  // Consumption denies replay but retains this exact read's identity through
+  // pending replies. Consuming a newer read cannot restore an older receipt.
+  aggregate.consumed = true;
+  try {
+    if (!childId) return await sendContent(route, action, args, deadline);
+    if (action !== "activate") throw new ProtocolError("unsupported_child_action", "Child documents support only DOM activation");
+    const proof = aggregate.children.get(args.nodeId);
+    if (!proof) throw new ProtocolError("unknown_node", "Child node is not in this aggregate snapshot");
+    const remainingVisits = await checkChildBrowser(route, proof, deadline);
+    const assertCurrent = () => {
+      if (!childAccessEnabled(route) || state.checkPairedRoute(route)) throw new ProtocolError("page_access_revoked", "Child authority was revoked");
+      if (aggregateSnapshot !== aggregate) throw new ProtocolError("stale_snapshot", "A newer read replaced this activation");
+    };
+    const content = await sendContent(route, action, args, deadline, false,
+      { frameId: proof.frameId, documentId: proof.documentId, remainingVisits }, assertCurrent);
+    if (content?.ok) {
+      await checkChildBrowser(route, proof, deadline, content.childRemainingVisits);
+      assertCurrent();
+    }
+    return content;
+  } catch (error) {
+    // Release the bridge's matching private handles even when a preflight
+    // rejects. Never discard a concurrently produced newer snapshot.
+    try {
+      await beforeDeadline(() => chrome.scripting.executeScript({
+        target: { tabId: route.tabId, documentIds: [route.documentId] }, world: "ISOLATED",
+        func: (id) => globalThis.NovaContentBridge?.discardSnapshot(id), args: [aggregate.snapshotId],
+      }), deadline);
+    } catch { /* Worker authority was already consumed. */ }
+    if (error?.code === "content_timeout") throw error;
+    const known = ["page_access_revoked", "stale_snapshot", "stale_node", "unknown_node", "unsupported_child_action", "no_observed_effect"];
+    return { ok: false, action, route, code: known.includes(error?.code) ? error.code : "stale_node",
+      message: "Child activation could not be confirmed. DOM dispatch may already have had side effects; read or inspect the page before retrying." };
+  }
 }
 
 async function dispatchRequest(request) {
@@ -362,16 +483,10 @@ async function dispatchRequest(request) {
   if (!decision.execute) return;
 
   try {
-    if (["activate", "focus", "set_value", "scroll"].includes(request.action) &&
-        typeof request.args?.nodeId === "string" && request.args.nodeId.startsWith("child:")) {
-      postNative(state.failExecution(request.requestId, request.action, decision.route,
-        "read_only_child", "Child document nodes are read-only"));
-      return;
-    }
     const deadline = Date.now() + CONTENT_TIMEOUT_MS;
     const content = request.action === "read"
       ? await readWithChildren(decision.route, request.args, deadline)
-      : await sendContent(decision.route, request.action, request.args, deadline);
+      : await mutateWithChildren(decision.route, request.action, request.args, deadline);
     if (!content || content.action !== request.action) {
       postNative(state.complete(request.requestId, content?.action ?? "status", decision.route, undefined));
       return;
@@ -561,6 +676,7 @@ function removedHostMatches(pattern, rawUrl) {
 }
 
 function revokeTabAccess(tabId, reason) {
+  if (aggregateSnapshot?.route.tabId === tabId) aggregateSnapshot = null;
   if (childAccessRoute?.tabId === tabId) childAccessRoute = null;
   const entry = state.routes.get(tabId);
   if (pairingCandidateRoute()?.tabId === tabId) invalidatePairingCandidate();
@@ -738,7 +854,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void (async () => {
       const route = state.paired?.route;
       if (!route || !sameRoute(message.route, route, true)) {
-        throw new ProtocolError("stale_pair", "Review and pair the page before enabling child reads");
+        throw new ProtocolError("stale_pair", "Review and pair the page before enabling child reads and activation");
       }
       const granted = await chrome.permissions.contains({ permissions: ["webNavigation"] });
       if (!granted) throw new ProtocolError("frame_permission_denied", "Frame metadata permission was denied; top-document reads remain available");

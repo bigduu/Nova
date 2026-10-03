@@ -859,6 +859,7 @@ async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7,
     } } };
   vm.runInContext(semanticSource, contexts.get(0));
   await vm.runInContext(contentSource, contexts.get(0));
+  top.NovaContentBridge = contexts.get(0).NovaContentBridge;
   let scriptHook = () => {};
   let queryHook = () => {};
   fixture.chrome.scripting.executeScript = async (options) => {
@@ -868,11 +869,12 @@ async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7,
       ? frames.find((entry) => entry.documentId === options.target.documentIds[0]) : frames.find((entry) => entry.frameId === 0);
     assert.ok(frame, "only exact inventoried documents may be injected");
     targets.push({ frameId: frame.frameId, documentId: frame.documentId,
-      files: options.files, read: Boolean(options.func), budget: structuredClone(options.args?.[0]?.budget) });
+      files: options.files, read: Boolean(options.func && frame.frameId), budget: structuredClone(options.args?.[0]?.budget) });
     const replacement = await scriptHook(options, frame);
     if (replacement) return replacement;
     let result;
-    if (!frame.frameId) { await contexts.get(0).NovaContentBridge.enable(); result = { ok: true }; }
+    if (!frame.frameId && options.files) { await contexts.get(0).NovaContentBridge.enable(); result = { ok: true }; }
+    else if (!frame.frameId) result = vm.runInContext(`(${options.func.toString()})`, contexts.get(0))(structuredClone(options.args?.[0]));
     else if (options.files) vm.runInContext(semanticSource, contexts.get(frame.frameId));
     else result = vm.runInContext(`(${options.func.toString()})`, contexts.get(frame.frameId))(structuredClone(options.args[0]));
     return [{ frameId: frame.frameId, documentId: frame.documentId, result }];
@@ -891,6 +893,7 @@ async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7,
   } };
   const route = await fixture.pair();
   let readId = 0;
+  let mutationId = 0;
   return { ...fixture, frames, route, documents, owners, targets, queries,
     hookScript: (hook) => { scriptHook = hook; }, hookQuery: (hook) => { queryHook = hook; },
     async enableChildren() {
@@ -900,6 +903,11 @@ async function childWorkerFixture(t, frames = [frameRecord(9, 3), frameRecord(7,
     async read(args = {}) {
       const id = `child-read-${++readId}`;
       fixture.request(id, "read", route, args);
+      return waitForValue(() => fixture.posted.find((message) => message.requestId === id), id);
+    },
+    async mutate(read, node, action = "activate", args = {}) {
+      const id = `child-mutation-${++mutationId}`;
+      fixture.request(id, action, route, { snapshotId: read.result.snapshotId, nodeId: node.nodeId, ...args });
       return waitForValue(() => fixture.posted.find((message) => message.requestId === id), id);
     },
   };
@@ -959,7 +967,7 @@ test("metadata removal fences an enable awaiting a previously granted permission
   assert.equal(f.queries.length, 0);
 });
 
-test("nested same-URL documents read in browser preorder and child mutations never reach the top", async (t) => {
+test("nested same-URL controls activate exactly and consume the aggregate across top and children", async (t) => {
   const f = await childWorkerFixture(t);
   await f.enableChildren();
   const read = await f.read();
@@ -969,25 +977,315 @@ test("nested same-URL documents read in browser preorder and child mutations nev
   const child = read.result.nodes[1];
   assert.ok(child.nodeId.startsWith("child:3:document-child-3:"));
   assert.notEqual(child.nodeId, read.result.nodes[3].nodeId);
-  assert.ok(read.result.nodes.slice(1).every((node) => !node.actions.length && !Object.hasOwn(node, "bounds")));
-  const targets = f.targets.length;
-  const sends = f.contentMessages.length;
-  for (const action of ["activate", "focus", "set_value", "scroll"]) {
-    f.request(`reject-child-${action}`, action, f.route, { snapshotId: read.result.snapshotId,
-      nodeId: child.nodeId, value: "Must not write", direction: "down" });
-    const rejected = await waitForValue(() => f.posted.find((reply) => reply.requestId === `reject-child-${action}`), action);
-    assert.equal(rejected.error.code, "read_only_child");
-  }
-  assert.equal(f.targets.length, targets, "reserved mutations cannot even bootstrap the top bridge");
-  assert.equal(f.contentMessages.length, sends);
+  assert.ok(read.result.nodes.slice(1).every((node) => node.actions.join() === "activate" && !Object.hasOwn(node, "bounds")));
+  assert.equal((await f.mutate(read, child)).status, "ok");
+  assert.equal(f.documents.get(3).body.firstChild.clicks, 1);
+  for (const id of [0, 7, 8, 9]) assert.equal(f.documents.get(id).body.firstChild.clicks, 0);
+  assert.equal((await f.mutate(read, read.result.nodes[2])).error.code, "stale_snapshot");
+  assert.equal((await f.mutate(read, read.result.nodes[0])).error.code, "stale_snapshot");
+  const fresh = await f.read();
   const control = f.documents.get(0).body.firstChild;
   assert.equal(control.clicks, 0);
-  f.request("actual-top-action", "activate", f.route, { snapshotId: read.result.snapshotId, nodeId: read.result.nodes[0].nodeId });
+  f.request("actual-top-action", "activate", f.route, { snapshotId: fresh.result.snapshotId, nodeId: fresh.result.nodes[0].nodeId });
   assert.equal((await waitForValue(() => f.posted.find((reply) => reply.requestId === "actual-top-action"), "top action")).status, "ok");
   assert.equal(control.clicks, 1);
-  f.request("consumed-top-action", "activate", f.route, { snapshotId: read.result.snapshotId, nodeId: read.result.nodes[0].nodeId });
+  f.request("consumed-top-action", "activate", f.route, { snapshotId: fresh.result.snapshotId, nodeId: fresh.result.nodes[0].nodeId });
   assert.equal((await waitForValue(() => f.posted.find((reply) => reply.requestId === "consumed-top-action"), "consumed action")).error.code, "stale_snapshot");
 });
+
+test("same-label sibling and nested child handles ignore the other active tab", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  for (const [id, document] of f.documents) if (id) document.body.firstChild.attributes["aria-label"] = "Shared child action";
+  f.chrome.tabs.query = async () => [{ id: 999, url: "https://other.example/active", title: "Other tab" }];
+  for (const frameId of [7, 9, 8, 3]) {
+    const read = await f.read();
+    const node = read.result.nodes.find((entry) => entry.nodeId.startsWith(`child:${frameId}:`));
+    assert.equal(node.name, "Shared child action");
+    assert.equal((await f.mutate(read, node)).status, "ok");
+    assert.equal(f.documents.get(frameId).body.firstChild.clicks, 1);
+    assert.equal((await f.mutate(read, node)).error.code, "stale_snapshot");
+  }
+  assert.equal(f.documents.get(0).body.firstChild.clicks, 0);
+});
+
+test("child node and owner changes reject before dispatch and consume every aggregate handle", async (t) => {
+  for (const kind of ["rename", "role", "disabled", "hidden", "private target", "owner hidden", "owner private", "owner sandbox", "owner replacement", "document", "browser document", "parent identity"]) {
+    await t.test(kind, async (child) => {
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const read = await f.read();
+      const node = read.result.nodes.find((entry) => entry.nodeId.startsWith("child:7:"));
+      const control = f.documents.get(7).body.firstChild;
+      const owner = f.owners.get(7);
+      if (kind === "rename") control.attributes["aria-label"] = "DO_NOT_ECHO_CHANGED_LABEL";
+      if (kind === "role") control.attributes.role = "heading";
+      if (kind === "disabled") control.disabled = true;
+      if (kind === "hidden") control.hidden = true;
+      if (kind === "private target") control.attributes["data-private"] = "";
+      if (kind === "owner hidden") owner.hidden = true;
+      if (kind === "owner private") owner.attributes["data-private"] = "";
+      if (kind === "owner sandbox") owner.attributes.sandbox = "allow-same-origin allow-scripts";
+      if (kind === "owner replacement") f.documents.get(7).defaultView.frameElement = Object.assign(Object.create(Object.getPrototypeOf(owner)), owner);
+      if (kind === "document") owner.contentDocument = {};
+      if (kind === "browser document") f.frames.find((entry) => entry.frameId === 7).documentId = "replacement-document";
+      if (kind === "parent identity") f.frames.find((entry) => entry.frameId === 7).parentDocumentId = "replacement-parent";
+      const result = await f.mutate(read, node);
+      assert.notEqual(result.status, "ok");
+      assert.equal(JSON.stringify(result).includes("DO_NOT_ECHO"), false);
+      for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+      assert.equal((await f.mutate(read, read.result.nodes[0])).error.code, "stale_snapshot");
+    });
+  }
+});
+
+test("unsupported and forged child requests consume the aggregate without other dispatch", async (t) => {
+  for (const action of ["focus", "set_value", "scroll", "forged", "coordinates"]) {
+    await t.test(action, async (child) => {
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const read = await f.read();
+      const node = action === "forged" ? { nodeId: "child:7:document-child-7:forged" } : read.result.nodes[1];
+      const result = await f.mutate(read, node, ["forged", "coordinates"].includes(action) ? "activate" : action,
+        action === "coordinates" ? { x: 1, y: 2 } : { value: "DO_NOT_WRITE", direction: "down" });
+      assert.notEqual(result.status, "ok");
+      assert.equal((await f.mutate(read, read.result.nodes[0])).error.code, "stale_snapshot");
+      for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+    });
+  }
+});
+
+test("child activation reuses effect privacy, inspection guidance and no raw receipts", async (t) => {
+  for (const kind of ["public", "own label", "inert", "trusted-only", "hidden-only", "private-only"]) {
+    await t.test(kind, async (child) => {
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const document = f.documents.get(7);
+      const control = document.body.firstChild;
+      const field = new control.constructor("INPUT", document, { type: kind === "private-only" ? "password" : "text", "aria-label": "Effect field" });
+      field.parentElement = document.body;
+      field.value = "EXCLUDE_INITIAL_VALUE";
+      field.hidden = kind === "hidden-only";
+      control.nextSibling = field;
+      control.getBoundingClientRect = () => assert.fail("Child coordinates must not be calculated");
+      control.click = () => {
+        control.clicks += 1;
+        if (["public", "hidden-only", "private-only"].includes(kind)) field.value = "EXCLUDE_CHANGED_VALUE";
+        if (kind === "own label") control.attributes["aria-label"] = "Changed own public label";
+        if (kind === "trusted-only" && ({ isTrusted: false }).isTrusted) field.value = "EXCLUDE_CHANGED_VALUE";
+      };
+      const read = await f.read();
+      const node = read.result.nodes.find((entry) => entry.nodeId.startsWith("child:7:") && entry.role === "button");
+      const result = await f.mutate(read, node);
+      if (["public", "own label"].includes(kind)) {
+        assert.equal(result.status, "ok");
+        assert.deepEqual(result.result, { activated: true });
+      } else {
+        assert.equal(result.error.code, "no_observed_effect");
+        assert.match(result.error.message, /DOM dispatch may already have had side effects/u);
+        assert.match(result.error.message, /read or inspect the page before retrying/u);
+      }
+      assert.equal(JSON.stringify(result).includes("EXCLUDE_"), false);
+      assert.equal(control.clicks, 1);
+      assert.equal((await f.mutate(read, node)).error.code, "stale_snapshot");
+      assert.equal(f.documents.get(0).body.firstChild.clicks, 0);
+    });
+  }
+});
+
+test("child owner invalidation and fresh reads after dispatch cannot produce stale success", async (t) => {
+  for (const kind of ["hidden", "private", "sandbox", "fresh read"]) {
+    await t.test(kind, async (child) => {
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const read = await f.read();
+      const control = f.documents.get(7).body.firstChild;
+      let fresh;
+      control.click = () => {
+        control.clicks += 1; control.attributes["aria-pressed"] = "true";
+        if (kind === "hidden") f.owners.get(7).hidden = true;
+        if (kind === "private") f.owners.get(7).attributes["data-private"] = "";
+        if (kind === "sandbox") f.owners.get(7).attributes.sandbox = "allow-same-origin";
+        if (kind === "fresh read") fresh = f.read();
+      };
+      const result = await f.mutate(read, read.result.nodes.find((entry) => entry.nodeId.startsWith("child:7:")));
+      assert.notEqual(result.status, "ok");
+      assert.equal(control.clicks, 1);
+      if (fresh) await fresh;
+      assert.equal((await f.mutate(read, read.result.nodes[0])).error.code, "stale_snapshot");
+    });
+  }
+});
+
+test("child activation retains the original deadline and bounded browser observation visits", async (t) => {
+  for (const kind of ["deadline", "browser budget"]) {
+    await t.test(kind, async (child) => {
+      let now = 100_000;
+      child.mock.method(Date, "now", () => now);
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const read = await f.read();
+      const control = f.documents.get(7).body.firstChild;
+      if (kind === "deadline") control.click = () => { control.clicks += 1; control.attributes["aria-pressed"] = "true"; now += 10_000; };
+      if (kind === "browser budget") f.hookQuery((count) => { if (count > 2) f.frames.push(...Array.from({ length: 10_001 }, (_, i) => frameRecord(100 + i, 0))); });
+      const result = await f.mutate(read, read.result.nodes.find((entry) => entry.nodeId.startsWith("child:7:")));
+      assert.notEqual(result.status, "ok");
+      assert.equal(control.clicks, kind === "deadline" ? 1 : 0);
+      assert.equal(f.documents.get(0).body.firstChild.clicks, 0);
+    });
+  }
+});
+
+test("paired lifecycle invalidation during child preflight prevents dispatch and stale success", async (t) => {
+  for (const kind of ["release", "metadata removal", "navigation", "disconnect"]) {
+    await t.test(kind, async (child) => {
+      const timers = new Set();
+      const setTimer = globalThis.setTimeout;
+      child.mock.method(globalThis, "setTimeout", (...args) => { const timer = setTimer(...args); timers.add(timer); return timer; });
+      child.after(() => { for (const timer of timers) clearTimeout(timer); });
+      const f = await childWorkerFixture(child);
+      await f.enableChildren();
+      const read = await f.read();
+      let reached;
+      let resume;
+      const started = new Promise((resolve) => { reached = resolve; });
+      const hold = new Promise((resolve) => { resume = resolve; });
+      f.hookQuery(async (count) => { if (count === 3) { reached(); await hold; } });
+      const node = read.result.nodes[1];
+      f.request("pending-child-lifecycle", "activate", f.route, { snapshotId: read.result.snapshotId, nodeId: node.nodeId });
+      await started;
+      if (kind === "release") assert.equal((await f.popup("release_pair")).ok, true);
+      if (kind === "metadata removal") { f.grants.delete("webNavigation"); f.chrome.permissions.onRemoved.emit({ permissions: ["webNavigation"] }); }
+      if (kind === "navigation") f.chrome.tabs.onUpdated.emit(f.tab.id, { status: "loading" });
+      if (kind === "disconnect") f.disconnect();
+      resume();
+      if (kind !== "disconnect") {
+        const result = await waitForValue(() => f.posted.find((message) => message.requestId === "pending-child-lifecycle"), kind);
+        assert.notEqual(result.status, "ok");
+      } else {
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(f.posted.some((message) => message.requestId === "pending-child-lifecycle" && message.status === "ok"), false);
+      }
+      const popup = await f.popup("popup_state");
+      assert.equal(popup.status.paired, false);
+      assert.equal(popup.childFrames.enabled, false);
+      for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+    });
+  }
+});
+
+test("worker restart and a fresh opt-in cannot reuse the old child aggregate", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  const read = await f.read();
+  // A real worker restart destroys its listeners. Model that boundary without
+  // leaving the retired test worker attached to the shared fake native port.
+  f.chrome.runtime.onMessage.listeners.length = 0;
+  f.chrome.runtime.connectNative().onMessage.listeners.length = 0;
+  await import(`../service-worker.js?child-action-restart=${++consentFixtureId}`);
+  const popup = (type, details = {}) => callListener(f.chrome.runtime.onMessage.listeners[0],
+    { channel: "nova-extension-v1", type, ...details }, { id: f.chrome.runtime.id, url: `chrome-extension://${f.chrome.runtime.id}/popup.html` });
+  try {
+    assert.equal((await popup("popup_state")).childFrames.enabled, false);
+    assert.equal((await popup("bootstrap_tab", { tabId: f.tab.id, url: f.tab.url })).ok, true);
+    f.request("pair-after-child-restart", "pair");
+    const candidate = await popup("popup_state");
+    const paired = await popup("confirm_pair", { candidateId: candidate.candidateId });
+    assert.equal(paired.ok, true);
+    assert.equal((await popup("enable_child_frames", { route: paired.route })).ok, true);
+    f.request("old-child-after-restart", "activate", paired.route,
+      { snapshotId: read.result.snapshotId, nodeId: read.result.nodes[1].nodeId });
+    const stale = await waitForValue(() => f.posted.find((message) => message.requestId === "old-child-after-restart"), "restarted child action");
+    assert.equal(stale.error.code, "stale_snapshot");
+    for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+  } finally {
+    await popup("deny_pair");
+  }
+});
+
+test("a fresh aggregate read awaiting bootstrap rejects an older child activation before dispatch", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  const read = await f.read();
+  let reachedPreflight;
+  let resumePreflight;
+  const preflightStarted = new Promise((resolve) => { reachedPreflight = resolve; });
+  const preflightHold = new Promise((resolve) => { resumePreflight = resolve; });
+  f.hookQuery(async (count) => { if (count === 3) { reachedPreflight(); await preflightHold; } });
+  const activation = f.mutate(read, read.result.nodes[1]);
+  await preflightStarted;
+  let reachedRead;
+  let resumeRead;
+  const readStarted = new Promise((resolve) => { reachedRead = resolve; });
+  const readHold = new Promise((resolve) => { resumeRead = resolve; });
+  let held = false;
+  f.hookScript(async (options, frame) => {
+    if (!held && frame.frameId === 0 && options.files) { held = true; reachedRead(); await readHold; }
+  });
+  const freshRead = f.read();
+  await readStarted;
+  resumePreflight();
+  const stale = await activation;
+  assert.equal(stale.error.code, "stale_snapshot");
+  for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+  resumeRead();
+  const fresh = await freshRead;
+  assert.equal(fresh.status, "ok");
+  assert.equal((await f.mutate(fresh, fresh.result.nodes[1])).status, "ok");
+});
+
+for (const freshTarget of ["child", "top"]) {
+  test(`a newer ${freshTarget} aggregate mutation cannot restore an old child receipt`, { timeout: 4000 }, async (t) => {
+    const f = await childWorkerFixture(t);
+    await f.enableChildren();
+    const oldRead = await f.read();
+    const oldNode = oldRead.result.nodes.find((node) => node.nodeId.startsWith("child:3:"));
+    let oldContentReply;
+    const originalSend = f.chrome.tabs.sendMessage;
+    f.chrome.tabs.sendMessage = async (...args) => {
+      const reply = await originalSend(...args);
+      if (args[1].action === "activate" && args[1].args?.snapshotId === oldRead.result.snapshotId) oldContentReply = structuredClone(reply);
+      return reply;
+    };
+    let reached;
+    let resume;
+    const started = new Promise((resolve) => { reached = resolve; });
+    const held = new Promise((resolve) => { resume = resolve; });
+    t.after(() => resume());
+    f.hookQuery(async (count) => {
+      if (count === 4) {
+        assert.equal(oldContentReply?.ok, true, "old content success precedes the held postflight");
+        assert.equal(f.documents.get(3).body.firstChild.clicks, 1);
+        reached();
+        await held;
+      }
+    });
+    const oldPending = f.mutate(oldRead, oldNode);
+    await started;
+    const freshRead = await f.read();
+    assert.equal(freshRead.status, "ok");
+    assert.notEqual(freshRead.result.snapshotId, oldRead.result.snapshotId);
+    const freshNode = freshTarget === "top" ? freshRead.result.nodes[0]
+      : freshRead.result.nodes.find((node) => node.nodeId.startsWith("child:7:"));
+    const freshResult = await f.mutate(freshRead, freshNode);
+    assert.equal(freshResult.status, "ok", "a valid newer mutation consumes the replacement aggregate");
+    const queriesBeforeResume = f.queries.length;
+    assert.equal(queriesBeforeResume, freshTarget === "child" ? 8 : 6);
+    resume();
+    const oldResult = await oldPending;
+    const dispatches = Object.fromEntries([...f.documents].map(([id, document]) => [id, document.body.firstChild.clicks]));
+    console.log("NOVA80_AGGREGATE_FRESHNESS " + JSON.stringify({ freshTarget, oldContentReply,
+      oldSnapshotId: oldRead.result.snapshotId, freshSnapshotId: freshRead.result.snapshotId,
+      freshResult, oldResult, queriesBeforeResume, dispatches }));
+    assert.deepEqual(dispatches, { 0: freshTarget === "top" ? 1 : 0, 3: 1, 7: freshTarget === "child" ? 1 : 0, 8: 0, 9: 0 });
+    assert.equal(oldResult.status, "error", "the newer read and mutation must deny the old success receipt");
+    assert.equal(oldResult.error.code, "stale_snapshot");
+    assert.equal(oldResult.result, undefined);
+    assert.match(oldResult.error.message, /DOM dispatch may already have had side effects; read or inspect/);
+    assert.equal((await f.mutate(oldRead, oldNode)).error.code, "stale_snapshot");
+    assert.equal((await f.mutate(freshRead, freshNode)).error.code, "stale_snapshot");
+  });
+}
 
 test("cross-origin ancestry including a returned top origin is never injected", async (t) => {
   const f = await childWorkerFixture(t, [frameRecord(0, -1), frameRecord(1, 0, "https://other.example"), frameRecord(2, 1), frameRecord(3, 0)]);
@@ -1109,6 +1407,23 @@ test("one absolute content deadline spans root bootstrap and every child", async
   assert.equal(read.result.nodes.length, 1, "expired aggregation discards already read child data");
   assert.ok(read.result.frameCoverage.reasons.includes("deadline"));
   assert.equal(f.targets.filter((target) => target.read).length, 1);
+});
+
+test("expired child handle finalization retains a partial top snapshot and denies unpublished children", async (t) => {
+  const f = await childWorkerFixture(t);
+  await f.enableChildren();
+  f.hookScript((options, frame) => {
+    if (frame.frameId === 0 && options.func) throw Object.assign(new Error("content script timed out"), { code: "content_timeout" });
+  });
+  const read = await f.read();
+  assert.equal(read.status, "ok");
+  assert.deepEqual(read.result.nodes.map((node) => node.name), ["Top action"]);
+  assert.ok(read.result.frameCoverage.reasons.includes("deadline"));
+  const unpublished = { nodeId: "child:3:document-child-3:n1" };
+  assert.equal((await f.mutate(read, unpublished)).error.code, "unknown_node");
+  for (const document of f.documents.values()) assert.equal(document.body.firstChild.clicks, 0);
+  const fresh = await f.read();
+  assert.equal((await f.mutate(fresh, fresh.result.nodes[0])).status, "ok");
 });
 
 for (const mode of ["navigation", "metadata removal", "popup release"]) {
