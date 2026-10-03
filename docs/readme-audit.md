@@ -26,3 +26,16 @@
 
 No native macOS/Windows UI acceptance or performance claim is made by this
 README refresh. No functionality, release files, or Zenith pins were changed.
+
+## Approved brand illustration
+
+The user-approved nature illustration is saved at `docs/assets/nova-nature-hero.png`.
+The original PNG was visually inspected and decoded, and its SHA-256 matched
+the approved image package. It is a brand illustration, not a software screenshot;
+the README alt text and visible caption say so. Existing source/release and
+recording limits still apply. The older artwork remains in repository history
+and any existing SVG asset is preserved.
+
+- Pixels: 1672 × 941 (RGB PNG)
+- Bytes: 1994655
+- SHA-256: `d90c130139531de6d600c74cb880d9452ed9fb90a0d2d2cdfcb307b3eb7f736f`

@@ -1,5 +1,9 @@
 # Nova
 
+![Nova brand illustration: a mechanical arm operating a symbolic interface in a forest.](docs/assets/nova-nature-hero.png)
+
+*Brand illustration, not a software screenshot. A mechanical arm represents computer interaction.*
+
 **Let your agent work with desktop apps through MCP.** Nova provides semantic
 UI reads and actions, screenshots, keyboard/mouse input, OCR, and clipboard
 access on macOS and Windows. Use it when a task needs a real application's UI:
