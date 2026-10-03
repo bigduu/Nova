@@ -105,6 +105,9 @@
     if (["permission_removed", "site_permission_removed"].includes(reason)) {
       return "Site access was removed. Enable the tab or allow its site, then ask Nova to pair again.";
     }
+    if (reason === "frame_permission_removed") {
+      return "Frame metadata permission was removed. Ask Nova to pair again, then enable child reads and activation if needed.";
+    }
     if (["popup_release", "released", "pair_denied"].includes(reason)) return "Pairing ended. Ask Nova for a new Pair request when ready.";
     return "No live pairing request. Ask Nova to pair, then confirm the reviewed document within 30 seconds.";
   }

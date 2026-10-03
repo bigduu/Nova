@@ -1784,6 +1784,9 @@ for (const mode of ["native release", "popup release", "content timeout"]) {
   test(`${mode} completes when exact-document revocation remains unanswered`, async (t) => {
     const fixture = await consentFixture(t);
     const route = await fixture.pair();
+    const view = openPopup(fixture);
+    await waitForValue(() => !view.elements.paired.hidden, "paired popup before unanswered cleanup");
+    const noticesBefore = fixture.notifications.length;
     const send = fixture.chrome.tabs.sendMessage;
     const targets = [];
     fixture.chrome.tabs.sendMessage = (tabId, message, options) => {
@@ -1821,10 +1824,25 @@ for (const mode of ["native release", "popup release", "content timeout"]) {
     }
     await waitForValue(() => targets.length, "unanswered revocation attempt");
     assert.deepEqual(targets, [{ tabId: route.tabId, documentId: route.documentId }]);
+    const reason = mode === "native release" ? "released" : mode === "popup release" ? "popup_release"
+      : "content_transport_ambiguous";
+    assert.deepEqual(fixture.notifications.slice(noticesBefore).map((notice) => notice.reason), [reason],
+      "popup notification follows authority revocation immediately, before content cleanup settles");
+    assert.equal(view.elements.paired.hidden, true, "the open popup hides revoked consent immediately");
+    assert.equal(view.elements.release.disabled, true);
+    assert.equal((await fixture.popup("popup_state")).status.paired, false);
     assert.equal(popupResult, undefined);
     assert.equal(fixture.posted.some((message) => ["unanswered-release", "unanswered-value"].includes(message.requestId)), false);
     const pending = deadlines.filter((deadline) => !deadline.cleared);
     assert.equal(pending.length, 1, "revocation must retain the existing content deadline");
+    fixture.sender.documentId = "replacement-during-old-cleanup";
+    assert.equal((await fixture.enable()).ok, true);
+    fixture.request("unanswered-repair", "pair");
+    const candidate = await fixture.popup("popup_state");
+    const repaired = await fixture.popup("confirm_pair", { candidateId: candidate.candidateId });
+    assert.equal(repaired.ok, true);
+    await waitForValue(() => !view.elements.paired.hidden, "new pairing while old cleanup remains unanswered");
+    const noticesAfterRepair = fixture.notifications.length;
     pending[0].callback();
     if (mode === "popup release") assert.equal((await popupReply).ok, true);
     else {
@@ -1834,9 +1852,64 @@ for (const mode of ["native release", "popup release", "content timeout"]) {
       else assert.equal(result.error.code, "ambiguous_content_timeout");
     }
     assert.equal(pending[0].cleared, true);
-    assert.equal((await fixture.popup("popup_state")).status.paired, false);
+    const current = await fixture.popup("popup_state");
+    assert.equal(current.status.paired, true);
+    assert.deepEqual(current.status.route, repaired.route);
+    assert.equal(fixture.notifications.length, noticesAfterRepair,
+      "late old cleanup cannot repeat a stale popup reason or invalidate newly reviewed consent");
+    assert.equal(view.elements.paired.hidden, false);
+    const revokedEvent = fixture.posted.findLast((message) => message.name === "route_revoked" && message.details.reason === reason);
+    assert.ok(revokedEvent, "the original native revocation event is still sent after cleanup");
+    assert.equal(revokedEvent.epoch, route.epoch + 1);
+    if (mode !== "popup release") {
+      const requestId = mode === "native release" ? "unanswered-release" : "unanswered-value";
+      assert.ok(fixture.posted.findIndex((message) => message.requestId === requestId)
+        < fixture.posted.indexOf(revokedEvent), "the native response still precedes its revocation event");
+    }
   });
 }
+
+for (const paired of [true, false]) {
+  test(`frame-only permission removal preserves site access and updates an open ${paired ? "paired" : "unpaired"} popup`, async (t) => {
+    const fixture = await consentFixture(t);
+    fixture.grants.add("https://consent.example/*");
+    fixture.grants.add("webNavigation");
+    const route = paired ? await fixture.pair() : null;
+    if (route) assert.equal((await fixture.popup("enable_child_frames", { route })).ok, true);
+    else await fixture.enable();
+    const view = openPopup(fixture);
+    await waitForValue(() => view.elements.connection.textContent === "Nova.app connected", "initial frame permission popup");
+    const noticesBefore = fixture.notifications.length;
+    fixture.grants.delete("webNavigation");
+    fixture.chrome.permissions.onRemoved.emit({ permissions: ["webNavigation"] });
+    assert.deepEqual(fixture.notifications.slice(noticesBefore).map((notice) => notice.reason), ["frame_permission_removed"]);
+    await waitForValue(() => !view.elements.idle.hidden && view.elements.idle.textContent !== "Updating Nova state…",
+      "frame-only removal recovery");
+    const current = await fixture.popup("popup_state");
+    assert.equal(current.status.paired, false);
+    assert.equal(current.access.siteAllowed, true);
+    assert.equal(current.childFrames.permissionGranted, false);
+    assert.equal(current.childFrames.enabled, false);
+    assert.equal(view.elements["revoke-site"].hidden, false, "the site grant remains visible");
+    assert.match(view.elements.idle.textContent, /Frame metadata permission was removed.*pair again/u);
+    assert.doesNotMatch(view.elements.idle.textContent, /Site access was removed/u);
+    assert.equal(view.elements["remove-frame-permission"].hidden, true);
+  });
+}
+
+test("frame metadata additions refresh controls using their actual permission reason", async (t) => {
+  const fixture = await consentFixture(t);
+  await fixture.enable();
+  const view = openPopup(fixture);
+  await waitForValue(() => view.elements.connection.textContent === "Nova.app connected", "initial metadata permission popup");
+  const noticesBefore = fixture.notifications.length;
+  fixture.grants.add("webNavigation");
+  fixture.chrome.permissions.onAdded.emit({ permissions: ["webNavigation"] });
+  assert.deepEqual(fixture.notifications.slice(noticesBefore).map((notice) => notice.reason), ["frame_permission_added"]);
+  await waitForValue(() => !view.elements["remove-frame-permission"].hidden, "metadata grant controls");
+  assert.equal(view.elements["enable-frames"].disabled, true, "metadata permission alone cannot pair a document");
+});
+
 function openPopup(fixture) {
   const elements = Object.fromEntries([...popupMarkup.matchAll(/id="([^"]+)"([^>]*)/gu)].map(([, id, attributes]) => [id, {
     textContent: "", hidden: /\bhidden\b/u.test(attributes), disabled: /\bdisabled\b/u.test(attributes), listeners: new Map(),

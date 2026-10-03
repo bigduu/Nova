@@ -95,7 +95,7 @@ function postNative(message) {
   }
 }
 
-function postEvent(name, details = {}, epoch = state.epoch) {
+function postEvent(name, details = {}, epoch = state.epoch, notifyPopupChange = true) {
   postNative({
     protocolVersion: PROTOCOL_VERSION,
     kind: "event",
@@ -103,7 +103,7 @@ function postEvent(name, details = {}, epoch = state.epoch) {
     epoch,
     details,
   });
-  if (["pair_pending", "pair_expired", "pair_confirmed", "route_revoked"].includes(name)) {
+  if (notifyPopupChange && ["pair_pending", "pair_expired", "pair_confirmed", "route_revoked"].includes(name)) {
     notifyPopup(details.reason ?? name);
   }
 }
@@ -478,10 +478,11 @@ async function dispatchRequest(request) {
 
   if (decision.response) {
     if (request.action === "release" && decision.response.result?.released) {
+      notifyPopup("released");
       await revokeContentRoute(decision.response.result.previousRoute);
     }
     postNative(decision.response);
-    if (request.action === "release") postEvent("route_revoked", { reason: "released" }, decision.response.epoch);
+    if (request.action === "release") postEvent("route_revoked", { reason: "released" }, decision.response.epoch, false);
     return;
   }
   if (decision.pendingPair) {
@@ -541,6 +542,7 @@ async function dispatchRequest(request) {
     );
     const revoked = state.epoch !== beforeEpoch;
     if (revoked) {
+      notifyPopup("content_transport_ambiguous");
       await revokeContentRoute(previousRoute);
     }
     postNative(response);
@@ -549,7 +551,7 @@ async function dispatchRequest(request) {
         reason: "content_transport_ambiguous",
         errorCode,
         previousRoute: decision.route,
-      }, response.epoch);
+      }, response.epoch, false);
     }
   }
 }
@@ -960,8 +962,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (previous) {
       state.revoke("popup_release");
       const revokedEpoch = state.epoch;
+      notifyPopup("popup_release");
       void revokeContentRoute(previous).then(() => {
-        postEvent("route_revoked", { reason: "popup_release", previousRoute: previous }, revokedEpoch);
+        postEvent("route_revoked", { reason: "popup_release", previousRoute: previous }, revokedEpoch, false);
         sendResponse({ ok: true });
       });
       return true;
@@ -1007,15 +1010,20 @@ chrome.permissions.onRemoved.addListener((permissions) => {
     state.revoke("frame_permission_removed");
     void revokeContentRoute(previous);
     postEvent("route_revoked", { reason: "frame_permission_removed" });
+  } else if (permissions.permissions?.includes("webNavigation")) {
+    notifyPopup("frame_permission_removed");
   }
   for (const [tabId, entry] of [...state.routes]) {
     if (permissions.origins?.some((pattern) => removedHostMatches(pattern, entry.url))) {
       revokeTabAccess(tabId, "permission_removed");
     }
   }
-  notifyPopup("site_permission_removed");
+  if (permissions.origins?.length) notifyPopup("site_permission_removed");
 });
 
-chrome.permissions.onAdded.addListener(() => notifyPopup("site_permission_added"));
+chrome.permissions.onAdded.addListener((permissions) => {
+  if (permissions.origins?.length) notifyPopup("site_permission_added");
+  else if (permissions.permissions?.includes("webNavigation")) notifyPopup("frame_permission_added");
+});
 
 connectNative();
