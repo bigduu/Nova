@@ -1648,7 +1648,6 @@ fn build_page_entries(
             ("enabled", &mut states.enabled),
             ("focused", &mut states.focused),
             ("selected", &mut states.selected),
-            ("checked", &mut states.checked),
             ("expanded", &mut states.expanded),
             ("scrollable", &mut states.scrollable),
         ] {
@@ -1656,6 +1655,25 @@ fn build_page_entries(
                 *field = Some(value.as_bool().ok_or("invalid state")?);
             }
         }
+        // The page producer's state domain is wider than native UiNodeStates.
+        let mut page_states = Vec::new();
+        match state.get("checked") {
+            Some(serde_json::Value::String(value)) if value == "mixed" => {
+                page_states.push("checked=mixed".to_string())
+            }
+            Some(value) => states.checked = Some(value.as_bool().ok_or("invalid state")?),
+            None => {}
+        }
+        for key in ["disabled", "pressed"] {
+            if let Some(value) = state.get(key) {
+                page_states.push(format!("{key}={}", value.as_bool().ok_or("invalid state")?));
+            }
+        }
+        let page_states = if page_states.is_empty() {
+            String::new()
+        } else {
+            format!(" page_states={{{}}}", page_states.join(","))
+        };
         let actionable = actions.iter().any(|action| action == "activate");
         let line = AxLine {
             node_id: format!("n{}", index + 1),
@@ -1688,7 +1706,7 @@ fn build_page_entries(
         let shown = filter.is_none_or(|filter| ax_line_matches(&line, filter));
         if shown {
             let rendered = format!(
-                "\n{} provider=chrome_extension provider_node_id=\"{}\"",
+                "\n{}{page_states} provider=chrome_extension provider_node_id=\"{}\"",
                 format_ax_node(&line),
                 sanitize_ax_field(provider_id, 160)
             );

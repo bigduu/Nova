@@ -37,9 +37,9 @@ Run the native suite with an explicitly built `NOVA_TEST_CHROME_HOST`; no skip o
 installed host is an acceptable substitute. Windows cross compilation/lint is
 also distinct from Windows runtime evidence.
 
-## Exact-candidate desktop acceptance — pending
+## Exact-candidate desktop acceptance protocol
 
-Both real macOS and Windows acceptance remain **PENDING** until root records
+Both real macOS and Windows acceptance require root to record
 the final candidate source/tree, binary hashes, extension payload hashes,
 commands, genuine popup consent, public MCP responses and observed page states.
 Use fresh task-owned profiles and private native-host registration. Do not reuse

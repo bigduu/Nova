@@ -316,13 +316,17 @@ fn simple_page() -> Value {
 async fn canonical_projection_preserves_modes_filter_unicode_provenance_and_exact_action_ids() {
     let fixture = Fixture::new();
     let mut mcp = Mcp::paired(&fixture).await;
-    let mut content = node("content", "Read\n\t\r 🪷", json!(["focus", "set_value"]));
+    let mut content = node("content", "Read\n\t\r 🪷", json!([]));
     content["value"] = json!({"kind":"redacted","text":"must-not-appear"});
-    let nodes = vec![
+    content["states"] = json!({"checked":false,"disabled":true,"pressed":true});
+    let mut nodes = vec![
         node("node-1", "重复 🪷", json!(["activate"])),
         node("child:7:child-document:n1", "重复 🪷", json!(["activate"])),
         content,
     ];
+    nodes[0]["role"] = json!("checkbox");
+    nodes[0]["states"] = json!({"checked":"mixed","disabled":false,"pressed":true});
+    nodes[1]["states"] = json!({"checked":true,"disabled":false,"pressed":false});
     fixture.reply(page(nodes.clone()));
     let read = mcp
         .call(3, "ax_read", json!({"target":"paired_page","mode":"all"}))
@@ -345,6 +349,13 @@ async fn canonical_projection_preserves_modes_filter_unicode_provenance_and_exac
         "重复 🪷",
         "[REDACTED]",
         "actionable=false",
+        "checked=mixed",
+        "checked=true",
+        "checked=false",
+        "disabled=true",
+        "disabled=false",
+        "pressed=true",
+        "pressed=false",
         "provider_node_id=\"child:7:child-document:n1\"",
     ] {
         assert!(
@@ -480,6 +491,25 @@ async fn selector_failures_and_invalid_provider_data_are_explicit_and_bounded() 
         fixture.next();
         assert_eq!(reply["result"]["isError"], true);
         assert!(text(&reply).contains("invalid_provider_snapshot"));
+    }
+    for (id, states) in [
+        (11, json!({"checked":"Mixed"})),
+        (12, json!({"disabled":1})),
+        (13, json!({"pressed":"false"})),
+    ] {
+        let mut malformed = node("bad-state", "Filtered out", json!([]));
+        malformed["states"] = states;
+        fixture.reply(page(vec![malformed]));
+        let failure = mcp
+            .call(
+                id,
+                "ax_read",
+                json!({"target":"paired_page","filter":"unrelated"}),
+            )
+            .await;
+        fixture.next();
+        assert_eq!(failure["result"]["isError"], true);
+        assert!(text(&failure).contains("invalid_provider_snapshot invalid state"));
     }
     fixture.reply(page(vec![node(
         "huge",
