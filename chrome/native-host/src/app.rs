@@ -332,14 +332,22 @@ mod runtime {
         }
 
         fn broker_result(&self, mut message: Value, action: &str) -> Result<Value> {
-            if action == "status" && message["status"] == "ok" {
-                let status = message
-                    .get_mut("result")
-                    .and_then(Value::as_object_mut)
-                    .context("Chrome status result must be an object")?;
-                // This is local broker metadata, never a new native wire field.
-                // Always replace a worker-supplied value with fresh OS evidence.
-                status.insert("ownership".to_string(), self.ownership.status());
+            if action == "status" {
+                if message["status"] == "ok" {
+                    let status = message
+                        .get_mut("result")
+                        .and_then(Value::as_object_mut)
+                        .context("Chrome status result must be an object")?;
+                    // This is local broker metadata, never a new native wire field.
+                    // Always replace a worker-supplied value with fresh OS evidence.
+                    status.insert("ownership".to_string(), self.ownership.status());
+                } else if let Some(status) =
+                    message.get_mut("result").and_then(Value::as_object_mut)
+                {
+                    // Preserve optional/non-object error payloads and terminal
+                    // details, but never deliver worker-owned broker metadata.
+                    status.remove("ownership");
+                }
             }
             Ok(message)
         }
@@ -520,7 +528,9 @@ mod runtime {
                 }
                 ResultDisposition::DeliverThenDisconnect => {
                     active.route = None;
-                    let delivered = active.send_receipt(&message).map(|()| message);
+                    let delivered = active
+                        .send_receipt(&message)
+                        .and_then(|()| active.broker_result(message, &command.action));
                     let _ = command.reply.send(delivered);
                     *session = None;
                 }

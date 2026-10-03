@@ -207,6 +207,184 @@ fn ready(bridge: &ChromeBridge) -> Value {
     }
 }
 
+fn paired_host(endpoint: &Endpoint, bridge: &ChromeBridge) -> Host {
+    let driver = worker(Host::spawn(endpoint, false), &["status", "pair"]);
+    ready(bridge);
+    bridge.pair().unwrap();
+    driver.join().unwrap()
+}
+
+fn terminal_reply(
+    bridge: &ChromeBridge,
+    host: &mut Host,
+    action: &str,
+    mutate: impl FnOnce(&mut Value),
+) -> (anyhow::Result<Value>, Value) {
+    let caller = bridge.clone();
+    let action = action.to_string();
+    let requested_action = action.clone();
+    let caller = std::thread::spawn(move || caller.call(&action, json!({}), Some(LIMIT)));
+    let request = host.receive();
+    assert_eq!(request["action"], requested_action);
+    let mut result = json!({"protocolVersion":1,"kind":"result",
+        "requestId":request["requestId"],"action":requested_action,"status":"ok","epoch":3,
+        "receipt":{"receiptId":"terminal-receipt","expiresAt":10000},"result":{}});
+    if let Some(route) = request.get("route") {
+        result["route"] = route.clone();
+    }
+    mutate(&mut result);
+    host.send(&result);
+    assert_eq!(
+        host.receive(),
+        json!({"protocolVersion":1,"kind":"receipt",
+        "receiptId":result["receipt"]["receiptId"],"requestId":result["requestId"],
+        "action":result["action"],"epoch":result["epoch"]})
+    );
+    (caller.join().unwrap(), result)
+}
+
+fn assert_disconnected(bridge: &ChromeBridge, host: &mut Host) {
+    assert!(matches!(
+        host.output.recv_timeout(LIMIT),
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
+    let error = bridge.read(None, None).unwrap_err().to_string();
+    assert!(error.contains("not connected"), "{error}");
+    host.close();
+}
+
+#[test]
+fn matched_status_error_strips_forged_ownership_and_keeps_the_paired_route() {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut host = paired_host(&endpoint, &bridge);
+    let (delivered, mut expected) = terminal_reply(&bridge, &mut host, "status", |message| {
+        message["status"] = json!("error");
+        message["error"] = json!({"code":"fixture_error","message":"status failed"});
+        message["result"] = json!({"detail":"unchanged","ownership":{"status":"verified_chrome","kernelPeerPid":1}});
+    });
+    expected["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership");
+    assert_eq!(delivered.unwrap(), expected);
+    let (read, _) = terminal_reply(&bridge, &mut host, "read", |_| {});
+    assert_eq!(read.unwrap()["route"]["documentId"], "document-7");
+    host.close();
+    drop(bridge);
+}
+
+fn assert_ambiguous_status_strips_ownership(echoed_action: &str) {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut host = paired_host(&endpoint, &bridge);
+    let (delivered, mut expected) = terminal_reply(&bridge, &mut host, "status", |message| {
+        message["status"] = json!("ambiguous");
+        message["action"] = json!(echoed_action);
+        message["error"] = json!({"code":"fixture_ambiguous","message":"route was revoked"});
+        message["result"] = json!({"detail":"unchanged","ownership":{"status":"verified_chrome","kernelPeerPid":1}});
+    });
+    expected["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership");
+    assert_eq!(delivered.unwrap(), expected, "echoed {echoed_action}");
+    assert_disconnected(&bridge, &mut host);
+    let replacement = Host::spawn(&endpoint, false);
+    let driver = worker(replacement, &["status"]);
+    ready(&bridge);
+    assert!(bridge
+        .read(None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("not paired"));
+    driver.join().unwrap().close();
+    drop(bridge);
+}
+
+#[test]
+fn ambiguous_status_strips_forged_ownership_and_revokes_the_paired_route() {
+    assert_ambiguous_status_strips_ownership("status");
+}
+
+#[test]
+fn ambiguous_status_strips_forged_ownership_even_when_worker_echoes_another_action() {
+    assert_ambiguous_status_strips_ownership("pair");
+}
+
+#[test]
+fn non_success_status_preserves_optional_and_non_object_result_payloads() {
+    for status in ["error", "ambiguous"] {
+        for payload in [
+            None,
+            Some(Value::Null),
+            Some(json!("detail")),
+            Some(json!([1, 2])),
+        ] {
+            let endpoint = Endpoint::new();
+            let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+            let mut host = paired_host(&endpoint, &bridge);
+            let (delivered, expected) = terminal_reply(&bridge, &mut host, "status", |message| {
+                message["status"] = json!(status);
+                message["error"] = json!({"code":"fixture_error","message":"unchanged"});
+                if let Some(payload) = payload {
+                    message["result"] = payload;
+                } else {
+                    message.as_object_mut().unwrap().remove("result");
+                }
+            });
+            assert_eq!(delivered.unwrap(), expected);
+            if status == "ambiguous" {
+                assert_disconnected(&bridge, &mut host);
+            } else {
+                host.close();
+            }
+            drop(bridge);
+        }
+    }
+}
+
+#[test]
+fn invalid_terminal_identity_is_acknowledged_and_rejected_without_delivery() {
+    for wrong_request in [false, true] {
+        let endpoint = Endpoint::new();
+        let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+        let mut host = paired_host(&endpoint, &bridge);
+        let (delivered, _) = terminal_reply(&bridge, &mut host, "status", |message| {
+            if wrong_request {
+                message["requestId"] = json!("another-request");
+                message["status"] = json!("ambiguous");
+            } else {
+                message["action"] = json!("pair");
+            }
+        });
+        let error = delivered.unwrap_err().to_string();
+        assert!(
+            error.contains("ambiguous Chrome result identity"),
+            "{error}"
+        );
+        assert_disconnected(&bridge, &mut host);
+        drop(bridge);
+    }
+}
+
+#[test]
+fn successful_status_requires_an_object_after_its_receipt_is_acknowledged() {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut host = paired_host(&endpoint, &bridge);
+    let (delivered, _) = terminal_reply(&bridge, &mut host, "status", |message| {
+        message["result"] = Value::Null;
+    });
+    let error = delivered.unwrap_err().to_string();
+    assert!(
+        error.contains("Chrome status result must be an object"),
+        "{error}"
+    );
+    assert_disconnected(&bridge, &mut host);
+    drop(bridge);
+}
+
 #[test]
 fn actual_host_identity_is_broker_owned_live_and_replaced_on_reconnect() {
     let endpoint = Endpoint::new();

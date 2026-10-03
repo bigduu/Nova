@@ -4,7 +4,7 @@ The app broker records the operating-system identity of its accepted native-host
 
 ## Contract
 
-`chrome_status` returns broker-owned `result.ownership`. A successful observation identifies the kernel peer PID, each observed process's PID/start identity and image evidence, and the supported launch shape. It records either a direct parent or one live Windows system-CMD intermediate and its parent. The broker checks these same process instances again before reporting them.
+Successful `chrome_status` returns broker-owned `result.ownership`. A successful observation identifies the kernel peer PID, each observed process's PID/start identity and image evidence, and the supported launch shape. It records either a direct parent or one live Windows system-CMD intermediate and its parent. The broker checks these same process instances again before reporting them. Delivered non-success status results strip worker-supplied canonical ownership, including ambiguous replies that echo another action; other error data and absent/non-object payloads remain unchanged.
 
 `ownership_unavailable` reports that the process relationship cannot currently be confirmed. Existing paired Chrome tools remain available. The existing Session controls witness lifetime; disconnect removes it and reconnect captures a new one. No additional persistence, wire action/version, authentication policy or process-discovery service is added.
 
@@ -12,7 +12,7 @@ The app broker records the operating-system identity of its accepted native-host
 
 ## Validation
 
-Local implementation checks passed: native-host 36 tests; Nova 175 tests, 22 existing ignored tests and only the unchanged clipboard round trip filtered; both owned standalone process regressions passed. Root/native format, strict all-targets Clippy, ARM64 Windows cross-Clippy, locked all-features metadata, workflow lint and patch checks passed. Windows runtime execution is required in the exact-head `windows-chrome-bridge` CI job before merge; local cross compilation is not that evidence.
+Final native-host repair checks passed: 42 tests, zero ignored, native format and strict native/ARM64 Windows all-targets Clippy. Three real-host forged-ownership regressions failed before the repair and passed afterward, covering matched error, ambiguous status and an ambiguous reply echoing a different action, with receipt delivery and route revocation preserved. Earlier root validation passed 175 tests with 22 existing ignored tests and only the unchanged clipboard round trip filtered, both owned standalone process regressions, root format/Clippy, locked all-features metadata, workflow lint and patch checks. All final exact-head CI jobs remain required; local Windows cross compilation is not runtime evidence.
 
 The native fixture suite must build and launch the real host on private endpoints. It covers kernel PID versus `Child::id`, stable process start identity, direct and Windows CMD parent relationships, unavailable/changed instances, spoofed hello and worker metadata, and existing disconnect/reconnect behavior. A real Windows CMD regression retains a live process snapshot, exits the child with code 259, and verifies the retained query rejects that exited instance. Windows liveness uses the process object's zero-time signal state with query and synchronization access; access failure leaves ownership unavailable. Missing fixture binaries fail setup rather than skip a test.
 
@@ -22,22 +22,23 @@ Windows runner evidence must execute both direct and live system-CMD fixtures pl
 
 ## Fresh actual macOS result
 
-The candidate production broker library and host were built from the nine tested implementation files. The host binary SHA256 was `122856512428afe386f777f96a2e3edbea132d295693506602dc747a0a619f85`. The extension's 22 tracked payload files and both repository lockfiles were unchanged. A subsequent Windows-only liveness repair and Windows regression change no compiled macOS production path; the sealed actual macOS evidence remains bound to the recorded binary and original source hashes. Real Windows execution belongs to the final exact-head CI.
+After the terminal-status repair, fresh actual macOS acceptance used the final tested production broker library and native host. The host binary SHA256 was `1ae87b60ee7d012b473e773c111385881c17ff333100f39e136192ca7285f968`. The nine implementation-file hashes, extension's 22 tracked payload files and both repository lockfiles were unchanged through acceptance. Earlier evidence remains separately sealed; it is not substituted for this fresh run. Real Windows execution belongs to the final exact-head CI.
 
 | Observation | PID | OS start identity | Result |
 | --- | --- | --- | --- |
-| Chrome A | 66175 | `[1791001920, 801018]` | Independent libproc and targeted ps evidence matched |
-| Chrome B, same title/URL | 27441 | `[1791000303, 225815]` | Independent libproc and targeted ps evidence matched |
-| Initial host | 68119 | `[1791002007, 520979]` | Independent libproc and targeted ps evidence matched |
-| Reconnected host | 78322 | `[1791002473, 514417]` | Independent libproc and targeted ps evidence matched |
+| Chrome A | 31588 | `[1791008034, 786837]` | Independent libproc and targeted ps evidence matched |
+| Chrome B, same title/URL | 31589 | `[1791008034, 786840]` | Independent libproc and targeted ps evidence matched |
+| Initial host | 33487 | `[1791008110, 409746]` | Independent libproc and targeted ps evidence matched |
+| Host after release/reconnect | 50964 | `[1791008731, 847017]` | Independent libproc and targeted ps evidence matched |
+| Host after paired disconnect | 55695 | `[1791008858, 468171]` | Independent libproc and targeted ps evidence matched |
 
-Actual broker status matched the OS host/parent PID, both start tuples and canonical image-path SHA256 values. Two live Chrome processes opened the same fixture title and URL; the parent witness identified A and did not equal B. The native UI harness initially selected older B, so B was normally closed after preserving that live comparison, before binding A's genuine extension popup. This was a harness selection limit, not a window-association claim.
+Actual broker status matched the OS host/parent PID, both start tuples and canonical image-path SHA256 values. Two live Chrome processes opened the same fixture title and URL; the parent witness identified A and did not equal B. B was normally closed after preserving that live comparison, before binding A's genuine extension popup. This avoids ambiguous native UI harness selection; it is not a window-association claim.
 
-A genuine popup confirmation paired the owned document. Actual semantic read and activation returned terminal receipts and changed only the fixture button's public label. Release kept the same live connection witness. Terminating only the independently verified owned host revoked pairing; the normal extension reconnect produced a different host PID/start, retained the same Chrome A parent, and required a fresh popup confirmation. Re-pairing and status verification passed. Three tabs in A still reported `nativeWindowAssociation=unproven`.
+A genuine popup confirmation paired the owned document. Actual semantic read and activation returned terminal receipts and changed only the fixture button's public label. Release kept the same live connection witness; a first reconnect after release remained unpaired. After a genuine re-pair, terminating only the independently verified owned host revoked that active pairing. Normal extension reconnect produced a different host PID/start, retained the same Chrome A parent, rejected reads until a fresh popup confirmation, then passed re-pairing and status verification. Three tabs in A still reported `nativeWindowAssociation=unproven`.
 
 Both Chrome processes, the native host, candidate broker and HTTP fixture were normally released/closed, with their private endpoints verified closed. Primary HEADs, contents, dirty gitlinks and raw indexes were preserved. No daily profile, installed registration, TCC permission, clipboard or Bodhi change was made. The inline pairing screenshot is Chrome confirmation evidence; Nova's native virtual cursor acceptance (#70) remains separate.
 
-Two bounded frame-timeout setup errno-22 diagnostics occurred during disconnect handling. Independent review verified that framing/timeout code was unchanged; the diagnostic is tracked separately in #85 without a root-cause claim. The existing popup refresh behavior (#35) required closing/reopening the popup before the first confirmation; no extension repair was included.
+Three bounded frame-timeout setup errno-22 diagnostics occurred during this run's disconnect handling. Framing/timeout code was unchanged; the diagnostic is tracked separately in #85 without a root-cause claim. Two initial pairing requests expired during root UI-harness setup; successful genuine confirmations and active-pair disconnect evidence were recorded separately. The existing popup refresh behavior (#35) required closing/reopening the popup before confirmation; no extension repair was included.
 
 ## Identity encoding
 
