@@ -145,6 +145,82 @@ async function externalLabelActivationFixture(naming, privateBefore) {
   return { ...fixture, label, field };
 }
 
+for (const [change, invalidate] of [
+  ["rename", (f) => { f.button.attributes["aria-label"] = "Changed captured target"; }],
+  ["non-actionable role", (f) => { f.button.attributes.role = "heading"; }],
+  ["other actionable role", (f) => { f.button.attributes.role = "link"; }],
+  ["type", (f) => { f.button.type = "submit"; }],
+  ["disabled", (f) => { f.button.disabled = true; }],
+  ["aria-disabled", (f) => { f.button.attributes["aria-disabled"] = "true"; }],
+  ["hidden target", (f) => { f.button.hidden = true; }],
+  ["inert target", (f) => { f.button.attributes.inert = ""; }],
+  ["hidden ancestor", (f) => { f.host.hidden = true; }],
+  ["inert ancestor", (f) => { f.host.attributes.inert = ""; }],
+]) {
+  test(`captured top activation rejects ${change} before dispatch and consumes its snapshot`, async () => {
+    const fixture = await activationFixture();
+    // Keep an independent public effect outside the target's ancestry, so an
+    // incorrect dispatch cannot look harmless when that ancestry is hidden.
+    const field = fixture.fields[1];
+    fixture.fields[0].nextSibling = fixture.button;
+    field.nextSibling = null;
+    field.parentElement = fixture.context.document.body;
+    fixture.host.nextSibling = field;
+    const originalValue = field.value;
+    fixture.button.onClick = () => { field.value = "Independent public effect"; };
+    const snapshot = await fixture.read();
+    invalidate(fixture);
+    const result = await fixture.activate(snapshot);
+    console.log("NOVA81_TOP_TARGET " + JSON.stringify({ change, result, dispatches: fixture.button.clicks,
+      publicValueUnchanged: field.value === originalValue }));
+    assert.equal(fixture.button.clicks, 0, "stale target must reject before DOM dispatch");
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "stale_node");
+    assert.equal(field.value, originalValue);
+    assert.equal(JSON.stringify(result).includes("Changed captured target"), false);
+    assert.equal(JSON.stringify(result).includes(originalValue), false);
+    assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+    assert.equal(fixture.button.clicks, 0);
+  });
+}
+
+test("captured top activation keeps the exact element after a same-label control changes snapshot order", async () => {
+  const fixture = await activationFixture();
+  const snapshot = await fixture.read();
+  const decoy = { ...fixture.button, attributes: { ...fixture.button.attributes }, clicks: 0,
+    nextSibling: fixture.host.firstChild };
+  fixture.host.firstChild = decoy;
+  fixture.button.onClick = () => { fixture.fields[1].value = "Original target public effect"; };
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.ok, true);
+  assert.deepEqual(Object.keys(result.result), ["activated"]);
+  assert.equal(result.result.activated, true);
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal(decoy.clicks, 0);
+  assert.equal(JSON.stringify(result).includes(fixture.fields[1].value), false);
+  assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal(decoy.clicks, 0);
+});
+
+test("captured top activation permits its own handler to change public label and state", async () => {
+  const fixture = await activationFixture();
+  const snapshot = await fixture.read();
+  fixture.button.onClick = () => {
+    fixture.button.attributes["aria-label"] = "Handler changed public label";
+    fixture.button.attributes["aria-pressed"] = "true";
+  };
+  const result = await fixture.activate(snapshot);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.activated, true);
+  assert.deepEqual(Object.keys(result.result), ["activated"]);
+  assert.equal(fixture.button.clicks, 1);
+  assert.equal(fixture.button.attributes["aria-pressed"], "true");
+  assert.equal(JSON.stringify(result).includes("Handler changed public label"), false);
+  assert.equal((await fixture.activate(snapshot)).code, "stale_snapshot");
+  assert.equal(fixture.button.clicks, 1);
+});
+
 test("inline content name privacy toggles return no effect and consume snapshots in both directions", async (t) => {
   for (const privateBefore of [false, true]) {
     await t.test(privateBefore ? "private-to-public" : "public-to-private", async () => {

@@ -1023,7 +1023,7 @@ test("activate confirms a visible control change after exactly one dispatch", as
   element.click = () => { element.clicks += 1; element.attributes["aria-pressed"] = "true"; };
   let checks = 0;
   const result = await semantic.performAction(
-    { element, actions: ["activate"], sensitive: false },
+    activationTarget(element.ownerDocument, element),
     "activate",
     {}, () => { checks += 1; },
   );
