@@ -158,6 +158,181 @@ fn existing_profile_with_headless_is_rejected_before_npx() {
     assert!(!called.exists(), "invalid options still invoked npx");
 }
 
+#[cfg(unix)]
+#[test]
+fn local_endpoint_modes_preserve_literal_argv_privacy_and_stdio() {
+    for (flag, endpoint) in [
+        ("--browser-url", "http://127.0.0.1:9222"),
+        ("--browser-url", "https://[0:0:0:0:0:0:0:1]:443/"),
+        (
+            "--ws-endpoint",
+            "ws://127.0.0.1:9222/devtools/browser/browser-1",
+        ),
+        (
+            "--ws-endpoint",
+            "wss://[::1]:443/devtools/browser/browser_2",
+        ),
+    ] {
+        let fixture = Fixture::new("endpoint");
+        let argv = fixture.path("argv");
+        let environment = fixture.path("environment");
+        let fake_npx = fixture.script(
+            r#"printf '%s\n' "$@" > "$NOVA_TEST_ARGV"
+printf '%s\n%s\n' "$CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS" "$CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS" > "$NOVA_TEST_ENVIRONMENT"
+IFS= read -r mcp_input
+printf 'fake-endpoint-stdout:%s\n' "$mcp_input"
+printf 'fake-endpoint-stderr\n' >&2"#,
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nova"))
+            .args([
+                "chrome-devtools",
+                "--npx",
+                fake_npx.to_str().unwrap(),
+                flag,
+                endpoint,
+                "--enable-webmcp",
+            ])
+            .env("NOVA_TEST_ARGV", &argv)
+            .env("NOVA_TEST_ENVIRONMENT", &environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run fake endpoint launcher");
+        writeln!(child.stdin.take().unwrap(), "mcp-input").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fake-endpoint-stdout:mcp-input\n");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("fake-endpoint-stderr"));
+        assert!(stderr.contains("cannot add launch flags to a running browser"));
+        assert_eq!(std::fs::read_to_string(environment).unwrap(), "1\n1\n");
+        assert_eq!(
+            std::fs::read_to_string(argv).unwrap(),
+            format!("--yes\nchrome-devtools-mcp@1.8.0\n{flag}\n{endpoint}\n--no-usage-statistics\n--no-performance-crux\n--redact-network-headers\n--category-experimental-webmcp=true\n")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_conflicts_fail_before_spawn_without_echoing_credentials() {
+    let fixture = Fixture::new("endpoint-conflicts");
+    let called = fixture.path("called");
+    let fake_npx = fixture.script(r#"touch "$NOVA_TEST_CALLED""#);
+    for (flag, endpoint) in [
+        ("--browser-url", "http://private:secret@127.0.0.1:9222"),
+        (
+            "--ws-endpoint",
+            "ws://private:secret@[::1]:9222/devtools/browser/id",
+        ),
+    ] {
+        for extra in [
+            vec!["--profile", "isolated"],
+            vec!["--profile", "existing"],
+            vec!["--headless"],
+            vec![
+                if flag == "--browser-url" {
+                    "--ws-endpoint"
+                } else {
+                    "--browser-url"
+                },
+                endpoint,
+            ],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_nova"))
+                .args([
+                    "chrome-devtools",
+                    "--npx",
+                    fake_npx.to_str().unwrap(),
+                    flag,
+                    endpoint,
+                ])
+                .args(extra)
+                .env("NOVA_TEST_CALLED", &called)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("choose only one") || stderr.contains("remove those options"));
+            assert!(!stderr.contains("private") && !stderr.contains("secret"));
+            assert!(!stderr.contains(endpoint));
+            assert!(
+                !called.exists(),
+                "incompatible endpoint options invoked npx"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_or_nonlocal_endpoints_are_rejected_before_npx_without_raw_url_errors() {
+    let fixture = Fixture::new("endpoint-syntax");
+    let called = fixture.path("called");
+    let fake_npx = fixture.script(r#"touch "$NOVA_TEST_CALLED""#);
+    for (flag, endpoint) in [
+        ("--browser-url", "http://localhost:9222"),
+        ("--browser-url", "http://127.1:9222"),
+        ("--browser-url", "http://2130706433:9222"),
+        ("--browser-url", "http://0x7f000001:9222"),
+        ("--browser-url", "http://0177.0.0.1:9222"),
+        ("--browser-url", "http://192.168.1.1:9222"),
+        ("--browser-url", "http://127.0.0.1"),
+        ("--browser-url", "http://127.0.0.1:0"),
+        ("--browser-url", "http://127.0.0.1:65536"),
+        ("--browser-url", "http://private:secret@127.0.0.1:9222"),
+        ("--browser-url", "http://127.0.0.1:9222/?private=secret"),
+        ("--browser-url", "http://127.0.0.1:9222/#private-secret"),
+        ("--browser-url", "http://127.0.0.1:9222/json/version"),
+        ("--browser-url", "http://127.0.0.1:9222/../"),
+        ("--browser-url", "http://127.0.0.1:9222\n"),
+        ("--browser-url", "ws://127.0.0.1:9222/"),
+        ("--browser-url", ""),
+        ("--ws-endpoint", "http://127.0.0.1:9222/devtools/browser/id"),
+        ("--ws-endpoint", "ws://[::1]:0/devtools/browser/id"),
+        ("--ws-endpoint", "ws://[::1]:9222/devtools/page/id"),
+        ("--ws-endpoint", "ws://[::1]:9222/node-inspector-id"),
+        ("--ws-endpoint", "ws://[::1]:9222/devtools/browser/"),
+        (
+            "--ws-endpoint",
+            "ws://[::1]:9222/devtools/browser/../page/id",
+        ),
+        (
+            "--ws-endpoint",
+            "ws://private:secret@[::1]:9222/devtools/browser/id",
+        ),
+        (
+            "--ws-endpoint",
+            "ws://[::1]:9222/devtools/browser/id?private=secret",
+        ),
+        (
+            "--ws-endpoint",
+            "ws://[::1]:9222/devtools/browser/id#private-secret",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_nova"))
+            .args([
+                "chrome-devtools",
+                "--npx",
+                fake_npx.to_str().unwrap(),
+                flag,
+                endpoint,
+            ])
+            .env("NOVA_TEST_CALLED", &called)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("literal loopback IP") && stderr.contains("nonzero port"));
+        assert!(!stderr.contains("private") && !stderr.contains("secret"));
+        assert!(!stderr.contains(endpoint) || endpoint.is_empty());
+        assert!(!called.exists(), "invalid endpoint invoked npx");
+    }
+}
+
 #[test]
 #[ignore = "requires Node/npm and may download chrome-devtools-mcp@1.8.0"]
 fn pinned_upstream_accepts_hardened_webmcp_options_and_lists_expected_tools() {
