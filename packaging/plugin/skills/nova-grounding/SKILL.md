@@ -6,7 +6,7 @@ description: AX-first reading and grounded activation workflow for Nova desktop 
 # Nova AX-first desktop grounding
 
 Nova controls macOS and Windows. Treat `ax_read` as the first-class
-`ax:read` capability. It reads Accessibility/UIA directly and does not take
+`ax:read` capability. It reads Accessibility/UIA by default and does not take
 a screenshot. `read_ui` is a compatibility alias.
 
 ## Chrome routing
@@ -18,6 +18,23 @@ permission dialogs, other desktop apps, and pixel fallback. If the user needs
 least-privilege access to one explicitly paired page, prefer Nova's separately
 installed Secure Chrome Bridge instead of broad existing-profile DevTools
 access.
+
+For an already consented Secure Chrome Bridge page, call
+`ax_read(target="paired_page", mode="all")`, then
+`ax_activate(snapshot_id, node_id)` on an activate-capable canonical node.
+`target="native"` or an omitted target keeps native selection; `paired_page`
+rejects `window=`. This page-only snapshot reports `provider=chrome_extension`,
+page/frame coverage and `nativeWindowAssociation=unproven`. It supplies no native
+marks, browser toolbar, PID/window association or global coordinates. Do not
+infer ownership from titles, URLs, Chrome window IDs or the frontmost window.
+Only the already paired document is eligible, even when a decoy is frontmost.
+
+Unknown/content-only/stale page IDs dispatch nothing. An accepted current page
+token consumes its generation before I/O; route changes, reconnects, DOM errors,
+no observed effect, ambiguity and timeout never restore or replay it. Read fresh
+and inspect before choosing another action. Keep page failures on this path;
+do not switch to native AX/UIA, AppleScript, app raising, OCR or coordinate input
+to retry a failed DOM action. Direct `chrome_*` tools remain available.
 
 ## Read in this order
 
@@ -41,7 +58,8 @@ permission.
 1. Immediately before acting, run a fresh `ax_read`, select the exact
    actionable node, and call `ax_activate(snapshot_id, node_id)`.
 2. Nova attempts semantic activation first (`route=ax` on macOS,
-   `route=uia` on Windows, or `route=web_dom` for supported browser content).
+   `route=uia` on Windows, `route=chrome_extension` for an explicitly paired page, or
+   `route=web_dom` for supported native browser content).
    If that is unsupported, Nova may use the node's freshly revalidated center
    (`route=element_center`).
 3. For text absent from the semantic tree, click the center returned by OCR
@@ -49,8 +67,8 @@ permission.
 4. Only then click coordinates read from a focused screenshot or zoom
    (`source="visual_coordinate"`).
 
-`ax_activate` fails closed when its snapshot generation is stale. Every
-activation attempt consumes the generation before provider dispatch, including
+`ax_activate` fails closed when its snapshot generation is stale. An accepted current
+actionable token consumes the generation before provider dispatch, including
 attempts that return an error because the provider may have partially applied
 the action. Run `ax_read` again after any result and after navigation, refresh,
 scrolling, or any other UI change.
@@ -81,7 +99,9 @@ may be ignored by browsers or custom-rendered surfaces.
 
 On macOS:
 
-- Accessibility is required for `ax_read`, semantic activation, and input.
+- Accessibility is required for native `ax_read`, native semantic activation,
+  and native input. Explicit `paired_page` read/activate uses existing Chrome
+  popup consent without an Accessibility or Screen Recording grant.
 - Screen Recording is required only for pixel capture, OCR, and
   capture-backed window listing.
 

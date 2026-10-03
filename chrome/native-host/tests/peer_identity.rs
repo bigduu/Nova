@@ -456,3 +456,133 @@ fn windows_real_system_cmd_hop_is_observed_without_claiming_chrome() {
     host.close();
     drop(bridge);
 }
+
+// These are native-host terminal fixtures, not actual Chrome/window evidence.
+fn finish_bound_request(host: &mut Host, request: &Value, body: Value) {
+    let mut response = json!({"protocolVersion":1,"kind":"result",
+        "requestId":request["requestId"],"action":request["action"],"status":"ok",
+        "epoch":3,
+        "receipt":{"receiptId":"bound-receipt","expiresAt":10000},"result":body});
+    if let Some(route) = request.get("route") {
+        response["route"] = route.clone();
+    }
+    host.send(&response);
+    assert_eq!(
+        host.receive(),
+        json!({"protocolVersion":1,"kind":"receipt",
+        "receiptId":"bound-receipt","requestId":request["requestId"],
+        "action":request["action"],"epoch":3})
+    );
+}
+
+fn bound_read(bridge: &ChromeBridge, host: &mut Host) -> nova_chrome_bridge::app::BoundPageRead {
+    let reader = bridge.clone();
+    let reader = std::thread::spawn(move || reader.read_bound(20, 4096, LIMIT));
+    let request = host.receive();
+    assert_eq!(request["action"], "read");
+    finish_bound_request(
+        host,
+        &request,
+        json!({"snapshotId":"fixture-snapshot","nodes":[],"coverage":"top_document","truncated":false}),
+    );
+    reader.join().unwrap().unwrap()
+}
+
+#[test]
+fn bound_activation_rejects_route_replaced_while_a_command_is_pending_without_revoking_it() {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut host = paired_host(&endpoint, &bridge);
+    let old = bound_read(&bridge, &mut host);
+    let observer = bridge.clone();
+    let observer = std::thread::spawn(move || observer.status());
+    let status_request = host.receive();
+    assert_eq!(status_request["action"], "status");
+    let caller = bridge.clone();
+    let (started, queued) = mpsc::channel();
+    let activation = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        caller.activate_bound(&old.binding, "fixture-snapshot", "node-1", LIMIT)
+    });
+    queued.recv_timeout(LIMIT).unwrap();
+    // Hold the current wire request while the caller attempts to enqueue. No
+    // activation can be sent until status replaces the route at dequeue.
+    assert!(matches!(
+        host.output.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let replacement = json!({"tabId":8,"documentId":"document-8","nonce":"page-8","epoch":3});
+    finish_bound_request(
+        &mut host,
+        &status_request,
+        json!({"paired":true,"route":replacement}),
+    );
+    observer.join().unwrap().unwrap();
+    let error = activation.join().unwrap().unwrap_err().to_string();
+    assert!(error.contains("binding is stale"), "{error}");
+    // The very next outgoing request is a fresh read of the replacement,
+    // proving both zero stale activation and preservation of the new pairing.
+    let fresh = bound_read(&bridge, &mut host);
+    assert_eq!(fresh.result["route"], replacement);
+    host.close();
+}
+
+#[test]
+fn bound_read_captures_the_route_at_dispatch_after_a_queued_status_replacement() {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut host = paired_host(&endpoint, &bridge);
+    let observer = bridge.clone();
+    let observer = std::thread::spawn(move || observer.status());
+    let status_request = host.receive();
+    let reader = bridge.clone();
+    let reader = std::thread::spawn(move || reader.read_bound(20, 4096, LIMIT));
+    let replacement = json!({"tabId":8,"documentId":"document-8","nonce":"page-8","epoch":3});
+    finish_bound_request(
+        &mut host,
+        &status_request,
+        json!({"paired":true,"route":replacement}),
+    );
+    observer.join().unwrap().unwrap();
+    let request = host.receive();
+    assert_eq!(request["action"], "read");
+    assert_eq!(request["route"], replacement);
+    finish_bound_request(
+        &mut host,
+        &request,
+        json!({"snapshotId":"fixture-snapshot","nodes":[],"coverage":"top_document","truncated":false}),
+    );
+    let read = reader.join().unwrap().unwrap();
+    let caller = bridge.clone();
+    let caller = std::thread::spawn(move || {
+        caller.activate_bound(&read.binding, "fixture-snapshot", "node-1", LIMIT)
+    });
+    let request = host.receive();
+    assert_eq!(request["action"], "activate");
+    assert_eq!(request["route"], replacement);
+    finish_bound_request(
+        &mut host,
+        &request,
+        json!({"activated":true,"method":"fixture"}),
+    );
+    assert_eq!(caller.join().unwrap().unwrap()["result"]["activated"], true);
+    host.close();
+}
+
+#[test]
+fn bound_activation_rejects_same_route_on_a_new_native_host_session_and_keeps_it_live() {
+    let endpoint = Endpoint::new();
+    let bridge = ChromeBridge::bind(&endpoint.0).unwrap();
+    let mut old_host = paired_host(&endpoint, &bridge);
+    let old = bound_read(&bridge, &mut old_host);
+    old_host.close();
+    let mut new_host = paired_host(&endpoint, &bridge);
+    let error = bridge
+        .activate_bound(&old.binding, "fixture-snapshot", "node-1", LIMIT)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("binding is stale"), "{error}");
+    let fresh = bound_read(&bridge, &mut new_host);
+    assert_eq!(fresh.result["route"], old.result["route"]);
+    new_host.close();
+}
