@@ -37,9 +37,9 @@
         <p id="paired-origin" class="origin"></p>
         <p>Only this exact document can receive semantic actions.</p>
         <p id="frame-status" class="hint">Top document only.</p>
-        <p class="hint">Chrome's frame metadata permission can access navigation and frame metadata across your browser. Nova queries only the paired tab and reads proven visible same-origin child documents. Child nodes are read-only; other frames have partial coverage.</p>
-        <p class="hint">Child reads stop on release, navigation, or bridge restart. Enable them again for each pairing.</p>
-        <button id="enable-frames" class="secondary" type="button" disabled>Enable read-only child frames</button>
+        <p class="hint">Chrome's frame metadata permission can access navigation and frame metadata across your browser. Nova queries only the paired tab. Enabling child access permits reads and DOM activation of proven visible same-origin controls. Child focus, value writes, scrolling and native coordinates remain unavailable; other frames have partial coverage.</p>
+        <p class="hint">Child reads and activation stop on release, navigation, or bridge restart. Enable them again for each pairing.</p>
+        <button id="enable-frames" class="secondary" type="button" disabled>Enable child reads and activation</button>
         <button id="remove-frame-permission" class="danger" type="button" hidden>Remove frame metadata permission</button>
         <button id="release" class="danger" type="button">Release pairing</button>
       </section>

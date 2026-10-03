@@ -87,8 +87,8 @@
     elements["remove-frame-permission"].hidden = !response.childFrames?.permissionGranted;
     elements["remove-frame-permission"].disabled = !response.childFrames?.permissionGranted;
     elements["frame-status"].textContent = response.childFrames?.enabled
-      ? "Child reads enabled for this pairing. Only proven visible same-origin documents are included."
-      : "Top document only. Child reads are off for this pairing.";
+      ? "Child reads and DOM activation enabled for this pairing. Only proven visible same-origin documents are included."
+      : "Top document only. Child reads and activation are off for this pairing.";
     renderAccess(response.access);
     elements.connection.textContent = status.connected ? "Nova.app connected" : "Nova.app unavailable";
     elements.pending.hidden = true;
@@ -224,7 +224,7 @@
           return;
         }
         const response = await send("enable_child_frames", { route });
-        if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Could not enable child reads");
+        if (!response?.ok) throw new Error(response?.message ?? response?.code ?? "Could not enable child access");
         elements.error.hidden = true;
         await render();
       }).catch((error) => {

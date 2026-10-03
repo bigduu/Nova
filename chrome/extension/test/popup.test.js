@@ -293,7 +293,9 @@ test("granted metadata alone stays off until the exact reviewed pairing is enabl
   assert.deepEqual(structuredClone(sent[1].route), pairedRoute);
   assert.equal(sent[1].type, "enable_child_frames");
   assert.equal(elements["enable-frames"].disabled, true);
-  assert.match(elements["frame-status"].textContent, /Child reads enabled/);
+  assert.match(elements["frame-status"].textContent, /Child reads and DOM activation enabled/);
+  assert.match(popupMarkup, /Enable child reads and activation/);
+  assert.match(popupMarkup, /Child focus, value writes, scrolling and native coordinates remain unavailable/);
 });
 
 test("frame permission removal requests only the optional metadata permission", async () => {

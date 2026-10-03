@@ -510,7 +510,8 @@
 
   function createSnapshot(document, { maxNodes = 500, maxChars = 100_000,
     deadline = null, includeChildFrames = false, sharedBudget = null, childPrefix = null,
-    activationObservation = false } = {}) {
+    activationObservation = false, childActivation = false, omitBounds = false,
+    remainingVisits = MAX_VISITED, checkDocument = () => {} } = {}) {
     const nodeLimit = Math.floor(Math.max(1, Math.min(Number(maxNodes) || 500, 1000)));
     const charLimit = Math.floor(Math.max(1024, Math.min(Number(maxChars) || 100_000, 500_000)));
     const snapshotId = randomToken("snapshot");
@@ -526,7 +527,7 @@
     const serialized = JSON.stringify(result);
     // Reserve bounded coverage metadata once, never once per child document.
     const reserve = includeChildFrames ? 512 : 0;
-    const budget = sharedBudget ?? { remaining: MAX_VISITED, truncated: false, deadline,
+    const budget = sharedBudget ?? { remaining: Math.max(0, Math.min(MAX_VISITED, remainingVisits)), truncated: false, deadline,
       nodes: 0, nodeLimit, charLimit, characters: serialized.length + reserve,
       bytes: new TextEncoder().encode(serialized).byteLength + reserve };
     // Activation has two separate observations, not one snapshot extended by
@@ -540,6 +541,7 @@
     const phaseNodes = activationObservation ? Math.min(budget.nodeLimit, budget.nodes + Math.floor(budget.nodeLimit / 2)) : budget.nodeLimit;
     const phaseChars = activationObservation ? Math.min(budget.charLimit, budget.characters - serialized.length + Math.floor(budget.charLimit / 2)) : budget.charLimit;
     const phaseBytes = activationObservation ? Math.min(MAX_SNAPSHOT_BYTES, budget.bytes - new TextEncoder().encode(serialized).byteLength + Math.floor(MAX_SNAPSHOT_BYTES / 2)) : MAX_SNAPSHOT_BYTES;
+    checkDocument(budget);
     if (budget.characters > phaseChars || budget.bytes > phaseBytes || !visit(budget)) {
       budget.truncated = true;
       result.truncated = true;
@@ -576,7 +578,7 @@
     function append(node, element) {
       if (childPrefix) {
         node.nodeId = `${childPrefix}${node.nodeId}`;
-        node.actions = [];
+        node.actions = childActivation ? node.actions.filter((action) => action === "activate") : [];
         delete node.bounds;
       }
       const serialized = JSON.stringify(node);
@@ -589,7 +591,8 @@
         return false;
       }
       nodes.push(node);
-      if (!childPrefix) handles.set(node.nodeId, { element, actions: node.actions, sensitive: false });
+      if (!childPrefix || childActivation) handles.set(node.nodeId, { element, actions: node.actions, sensitive: false,
+        ...(childActivation ? { fingerprint: JSON.stringify([node.role, node.name, String(element.type ?? "")]) } : {}) });
       budget.nodes += 1;
       budget.characters += length;
       budget.bytes += byteLength;
@@ -616,13 +619,13 @@
       }
       if (element.nodeType === 3) {
         if (suppressed) continue;
-        const rect = textBounds(element, Boolean(childPrefix));
+        const rect = textBounds(element, Boolean(childPrefix) || omitBounds);
         if (!rect) continue;
         const name = read.clip(element.data, MAX_NAME);
         if (!name) continue;
         if (!append({
           nodeId: `n${nodes.length + 1}`, role: "text", name,
-          actions: [], states: {}, ...(childPrefix ? {} : { bounds: rect }),
+          actions: [], states: {}, ...(childPrefix || omitBounds ? {} : { bounds: rect }),
         }, element)) break;
         continue;
       }
@@ -643,7 +646,7 @@
       if (value !== undefined) node.value = { kind: "text", text: value };
       const description = read.clip(attr(element, "aria-description") ?? "", MAX_NAME);
       if (description) node.description = description;
-      const rect = childPrefix ? null : bounds(element);
+      const rect = childPrefix || omitBounds ? null : bounds(element);
       if (rect) node.bounds = rect;
       if (!append(node, element)) break;
     }
@@ -652,7 +655,7 @@
     return { result, handles, budget, privacyExcluded, privateNames };
   }
 
-  function proveChildOwners(view, expectedDepth, budget) {
+  function proveChildOwners(view, expectedDepth, budget, expectedOwners = null, owners = null) {
     let child = view;
     let depth = 0;
     try {
@@ -665,6 +668,9 @@
         if (!owner || !(owner instanceof parent.HTMLIFrameElement) || !owner.isConnected ||
             owner.contentWindow !== child || owner.contentDocument !== child.document ||
             owner.ownerDocument !== parentDocument) return "owner_unproven";
+        if (expectedOwners && (expectedOwners[depth]?.owner !== owner ||
+            expectedOwners[depth]?.document !== child.document || expectedOwners[depth]?.parentDocument !== parentDocument)) return "owner_unproven";
+        owners?.push({ owner, document: child.document, parentDocument });
         const root = owner.getRootNode();
         if (root !== parentDocument) {
           return root instanceof parent.ShadowRoot && root.mode === "closed"
@@ -698,18 +704,31 @@
     }
   }
 
-  function readChildDocument({ frameId, documentId, depth, budget }) {
+  function readChildDocument({ frameId, documentId, depth, budget, snapshotId, route }) {
     const view = global.window;
     const excluded = (reason) => ({ nodes: [], budget, reason });
     if (!view || view === view.top || global.document !== view.document) return excluded("owner_unproven");
-    const reason = proveChildOwners(view, depth, budget);
+    const owners = [];
+    const reason = proveChildOwners(view, depth, budget, null, owners);
     if (reason) return excluded(reason);
     try {
       const snapshot = createSnapshot(global.document, {
         sharedBudget: budget, childPrefix: `child:${frameId}:${documentId}:`,
+        childActivation: Boolean(snapshotId && route),
       });
-      const changed = proveChildOwners(view, depth, budget);
+      const changed = proveChildOwners(view, depth, budget, owners);
       if (changed) return excluded(changed);
+      if (snapshotId && route) {
+        const checkDocument = (remaining) => {
+          if (global.document !== view.document || proveChildOwners(view, depth, remaining, owners)) {
+            throw Object.assign(new Error("Child document or visible owner authority changed"), { code: "stale_node" });
+          }
+        };
+        for (const handle of snapshot.handles.values()) {
+          handle.child = { frameId, documentId, document: global.document, checkDocument };
+        }
+        if (!view.top.NovaContentBridge?.captureChild(snapshotId, route, snapshot.handles)) return excluded("stale_child_documents");
+      }
       return { nodes: snapshot.result.nodes, budget, reason: null };
     } catch {
       return excluded("owner_unproven");
@@ -764,7 +783,8 @@
   }
 
   async function performAction(handle, action, args = {}, assertCurrent = () => {},
-    { deadline = null, document: authorizedDocument = null } = {}) {
+    { deadline = null, document: authorizedDocument = null, remainingVisits = MAX_VISITED,
+      onBudget = () => {} } = {}) {
     validateNodeTarget(handle, action);
     const element = handle.element;
     if (Object.hasOwn(args, "x") || Object.hasOwn(args, "y") || Object.hasOwn(args, "coordinates")) {
@@ -785,9 +805,19 @@
       try {
         current();
         if (element.ownerDocument !== observationDocument) throw Object.assign(new Error(), { code: "stale_node" });
-        const before = createSnapshot(observationDocument, { deadline, activationObservation: true });
+        const checkDocument = handle.child?.checkDocument ?? (() => {});
+        const before = createSnapshot(observationDocument, { deadline, activationObservation: true,
+          remainingVisits, omitBounds: Boolean(handle.child), checkDocument });
+        onBudget(before.budget);
         current();
         validateNodeTarget(handle, action);
+        if (handle.child) {
+          const target = before.result.nodes.find((node) => before.handles.get(node.nodeId)?.element === element);
+          if (!target?.actions.includes("activate") || handle.fingerprint !== JSON.stringify([target.role, target.name, String(element.type ?? "")])) {
+            throw Object.assign(new Error("Child node fingerprint changed; read again"), { code: "stale_node" });
+          }
+          checkDocument(before.budget);
+        }
         if (element.ownerDocument !== observationDocument) throw Object.assign(new Error(), { code: "stale_node" });
         dispatched = true;
         element.click();
@@ -795,7 +825,7 @@
         await Promise.resolve();
         current();
         const after = createSnapshot(observationDocument, {
-          sharedBudget: before.budget, activationObservation: true,
+          sharedBudget: before.budget, activationObservation: true, omitBounds: Boolean(handle.child), checkDocument,
         });
         // Privacy classification alone does not change rendering. Exclude
         // either phase's private roots, using only the still-unspent budget.

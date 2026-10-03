@@ -83,6 +83,8 @@
       currentSnapshot = {
         id: snapshot.result.snapshotId,
         handles: snapshot.handles,
+        route: message.route,
+        childFrames: message.includeChildFrames === true,
       };
       return { ok: true, action: "read", route: message.route, result: snapshot.result,
         ...(message.includeChildFrames ? { readBudget: snapshot.budget } : {}) };
@@ -91,25 +93,31 @@
     if (!["activate", "focus", "set_value", "scroll"].includes(message.action)) {
       return { ok: false, action: message.action, code: "unknown_action", message: "unknown content action" };
     }
-    if (typeof message.args?.nodeId === "string" && message.args.nodeId.startsWith("child:")) {
-      return { ok: false, action: message.action, code: "read_only_child", message: "Child document nodes are read-only" };
+    if (typeof message.args?.nodeId === "string" && message.args.nodeId.startsWith("child:") && !currentSnapshot?.childFrames) {
+      return { ok: false, action: message.action, code: "read_only_child", message: "Child activation is not enabled for this snapshot" };
     }
     if (
       !currentSnapshot ||
       typeof message.args?.snapshotId !== "string" ||
-      message.args.snapshotId !== currentSnapshot.id
+      message.args.snapshotId !== currentSnapshot.id || message.route.epoch !== currentSnapshot.route.epoch
     ) {
       return { ok: false, action: message.action, code: "stale_snapshot", message: "snapshot is absent or stale" };
     }
+    const snapshot = currentSnapshot;
+    // All targets share this one consumed snapshot, including invalid or
+    // unsupported child requests. A failed mutation cannot retain top handles.
+    currentSnapshot = null;
     const nodeId = message.args?.nodeId;
-    if (typeof nodeId !== "string" || !currentSnapshot.handles.has(nodeId)) {
+    if (typeof nodeId === "string" && nodeId.startsWith("child:") && message.action !== "activate") {
+      return { ok: false, action: message.action, code: "unsupported_child_action", message: "Child documents support only DOM activation" };
+    }
+    if (typeof nodeId !== "string" || !snapshot.handles.has(nodeId)) {
       return { ok: false, action: message.action, code: "unknown_node", message: "node is not in this snapshot" };
     }
 
-    const handle = currentSnapshot.handles.get(nodeId);
+    const handle = snapshot.handles.get(nodeId);
     // One read authorizes at most one mutation. This is intentionally consumed
     // before dispatch, including when the DOM operation fails.
-    currentSnapshot = null;
     const authorizedRevision = mutationRevision;
     const assertCurrent = () => {
       if (!enabled) throw Object.assign(new Error("Page access was revoked; enable and pair the page again"), { code: "page_access_revoked" });
@@ -118,14 +126,22 @@
         throw Object.assign(new Error("Page authority or snapshot changed; read again before retrying"), { code: "stale_snapshot" });
       }
     };
+    let activationBudget;
     try {
+      if (handle.child && (!message.childValidated || message.childValidated.frameId !== handle.child.frameId ||
+          message.childValidated.documentId !== handle.child.documentId)) {
+        throw Object.assign(new Error("Child browser identity is absent or changed; read again"), { code: "stale_node" });
+      }
       const result = await NovaSemantic.performAction(handle, message.action, message.args, assertCurrent,
-        { deadline: message.deadline, document });
+        { deadline: message.deadline, document: handle.child?.document ?? document,
+          remainingVisits: handle.child ? message.childValidated.remainingVisits : 10_000,
+          onBudget: (budget) => { activationBudget = budget; } });
       if (message.action === "activate") {
         // Authority can change between the runtime's last check and this await
         // resuming. A dispatched activation must not receive a stale success.
         try {
           assertCurrent();
+          if (handle.child) handle.child.checkDocument(activationBudget);
           if (message.deadline && Date.now() >= message.deadline) {
             throw Object.assign(new Error(), { code: "ambiguous_content_timeout" });
           }
@@ -133,7 +149,8 @@
           throw Object.assign(new Error(`Activation receipt could not be confirmed (${error.code}). DOM dispatch may already have had side effects; read or inspect the page before retrying.`), { code: error.code });
         }
       }
-      return { ok: true, action: message.action, route: message.route, result };
+      return { ok: true, action: message.action, route: message.route, result,
+        ...(handle.child ? { childRemainingVisits: activationBudget.remaining } : {}) };
     } catch (error) {
       return {
         ok: false,
@@ -197,6 +214,24 @@
     enable() {
       enabled = true;
       return register();
+    },
+    captureChild(snapshotId, route, handles) {
+      if (!enabled || !baseRouteMatches(route) || !currentSnapshot?.childFrames ||
+          currentSnapshot.id !== snapshotId || currentSnapshot.route.epoch !== route.epoch) return false;
+      for (const [id, handle] of handles) currentSnapshot.handles.set(id, handle);
+      return true;
+    },
+    finishChildren(snapshotId, route, nodeIds) {
+      if (!enabled || !baseRouteMatches(route) || currentSnapshot?.id !== snapshotId ||
+          currentSnapshot.route.epoch !== route.epoch) return false;
+      const included = new Set(nodeIds);
+      for (const id of currentSnapshot.handles.keys()) {
+        if (id.startsWith("child:") && !included.has(id)) currentSnapshot.handles.delete(id);
+      }
+      return true;
+    },
+    discardSnapshot(snapshotId) {
+      if (currentSnapshot?.id === snapshotId) currentSnapshot = null;
     },
   };
   return register();
