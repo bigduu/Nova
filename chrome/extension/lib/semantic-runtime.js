@@ -592,7 +592,7 @@
       }
       nodes.push(node);
       if (!childPrefix || childActivation) handles.set(node.nodeId, { element, actions: node.actions, sensitive: false,
-        ...(childActivation ? { fingerprint: JSON.stringify([node.role, node.name, String(element.type ?? "")]) } : {}) });
+        fingerprint: JSON.stringify([node.role, node.name, String(element.type ?? "")]) });
       budget.nodes += 1;
       budget.characters += length;
       budget.bytes += byteLength;
@@ -811,13 +811,11 @@
         onBudget(before.budget);
         current();
         validateNodeTarget(handle, action);
-        if (handle.child) {
-          const target = before.result.nodes.find((node) => before.handles.get(node.nodeId)?.element === element);
-          if (!target?.actions.includes("activate") || handle.fingerprint !== JSON.stringify([target.role, target.name, String(element.type ?? "")])) {
-            throw Object.assign(new Error("Child node fingerprint changed; read again"), { code: "stale_node" });
-          }
-          checkDocument(before.budget);
+        const target = before.result.nodes.find((node) => before.handles.get(node.nodeId)?.element === element);
+        if (!target?.actions.includes("activate") || handle.fingerprint !== JSON.stringify([target.role, target.name, String(element.type ?? "")])) {
+          throw Object.assign(new Error("Semantic node fingerprint changed; read again"), { code: "stale_node" });
         }
+        if (handle.child) checkDocument(before.budget);
         if (element.ownerDocument !== observationDocument) throw Object.assign(new Error(), { code: "stale_node" });
         dispatched = true;
         element.click();

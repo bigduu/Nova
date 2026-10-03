@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Nova top activation fixture</title>
+<style>
+body{font:16px system-ui;margin:48px auto;max-width:780px;padding:0 24px;color:#243345;background:#f4f7fb}
+main{background:white;border:1px solid #d8e0eb;border-radius:16px;padding:28px}
+h1{margin-top:0;font-size:28px}p{line-height:1.6}button{padding:10px 16px;margin:6px;border:1px solid #bdcadd;border-radius:8px;background:#edf3ff;font:inherit}
+output{display:block;padding:14px;background:#eff8f0;margin:16px 0;border-radius:8px}label{display:block;margin:16px 6px}
+</style>
+<main><h1>Nova: captured top-document activation</h1>
+<p>Owned loopback test page. An old reference must reject when its captured target changes. A valid target may change its own public label or state after dispatch.</p>
+<div id="owner"><button id="public-action">Activate fixture</button></div>
+<output id="public-status">Public count 0</output>
+<button id="own-label">Change own label</button>
+<label><input id="state-toggle" type="checkbox">Public state toggle</label>
+<button id="no-effect">No visible effect</button>
+<p id="scope">Top document only. No physical mouse, clipboard, credentials or external requests.</p>
+</main>
+<script>
+(() => {
+  const dispatches = {"public-action":0,"replacement":0,"own-label":0,"state-toggle":0,"no-effect":0};
+  let target = document.getElementById("public-action");
+  let oldTarget = null;
+  let publicCount = 0;
+  let trustedDispatches = 0;
+  function listen(element,key,effect) {
+    element.addEventListener("click",event => {
+      dispatches[key] += 1;
+      if(event.isTrusted) trustedDispatches += 1;
+      effect?.();
+    });
+  }
+  function publicEffect(){publicCount += 1;document.getElementById("public-status").textContent = "Public count " + publicCount;}
+  listen(target,"public-action",publicEffect);
+  listen(document.getElementById("own-label"),"own-label",() => {
+    const button = document.getElementById("own-label");button.textContent += " ✓";
+  });
+  listen(document.getElementById("state-toggle"),"state-toggle");
+  listen(document.getElementById("no-effect"),"no-effect");
+  const owner = document.getElementById("owner");
+  function inspect(){
+    return {url:location.href,dispatches:{...dispatches},trustedDispatches,publicCount,
+      targetLabel:target.textContent,targetRole:target.getAttribute("role"),targetHidden:target.hidden,
+      targetDisabled:target.disabled,targetInert:target.inert,ownerHidden:owner.hidden,ownerInert:owner.inert,
+      targetAriaDisabled:target.getAttribute("aria-disabled"),targetPrivate:target.hasAttribute("data-private"),
+      oldTargetConnected:oldTarget?.isConnected ?? null,targetConnected:target.isConnected,
+      ownLabel:document.getElementById("own-label").textContent,state:document.getElementById("state-toggle").checked};
+  }
+  function restore(){
+    if(oldTarget){target.remove();target=oldTarget;oldTarget=null;owner.append(target);}
+    target.textContent="Activate fixture";target.hidden=false;target.disabled=false;target.inert=false;
+    target.removeAttribute("role");target.removeAttribute("aria-disabled");target.removeAttribute("data-private");
+    owner.hidden=false;owner.inert=false;document.getElementById("own-label").textContent="Change own label";
+    return inspect();
+  }
+  function changeTarget(kind){
+    if(kind==="rename") target.textContent="Different current label";
+    else if(kind==="role") target.setAttribute("role","heading");
+    else if(kind==="disabled") target.disabled=true;
+    else if(kind==="aria-disabled") target.setAttribute("aria-disabled","true");
+    else if(kind==="hidden") target.hidden=true;
+    else if(kind==="inert") target.inert=true;
+    else if(kind==="owner-hidden") owner.hidden=true;
+    else if(kind==="owner-inert") owner.inert=true;
+    else if(kind==="private") target.setAttribute("data-private","");
+    else if(kind==="replace") {
+      oldTarget=target;target=document.createElement("button");target.id="public-action";target.textContent="Activate fixture";
+      listen(target,"replacement",publicEffect);oldTarget.replaceWith(target);
+    } else throw new Error("Unknown owned fixture operation");
+    return inspect();
+  }
+  window.NovaTopActivationProof={inspect,changeTarget,restore};
+})();
+</script></html>
