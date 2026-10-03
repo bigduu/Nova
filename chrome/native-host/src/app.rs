@@ -191,15 +191,18 @@ mod runtime {
         connection: AppBridgeConnection,
         route: Option<Value>,
         extension_ready: bool,
+        ownership: crate::peer::ProcessWitness,
     }
 
     impl Session {
         fn new(connection: AppBridgeConnection) -> Self {
+            let ownership = crate::peer::ProcessWitness::capture(connection.peer_pid());
             Self {
                 host_extension_id: None,
                 connection,
                 route: None,
                 extension_ready: false,
+                ownership,
             }
         }
 
@@ -210,6 +213,7 @@ mod runtime {
                     if self.host_extension_id.is_some() || self.extension_ready {
                         bail!("duplicate Chrome native host hello");
                     }
+                    verify_hello_pid(self.connection.peer_pid(), &message)?;
                     let extension_id = message
                         .get("extensionId")
                         .and_then(Value::as_str)
@@ -326,6 +330,36 @@ mod runtime {
             }
             Ok(())
         }
+
+        fn broker_result(&self, mut message: Value, action: &str) -> Result<Value> {
+            if action == "status" {
+                if message["status"] == "ok" {
+                    let status = message
+                        .get_mut("result")
+                        .and_then(Value::as_object_mut)
+                        .context("Chrome status result must be an object")?;
+                    // This is local broker metadata, never a new native wire field.
+                    // Always replace a worker-supplied value with fresh OS evidence.
+                    status.insert("ownership".to_string(), self.ownership.status());
+                } else if let Some(status) =
+                    message.get_mut("result").and_then(Value::as_object_mut)
+                {
+                    // Preserve optional/non-object error payloads and terminal
+                    // details, but never deliver worker-owned broker metadata.
+                    status.remove("ownership");
+                }
+            }
+            Ok(message)
+        }
+    }
+
+    fn verify_hello_pid(peer_pid: Option<u32>, message: &Value) -> Result<()> {
+        if peer_pid
+            .is_some_and(|pid| message.get("pid").and_then(Value::as_u64) != Some(pid as u64))
+        {
+            bail!("native host hello PID disagrees with the kernel peer PID");
+        }
+        Ok(())
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,7 +515,7 @@ mod runtime {
                     let delivered = active
                         .update_route(&message, &command.action)
                         .and_then(|()| active.send_receipt(&message))
-                        .map(|()| message);
+                        .and_then(|()| active.broker_result(message, &command.action));
                     let disconnect = delivered.is_err();
                     let _ = command.reply.send(delivered);
                     if disconnect {
@@ -494,7 +528,9 @@ mod runtime {
                 }
                 ResultDisposition::DeliverThenDisconnect => {
                     active.route = None;
-                    let delivered = active.send_receipt(&message).map(|()| message);
+                    let delivered = active
+                        .send_receipt(&message)
+                        .and_then(|()| active.broker_result(message, &command.action));
                     let _ = command.reply.send(delivered);
                     *session = None;
                 }
@@ -691,6 +727,70 @@ mod runtime {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn host_hello_pid_is_only_a_kernel_consistency_check() {
+            verify_hello_pid(Some(42), &json!({"pid":42})).unwrap();
+            assert!(verify_hello_pid(Some(42), &json!({"pid":99})).is_err());
+            assert!(verify_hello_pid(Some(42), &json!({"pid":"42"})).is_err());
+            // An unavailable witness never disables existing Chrome tools.
+            verify_hello_pid(None, &json!({"pid":99})).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unavailable_witness_preserves_pair_read_release_and_overwrites_worker_status() {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = std::env::temp_dir().join(format!(
+                "nova-peer-{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let listener = AppBridgeListener::bind(directory.join("chrome.sock")).unwrap();
+            let _client = std::os::unix::net::UnixStream::connect(listener.path()).unwrap();
+            let mut session = Session::new(listener.accept().unwrap());
+            let mut hello =
+                crate::protocol::host_hello("abcdefghijklmnopabcdefghijklmnop").unwrap();
+            hello["pid"] = json!(u64::MAX);
+            assert!(session.handle_idle_message(hello.clone()).is_err());
+            assert!(session.host_extension_id.is_none());
+            hello["pid"] = json!(std::process::id());
+            session.handle_idle_message(hello).unwrap();
+            session.ownership = crate::peer::ProcessWitness::capture(None);
+            let status = session.broker_result(json!({
+                "status":"ok", "result":{"paired":false,"ownership":{"status":"verified_chrome"}}
+            }), "status").unwrap();
+            assert_eq!(
+                status["result"]["ownership"]["status"],
+                "ownership_unavailable"
+            );
+            let route = json!({"tabId":7,"documentId":"document-7","nonce":"page-7","epoch":3});
+            session
+                .update_route(&json!({"status":"ok","result":{"route":route}}), "pair")
+                .unwrap();
+            let (reply, _) = mpsc::sync_channel(1);
+            let command = Command {
+                reply,
+                request_id: "fixture-1".into(),
+                action: "read".into(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                args: json!({}),
+                expected_route: None,
+            };
+            assert_eq!(build_request(&session, &command).unwrap()["route"], route);
+            session
+                .update_route(&json!({"status":"ok"}), "release")
+                .unwrap();
+            assert!(session.route.is_none());
+            drop(session);
+            drop(listener);
+            std::fs::remove_dir(directory).unwrap();
+        }
 
         #[test]
         fn tool_args_forbid_coordinate_authority() {

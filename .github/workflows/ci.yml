@@ -68,7 +68,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path chrome/native-host/Cargo.toml --all-targets -- -D warnings
 
+      - name: Build the required native process fixture
+        run: cargo build --locked --manifest-path chrome/native-host/Cargo.toml
+
       - name: Test
+        env:
+          NOVA_TEST_CHROME_HOST: ${{ github.workspace }}/chrome/native-host/target/debug/nova-chrome-host
         run: cargo test --manifest-path chrome/native-host/Cargo.toml --verbose
 
   test:
@@ -115,6 +120,13 @@ jobs:
       # run them locally with `cargo test -- --include-ignored`.
       - name: Test
         run: cargo test --verbose
+
+      - name: Test real macOS native peer and process identity
+        env:
+          NOVA_TEST_CHROME_HOST: ${{ github.workspace }}/chrome/native-host/target/debug/nova-chrome-host
+        run: |
+          cargo build --locked --manifest-path chrome/native-host/Cargo.toml
+          cargo test --locked --manifest-path chrome/native-host/Cargo.toml --test peer_identity --verbose
 
   # Windows port (src/platform/windows) gate. CROSS-COMPILES to
   # aarch64-pc-windows-msvc from an ubuntu runner — `cargo check`/`clippy` never
@@ -196,7 +208,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked --manifest-path chrome/native-host/Cargo.toml --all-targets -- -D warnings
           exit $LASTEXITCODE
-      - name: Run owned registration, native pipe and launched-host contracts
+      - name: Run owned registration, native pipe and direct/CMD process contracts
         run: |
           $env:NOVA_TEST_CHROME_HOST = Join-Path $PWD "chrome/native-host/target/debug/nova-chrome-host.exe"
           $env:NOVA_TEST_NOVA_EXE = Join-Path $PWD "target/debug/nova.exe"

@@ -124,6 +124,7 @@ impl Drop for AppBridgeListener {
 pub struct AppBridgeConnection {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    peer_pid: Option<u32>,
 }
 
 impl AppBridgeConnection {
@@ -142,10 +143,17 @@ impl AppBridgeConnection {
             .set_write_timeout(Some(STREAM_FRAME_TIMEOUT))
             .context("set Chrome bridge write timeout")?;
         let writer = stream.try_clone().context("clone Chrome bridge stream")?;
+        let peer_pid = peer_pid(stream.as_raw_fd()).ok().filter(|pid| *pid > 0);
         Ok(Self {
             reader: BufReader::new(stream),
             writer,
+            peer_pid,
         })
+    }
+
+    /// Kernel process ID, never taken from the native-host hello JSON.
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.peer_pid
     }
 
     pub fn receive(&mut self) -> Result<Option<Value>> {
@@ -645,6 +653,141 @@ fn peer_uid(fd: RawFd) -> Result<u32> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn peer_uid(_fd: RawFd) -> Result<u32> {
     bail!("peer credential verification is unavailable on this Unix platform")
+}
+
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: RawFd) -> Result<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+    // SAFETY: connected fd and correctly sized writable pid/length outputs.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            0,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of_val(&pid)
+        || pid <= 0
+    {
+        bail!("kernel Chrome bridge peer PID is unavailable");
+    }
+    Ok(pid as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(fd: RawFd) -> Result<u32> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    // SAFETY: connected fd and correctly sized writable credential outputs.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of_val(&credentials)
+        || credentials.pid <= 0
+    {
+        bail!("kernel Chrome bridge peer PID is unavailable");
+    }
+    Ok(credentials.pid as u32)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_pid(_fd: RawFd) -> Result<u32> {
+    bail!("kernel peer PID is unavailable on this Unix platform")
+}
+
+pub(crate) struct ProcessQuery;
+
+impl ProcessQuery {
+    pub fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn get(&mut self, pid: u32) -> Result<crate::peer::ProcessEvidence> {
+        let pid = i32::try_from(pid)?;
+        // SAFETY: the C POD output and its exact size are passed to libproc.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if pid <= 0
+            || read != size
+            || info.pbi_pid != pid as u32
+            || info.pbi_uid != effective_uid()
+            || info.pbi_status == libc::SZOMB
+        {
+            bail!("process identity unavailable");
+        }
+        let mut path = [0u8; 4096];
+        // SAFETY: selected PID, writable path buffer and exact byte size.
+        let length =
+            unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if length <= 0 {
+            bail!("process image unavailable");
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let image = PathBuf::from(std::ffi::OsStr::from_bytes(&path[..length as usize]));
+        Ok(crate::peer::ProcessEvidence {
+            pid: info.pbi_pid,
+            parent_pid: info.pbi_ppid,
+            start: [info.pbi_start_tvsec, info.pbi_start_tvusec],
+            image: image.canonicalize()?,
+            system_cmd: false,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get(&mut self, pid: u32) -> Result<crate::peer::ProcessEvidence> {
+        if pid == 0 {
+            bail!("process identity unavailable");
+        }
+        let directory = PathBuf::from(format!("/proc/{pid}"));
+        if fs::metadata(&directory)?.uid() != effective_uid() {
+            bail!("process ownership unavailable");
+        }
+        let stat = fs::read_to_string(directory.join("stat"))?;
+        // comm can contain spaces and parentheses; only fields after its last
+        // closing parenthesis are positional. Never read argv/environment.
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .context("invalid process stat")?
+            .1
+            .split_whitespace()
+            .collect();
+        if matches!(fields.first(), Some(&"Z" | &"X")) {
+            bail!("process exited");
+        }
+        let parent_pid = fields.get(1).context("missing parent PID")?.parse()?;
+        let started = fields.get(19).context("missing process start")?.parse()?;
+        Ok(crate::peer::ProcessEvidence {
+            pid,
+            parent_pid,
+            start: [started, 0],
+            image: fs::read_link(directory.join("exe"))?,
+            system_cmd: false,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn get(&mut self, _pid: u32) -> Result<crate::peer::ProcessEvidence> {
+        bail!("process identity is unavailable on this Unix platform")
+    }
 }
 
 #[cfg(test)]

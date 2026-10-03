@@ -11,7 +11,11 @@ use ::windows::Win32::Security::Authorization::{
 use ::windows::Win32::Security::*;
 use ::windows::Win32::Storage::FileSystem::*;
 use ::windows::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+use ::windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use ::windows::Win32::System::Pipes::*;
+use ::windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use ::windows::Win32::System::Threading::*;
 use ::windows::Win32::System::IO::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -212,7 +216,7 @@ struct Pipe {
     connected: AtomicBool,
 }
 
-fn verify_peer(pipe: &Pipe, server_side: bool) -> Result<()> {
+fn verify_peer(pipe: &Pipe, server_side: bool) -> Result<u32> {
     let mut pid = 0;
     // SAFETY: pipe is connected, pid is output storage, and the process handle is
     // query-only. Identity is taken from the kernel, never from a JSON pid field.
@@ -230,7 +234,82 @@ fn verify_peer(pipe: &Pipe, server_side: bool) -> Result<()> {
             bail!("Chrome bridge peer is not the same user and logon session");
         }
     }
-    Ok(())
+    Ok(pid)
+}
+
+pub(crate) struct ProcessQuery {
+    snapshot: Handle,
+    system_cmd: String,
+}
+
+impl ProcessQuery {
+    pub fn new() -> Result<Self> {
+        let mut system = [0u16; 32768];
+        // SAFETY: writable buffer; query-only snapshot is owned by Handle.
+        let length = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
+        if length == 0 || length >= system.len() {
+            bail!("system directory unavailable");
+        }
+        let system_cmd = format!("{}\\cmd.exe", String::from_utf16(&system[..length])?);
+        Ok(Self {
+            snapshot: Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? }),
+            system_cmd,
+        })
+    }
+
+    pub fn get(&mut self, pid: u32) -> Result<crate::peer::ProcessEvidence> {
+        // Enumerate the kernel snapshot without retaining other process rows.
+        // Only the selected peer/direct-parent/one CMD-parent are inspected.
+        let mut row = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            Process32FirstW(self.snapshot.0, &mut row)?;
+            while row.th32ProcessID != pid {
+                Process32NextW(self.snapshot.0, &mut row)?;
+            }
+            let process = Handle(OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            )?);
+            if Identity::for_process(process.0)? != Identity::current()? {
+                bail!("process owner/logon unavailable");
+            }
+            // Exit code 259 is ambiguous. Only a nonsignaled process handle
+            // establishes liveness; failed waits also make it unavailable.
+            if WaitForSingleObject(process.0, 0) != WAIT_TIMEOUT {
+                bail!("process is not live");
+            }
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user)?;
+            let mut image = [0u16; 32768];
+            let mut length = image.len() as u32;
+            QueryFullProcessImageNameW(
+                process.0,
+                PROCESS_NAME_WIN32,
+                PWSTR(image.as_mut_ptr()),
+                &mut length,
+            )?;
+            let image = String::from_utf16(&image[..length as usize])?;
+            Ok(crate::peer::ProcessEvidence {
+                pid,
+                parent_pid: row.th32ParentProcessID,
+                start: [
+                    ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64,
+                    0,
+                ],
+                system_cmd: image.eq_ignore_ascii_case(&self.system_cmd),
+                image: image.into(),
+            })
+        }
+    }
 }
 
 /// One stable allocation per outstanding kernel operation. Drop cancels and
@@ -441,15 +520,18 @@ impl AppBridgeListener {
             }
         }
         self.pipe.connected.store(true, Ordering::Release);
-        if let Err(error) = verify_peer(&self.pipe, true) {
-            // SAFETY: no I/O is pending on this accepted instance.
-            unsafe {
-                let _ = DisconnectNamedPipe(self.pipe.handle.0);
+        let peer_pid = match verify_peer(&self.pipe, true) {
+            Ok(pid) => pid,
+            Err(error) => {
+                // SAFETY: no I/O is pending on this accepted instance.
+                unsafe {
+                    let _ = DisconnectNamedPipe(self.pipe.handle.0);
+                }
+                self.pipe.connected.store(false, Ordering::Release);
+                return Err(error);
             }
-            self.pipe.connected.store(false, Ordering::Release);
-            return Err(error);
-        }
-        match AppBridgeConnection::new(self.pipe.clone(), true) {
+        };
+        match AppBridgeConnection::new(self.pipe.clone(), true, peer_pid) {
             Ok(connection) => Ok(Some(connection)),
             Err(error) => {
                 // SAFETY: no accepted connection or pending I/O was exposed.
@@ -481,10 +563,11 @@ pub struct AppBridgeConnection {
     messages: VecDeque<Value>,
     expected_id: Option<String>,
     eof: bool,
+    peer_pid: u32,
 }
 
 impl AppBridgeConnection {
-    fn new(pipe: Arc<Pipe>, server_side: bool) -> Result<Self> {
+    fn new(pipe: Arc<Pipe>, server_side: bool, peer_pid: u32) -> Result<Self> {
         let expected_id = if env::var_os("NOVA_CHROME_EXTENSION_ID").is_some() {
             Some(expected_extension_id()?)
         } else {
@@ -499,6 +582,7 @@ impl AppBridgeConnection {
             messages: VecDeque::new(),
             expected_id,
             eof: false,
+            peer_pid,
         })
     }
 
@@ -541,8 +625,13 @@ impl AppBridgeConnection {
             identity: Identity::current()?,
             connected: AtomicBool::new(true),
         });
-        verify_peer(&pipe, false)?;
-        Self::new(pipe, false)
+        let peer_pid = verify_peer(&pipe, false)?;
+        Self::new(pipe, false, peer_pid)
+    }
+
+    /// PID authenticated by the existing kernel pipe/token check.
+    pub fn peer_pid(&self) -> Option<u32> {
+        Some(self.peer_pid)
     }
 
     fn begin_read(&mut self) -> Result<()> {
@@ -876,6 +965,55 @@ mod tests {
         let client = AppBridgeConnection::connect(listener.path()).unwrap();
         let server = listener.accept().unwrap();
         (listener, client, server)
+    }
+
+    #[test]
+    fn windows_process_snapshot_rejects_exited_cmd_with_still_active_exit_code() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        struct OwnedCmd(Child);
+        impl Drop for OwnedCmd {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = OwnedCmd(
+            Command::new(ProcessQuery::new().unwrap().system_cmd)
+                .args(["/d", "/q", "/c"])
+                .raw_arg("set /p NOVA_PEER_TEST_GATE= >nul & exit /b 259")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("actual OS system CMD fixture must start"),
+        );
+        let pid = child.0.id();
+        let mut input = child.0.stdin.take().unwrap();
+        // Snapshot while CMD is blocked on our held-open stdin. Keep both the
+        // snapshot and Child's process handle after exit to reproduce the bug.
+        let mut query = ProcessQuery::new().unwrap();
+        assert_eq!(query.get(pid).unwrap().pid, pid);
+        writeln!(input, "continue").unwrap();
+        drop(input);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(259));
+                break;
+            }
+            assert!(Instant::now() < deadline, "owned CMD did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut code = 0;
+        // SAFETY: Child retains its owned process handle throughout this query.
+        unsafe { GetExitCodeProcess(HANDLE(child.0.as_raw_handle()), &mut code) }.unwrap();
+        assert_eq!(code, STILL_ACTIVE.0 as u32);
+        let error = query.get(pid).unwrap_err().to_string();
+        assert!(error.contains("not live"), "{error}");
     }
 
     #[test]
