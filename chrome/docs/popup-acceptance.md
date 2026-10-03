@@ -1,56 +1,78 @@
 # Popup lifecycle acceptance (#35)
 
-Validated on macOS 26.6.2 / Apple Silicon with official Chrome for Testing
-149.0.7827.54 and an isolated profile on 2026-10-02. The browser loaded an
-immutable copy of all 22 tracked extension files; their SHA256 values matched
-the candidate. The native host used the existing production Chrome bridge in
-an isolated test broker, not the user's running Nova application.
+Validated on 2026-10-04 with official Chrome for Testing 154.0.8037.92,
+macOS 26.6.2 and Apple Silicon. The isolated profile loaded an immutable copy
+of all 22 tracked extension files from source candidate
+`f2aa0fb4ebfb14e8338f30bea9dcfc8fc0f6320f`; their SHA256 values matched.
+Chrome's displayed extension ID matched the private native-host manifest.
+
+The private development Nova.app used the existing accepted core binaries.
+Its Rust and native-host sources were byte-identical to merged Nova
+`32bf4d90129e944f15e3a66b9e0ca1c72efe0da2` and build candidate
+`364467b39731e9d2cb076ea48f21207dacaee9dc`. Product operations used public MCP
+tools and genuine toolbar-popup clicks. No pairing response was synthesized.
 
 ## Actual action-popup flow
 
-The normal toolbar action opened the popup on the owned HTTP fixture. No
-pairing was pending. Clicking **Use this tab** registered that document, then
-the test broker requested Pair while the same popup remained open.
+The normal toolbar action opened Nova on the owned HTTP fixture. **Use this
+tab** enabled the exact document without pairing it. The popup stayed open
+before the public `chrome_pair` request.
 
-| Trigger | Observed in the actual popup | Production bridge result |
+| Trigger | Actual popup observation | Public MCP result |
 | --- | --- | --- |
-| New Pair request | Reviewed fixture origin/title, countdown, Pair and Deny controls appeared without reopening | Confirmation returned the exact document route |
-| Pair this page | Pending controls changed to PAIRED and Release pairing | Semantic read returned the heading, Unicode field value, button and link |
-| External release | Paired controls disappeared; “Pairing ended. Ask Nova for a new Pair request when ready.” | Release succeeded |
-| Wait 30 seconds | Pending controls disappeared; “Pair request expired…” recovery text appeared | `pair_expired` |
-| Stop only the owned test broker | “Nova.app unavailable” and reconnect guidance appeared without reopening | Native messaging disconnected |
-| Restart that broker | The same popup returned to connected / no live request | Status connected; a new explicit document registration and Pair succeeded |
-| Navigate the paired tab using the browser test driver | “The page changed…” appeared and the old paired controls disappeared | `document_unloaded`, no route, zero registered frames; old snapshot action rejected |
-| Allow this site | Chrome displayed its real optional-permission prompt for only `nova-consent.test` | Permission grant did not pair a document |
-| Revoke site access | Allowed-site controls disappeared and removal guidance appeared | Chrome permission removed |
+| New Pair request | Reviewed fixture origin/title, countdown, Pair and Deny appeared without reopening | Genuine confirmation bound that document |
+| Pair this page | Same popup changed to PAIRED and Release pairing | Canonical paired-page read returned 16 nodes, including Unicode content |
+| External release | Same popup hid paired controls and showed “Pairing ended…” | Release succeeded |
+| Actual 30-second expiry | Same popup hid pending controls and showed “Pair request expired…” | `pair_expired` |
+| Navigate the fixture | Chrome closed its action popup; reopening showed “The page changed…” and no old paired controls | `document_unloaded`, zero registered frames, old canonical token rejected |
+| Stop only the identified development Nova.app | Same popup showed “Nova.app unavailable…” and reconnect guidance | Native messaging disconnected |
+| Restart that app | Same popup recovered to connected with no live pairing | Status was connected, unpaired and route-free |
+| New explicit registration and confirmation after reconnect | Genuine Pair click showed the replacement document as PAIRED | New document/epoch and fresh canonical 16-node read succeeded |
 
-Native accessibility observations and action-popup screenshots were captured
-in the acceptance session for these transitions. The two committed images
-below show profile settings and the replacement fixture document, rather than
-the action-popup overlays. Chrome closes the popup when displaying its
-optional-permission prompt; it was reopened after granting that permission.
-During the test-driver navigation the popup remained open and updated.
+Native accessibility observations and popup PNGs were captured for these
+transitions. The screenshots below include actual popup overlays, separately
+from the profile and dark fixture images.
+
+![New request in the already-open popup](assets/popup-pending-open.png)
+
+![Actual timeout in the same popup](assets/popup-expired-open.png)
 
 ![Owned profile: Developer mode on, file/incognito access off](assets/popup-profile-boundary.png)
 
-![Replacement fixture document after navigation](assets/popup-navigation-fixture.png)
+![Owned dark fixture](assets/popup-navigation-fixture.png)
 
-The command-line unpacked-extension launch initially enabled Chrome's file
-access checkbox. It was explicitly turned off in this owned test profile;
-incognito stayed off. These settings do not assert a command-line installation
-default. Daily Nova and Bodhi processes retained their original PIDs/start
-times, and no macOS privacy permission was changed.
+Chrome's command-line extension load initially enabled file access. It was
+explicitly disabled in the owned profile; incognito stayed off. This records
+the acceptance setting, not an installation default. The test used temporary
+tab access; real optional site/frame permission prompts were not part of this
+current-candidate run.
+
+An initial timeout observation was interrupted by a separately opened browser
+tab and is not credited; the complete same-popup retry above passed. An early
+post-restart MCP client correctly failed before the private app socket was
+ready, and one later consent attempt expired before its click. Those attempts
+are retained separately from the successful ready-client and confirmation.
+
+All private Nova, native-host and MCP fixture processes were closed, and the
+two owned profile registrations were removed. The browser and rendered dark
+fixture were preserved because other tabs were in use. Daily Nova/Bodhi,
+macOS privacy permissions and the user's running Windows VM were unchanged.
 
 ## Automated async coverage
 
-`npm run check` and `npm test` passed locally on Node 26.10.0: 156 tests,
-zero failures or skips. The existing production worker/popup fixtures cover
-serialized loading/actions, current versus stale errors, delayed read/action
-replies, navigation/candidate invalidation, and late probe success/failure.
-Repeated bootstrap registration does not send another state notification;
-unchanged reads reuse the candidate without another bootstrap or polling.
+`npm run check` and `npm test` passed on Node 26.10.0: 380 tests, zero failures,
+skips or cancellations. The existing production worker/popup fixtures cover
+serialized actions/reads, current and stale errors, delayed responses,
+candidate reuse, navigation invalidation and direct permission gestures.
 
-The native screenshots and real bridge flow above are separate from the
-hermetic async tests. This is development-extension acceptance, not production
-distribution or completion of all parent #23 criteria. CI runs the same
-extension checks on the configured Node 22 runner.
+The independent review's two findings were repaired within this slice.
+Revocation now notifies the popup before best-effort document cleanup; delayed
+native events preserve their response ordering without restoring old popup
+state. Frame metadata removal uses accurate recovery text while preserving
+site access. Six focused regressions failed before repair and passed after it;
+the combined popup/worker suite passed 130 tests.
+
+Actual Chrome observations and hermetic async tests are separate evidence.
+This establishes the development extension's popup lifecycle on macOS, not
+production distribution, TCC grants, real Windows popup acceptance or every
+criterion of parent #23. CI uses its configured Node 22 extension lane.
