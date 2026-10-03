@@ -47,15 +47,19 @@ Nova repository root (the two loopback ports above must be free):
 
 ```sh
 cargo build --locked --bin nova
+RECORDING_LOG=$(mktemp)
 NOVA_BIN=/absolute/path/to/target/debug/nova \
 PLAYWRIGHT_MODULE=/absolute/path/to/node_modules/playwright \
-node docs/demos/record-browser.mjs
+node docs/demos/record-browser.mjs | tee "$RECORDING_LOG"
 ```
 
-The script prints `TRIM_SECONDS` and the temporary `VIDEO` path. Convert that
-recording using the printed trim value and video path:
+The script prints `TRIM_SECONDS` and the temporary `VIDEO` path into the log.
+Assign those printed values in the same shell before converting the recording;
+the Node child process cannot set variables in its parent shell:
 
 ```sh
+TRIM_SECONDS=$(sed -n 's/^TRIM_SECONDS=//p' "$RECORDING_LOG")
+VIDEO=$(sed -n 's/^VIDEO=//p' "$RECORDING_LOG")
 ffmpeg -ss "$TRIM_SECONDS" -i "$VIDEO" \
   -vf 'fps=8,scale=900:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3' \
   -loop 0 -y docs/demos/browser-checklist.gif

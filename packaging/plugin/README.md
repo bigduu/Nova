@@ -20,7 +20,7 @@ with a screenshot fallback.
 This README describes the **current source template**. The published v0.2.1
 plugin predates the AX-first workflow, managed `mcp` command, Nova.app, and
 Chrome DevTools launcher; installing that release does not enable these additions.
-See the [version guide](../../README.md#choose-a-version) before choosing a bundle.
+See the [version guide](https://github.com/bigduu/Nova/blob/master/README.md#choose-a-version) before choosing a bundle.
 
 ## What's in this bundle
 
