@@ -125,6 +125,19 @@ struct InteractionSnapshot {
     node_marks: std::collections::HashMap<String, u32>,
     nodes: std::collections::HashSet<String>,
     related_action_nodes: std::collections::HashMap<String, Vec<String>>,
+    page: Option<PageActions>,
+}
+
+#[derive(Debug, Clone)]
+struct PageAction {
+    binding: nova_chrome_bridge::app::PageBinding,
+    snapshot_id: String,
+    node_id: String,
+}
+
+#[derive(Debug, Default)]
+struct PageActions {
+    targets: std::collections::HashMap<String, PageAction>,
 }
 
 struct AxNodeMaps {
@@ -358,6 +371,7 @@ impl NovaServer {
             node_marks,
             nodes,
             related_action_nodes,
+            page: None,
         };
         id
     }
@@ -561,6 +575,56 @@ impl NovaServer {
             .interaction_action_gate
             .lock()
             .expect("interaction action gate");
+        let page = {
+            let interaction = self.interaction.lock().expect("interaction mutex");
+            if interaction.id == snapshot_id {
+                if let Some(page) = &interaction.page {
+                    Some(page.targets.get(node_id).cloned().ok_or_else(|| {
+                        if interaction.nodes.contains(node_id) {
+                            "paired-page node has no activate capability; select an actionable node"
+                                .to_string()
+                        } else {
+                            "unknown paired-page node; run a fresh ax_read".to_string()
+                        }
+                    })?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(page) = page {
+            self.replace_interaction_unlocked(
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            );
+            drop(_gate);
+            let bridge = self.chrome_bridge.as_ref().ok_or(CHROME_APP_SERVICE_ONLY)?;
+            let result = bridge
+                .activate_bound(
+                    &page.binding,
+                    &page.snapshot_id,
+                    &page.node_id,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .map_err(|error| {
+                    format!("{error}; snapshot consumed; run a fresh paired-page ax_read")
+                })?;
+            let terminal = serde_json::to_string(&result)
+                .map_err(|_| "Chrome terminal serialization failed")?;
+            return if result["status"] == "ok" && result["result"]["activated"] == true {
+                Ok(format!(
+                    "route=chrome_extension {terminal}; snapshot consumed; run a fresh ax_read"
+                ))
+            } else {
+                Err(format!(
+                    "{terminal}; snapshot consumed; inspect the paired page before retrying"
+                ))
+            };
+        }
         let element = self.get_ax_node(snapshot_id, node_id)?;
         // Consume before crossing the process boundary. Provider calls can
         // report failure after partially applying an action, and an outer
@@ -620,6 +684,66 @@ impl NovaServer {
         }
     }
 
+    async fn read_paired_page(
+        &self,
+        generation: String,
+        mode: crate::platform::UiReadMode,
+        max_nodes: usize,
+        max_chars: usize,
+        filter: Option<String>,
+    ) -> rmcp::model::CallToolResult {
+        let Some(bridge) = self.chrome_bridge.clone() else {
+            return err_result(&format!("capability=ax:read provider=chrome_extension status=unavailable {CHROME_APP_SERVICE_ONLY}"));
+        };
+        let deadline = std::time::Instant::now() + READ_UI_TIMEOUT;
+        let task = tokio::task::spawn_blocking(move || {
+            bridge.read_bound(
+                max_nodes as u64,
+                max_chars as u64,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+        });
+        let read = match tokio::time::timeout(READ_UI_TIMEOUT + std::time::Duration::from_secs(1), task).await {
+            Ok(Ok(Ok(read))) => read,
+            Ok(Ok(Err(error))) => return err_result(&format!("capability=ax:read provider=chrome_extension status=unavailable {}", sanitize_ax_field(&error.to_string(), 1024))),
+            _ => return err_result("capability=ax:read provider=chrome_extension status=timed_out; inspect the paired page before retrying"),
+        };
+        if read.result["status"] != "ok" {
+            let terminal = read.result.to_string();
+            return if terminal.chars().count() <= max_chars {
+                err_result(&terminal)
+            } else {
+                let prefix = format!("capability=ax:read provider=chrome_extension status={} terminal_truncated=true receipt_id=\"{}\"; inspect the paired page: ",
+                    sanitize_ax_field(read.result["status"].as_str().unwrap_or("error"),16),
+                    sanitize_ax_field(read.result["receipt"]["receiptId"].as_str().unwrap_or(""),160));
+                err_result(&format!(
+                    "{prefix}{}",
+                    terminal
+                        .chars()
+                        .take(max_chars.saturating_sub(prefix.chars().count()))
+                        .collect::<String>()
+                ))
+            };
+        }
+        let page = match build_page_entries(read, &generation, mode, max_nodes, max_chars, filter.as_deref()) {
+            Ok(page) => page,
+            Err(error) => return err_result(&format!("capability=ax:read provider=chrome_extension status=invalid_provider_snapshot {error}")),
+        };
+        let _gate = self
+            .interaction_action_gate
+            .lock()
+            .expect("interaction action gate");
+        let mut interaction = self.interaction.lock().expect("interaction mutex");
+        if interaction.id != generation {
+            return err_result("paired-page ax_read was superseded by a newer read or capture");
+        }
+        interaction.nodes = page.nodes;
+        interaction.page = Some(PageActions {
+            targets: page.targets,
+        });
+        ok_text(page.output)
+    }
+
     async fn run_ax_read(&self, p: ReadUiParams) -> rmcp::model::CallToolResult {
         let invalidator = self.clone();
         let generation =
@@ -645,6 +769,24 @@ impl NovaServer {
             .filter
             .map(|filter| filter.trim().to_lowercase())
             .filter(|filter| !filter.is_empty());
+        match p.target.as_deref() {
+            None | Some("native") => {}
+            Some("paired_page") => {
+                if p.window.is_some() {
+                    return err_result(
+                        "capability=ax:read status=invalid_target reason=paired_page_with_window",
+                    );
+                }
+                return self
+                    .read_paired_page(generation, mode, max_nodes, max_chars, filter)
+                    .await;
+            }
+            Some(_) => {
+                return err_result(
+                    "capability=ax:read status=unsupported_target expected=native|paired_page",
+                )
+            }
+        }
         let query = p
             .window
             .map(|query| query.trim().to_string())
@@ -1374,6 +1516,215 @@ fn format_ax_node(line: &AxLine) -> String {
     rendered
 }
 
+struct BuiltPage {
+    output: String,
+    nodes: std::collections::HashSet<String>,
+    targets: std::collections::HashMap<String, PageAction>,
+}
+
+fn page_id(value: &serde_json::Value) -> Result<&str, &'static str> {
+    value
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 160
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c))
+        })
+        .ok_or("invalid provider identity")
+}
+
+/// Page-only projection: no UiTarget, native handles/marks or CSS/global bounds.
+fn build_page_entries(
+    read: nova_chrome_bridge::app::BoundPageRead,
+    generation: &str,
+    mode: crate::platform::UiReadMode,
+    max_nodes: usize,
+    max_chars: usize,
+    filter: Option<&str>,
+) -> Result<BuiltPage, &'static str> {
+    use crate::platform::{UiNode, UiNodeStates, UiNodeValue, UiReadMode};
+    let result = &read.result["result"];
+    let snapshot_id = page_id(&result["snapshotId"])?;
+    let source = result["nodes"].as_array().ok_or("nodes must be an array")?;
+    let coverage = result["coverage"]
+        .as_str()
+        .filter(|coverage| {
+            matches!(
+                *coverage,
+                "top_document" | "top_document_and_same_origin_children"
+            )
+        })
+        .ok_or("invalid page coverage")?;
+    let mut truncated = result["truncated"]
+        .as_bool()
+        .ok_or("missing truncation flag")?
+        || source.len() > max_nodes;
+    let mut partial_reason = if source.len() > max_nodes {
+        "node_limit"
+    } else if truncated {
+        "provider_limit"
+    } else {
+        "none"
+    };
+    let mut frame_partial = false;
+    let mut frames = String::new();
+    if let Some(frame) = result.get("frameCoverage") {
+        let status = frame["status"]
+            .as_str()
+            .filter(|s| matches!(*s, "complete" | "partial"))
+            .ok_or("invalid frame coverage")?;
+        frame_partial = status == "partial";
+        let documents = frame["documents"].as_u64().ok_or("invalid frame count")?;
+        let reasons = frame["reasons"].as_array().ok_or("invalid frame reasons")?;
+        let reasons: Vec<_> = reasons
+            .iter()
+            .take(16)
+            .map(|reason| {
+                reason
+                    .as_str()
+                    .map(|s| sanitize_ax_field(s, 64))
+                    .ok_or("invalid frame reason")
+            })
+            .collect::<Result<_, _>>()?;
+        frames = format!(
+            " frame_coverage={{status={status},documents={documents},reasons={reasons:?}}}"
+        );
+    }
+    let header = |truncated: bool, reason: &str| {
+        let status = if truncated || frame_partial {
+            "partial"
+        } else {
+            "complete"
+        };
+        format!("capability=ax:read snapshot_id=\"{}\" target=paired_page provider=chrome_extension mode={} scope=page status={status} coverage={} truncated={} partial_reason={reason} nativeWindowAssociation=unproven top_document_id=\"{}\"{}; use ax_activate for activate-capable nodes; inspect/re-read the paired page after any outcome",
+        sanitize_ax_field(generation,128),mode.as_str(),coverage,truncated,
+        sanitize_ax_field(read.result["route"]["documentId"].as_str().unwrap_or(""),256),frames)
+    };
+    let budget = max_chars.saturating_sub(
+        header(true, "character_limit")
+            .chars()
+            .count()
+            .max(header(false, "character_limit").chars().count()),
+    );
+    let mut output = String::new();
+    let mut used_chars = 0;
+    let mut nodes = std::collections::HashSet::new();
+    let mut identities = std::collections::HashSet::new();
+    let mut targets = std::collections::HashMap::new();
+    for (index, source) in source.iter().take(max_nodes).enumerate() {
+        let provider_id = page_id(&source["nodeId"])?;
+        if !identities.insert(provider_id) {
+            return Err("duplicate provider node identity");
+        }
+        let role = source["role"].as_str().ok_or("missing role")?;
+        let name = source["name"].as_str().ok_or("missing name")?;
+        let actions = source["actions"].as_array().ok_or("missing capabilities")?;
+        let actions: Vec<String> = actions
+            .iter()
+            .map(|action| {
+                action
+                    .as_str()
+                    .filter(|s| matches!(*s, "activate" | "focus" | "set_value" | "scroll"))
+                    .map(str::to_string)
+                    .ok_or("invalid capability")
+            })
+            .collect::<Result<_, _>>()?;
+        let value = match source.get("value") {
+            None => UiNodeValue::Absent,
+            Some(value) if value["kind"] == "text" => UiNodeValue::Text(
+                value["text"]
+                    .as_str()
+                    .ok_or("invalid safe value")?
+                    .to_string(),
+            ),
+            Some(value) if value["kind"] == "redacted" => UiNodeValue::Redacted,
+            _ => return Err("invalid safe value"),
+        };
+        let mut states = UiNodeStates::default();
+        let state = source["states"].as_object().ok_or("invalid states")?;
+        for (key, field) in [
+            ("enabled", &mut states.enabled),
+            ("focused", &mut states.focused),
+            ("selected", &mut states.selected),
+            ("checked", &mut states.checked),
+            ("expanded", &mut states.expanded),
+            ("scrollable", &mut states.scrollable),
+        ] {
+            if let Some(value) = state.get(key) {
+                *field = Some(value.as_bool().ok_or("invalid state")?);
+            }
+        }
+        let actionable = actions.iter().any(|action| action == "activate");
+        let line = AxLine {
+            node_id: format!("n{}", index + 1),
+            mark: None,
+            node: UiNode {
+                role: role.to_string(),
+                name: name.to_string(),
+                description: source
+                    .get("description")
+                    .map(|v| v.as_str().ok_or("invalid description"))
+                    .transpose()?
+                    .unwrap_or("")
+                    .to_string(),
+                value,
+                actions,
+                states,
+                bounds: None,
+                depth: 0,
+                actionable,
+            },
+        };
+        let content = !line.node.name.is_empty()
+            || !line.node.description.is_empty()
+            || !matches!(line.node.value, UiNodeValue::Absent);
+        if (mode == UiReadMode::Interactive && !actionable)
+            || (mode == UiReadMode::Content && !content)
+        {
+            continue;
+        }
+        let shown = filter.is_none_or(|filter| ax_line_matches(&line, filter));
+        if shown {
+            let rendered = format!(
+                "\n{} provider=chrome_extension provider_node_id=\"{}\"",
+                format_ax_node(&line),
+                sanitize_ax_field(provider_id, 160)
+            );
+            if used_chars + rendered.chars().count() > budget {
+                truncated = true;
+                partial_reason = "character_limit";
+                break;
+            }
+            used_chars += rendered.chars().count();
+            output.push_str(&rendered);
+        }
+        nodes.insert(line.node_id.clone());
+        if actionable {
+            targets.insert(
+                line.node_id,
+                PageAction {
+                    binding: read.binding.clone(),
+                    snapshot_id: snapshot_id.to_string(),
+                    node_id: provider_id.to_string(),
+                },
+            );
+        }
+    }
+    let mut rendered = header(truncated, partial_reason);
+    rendered.push_str(&output);
+    // Header fields are separately capped and the caller's minimum is 4096.
+    if rendered.chars().count() > max_chars {
+        return Err("page metadata exceeds output budget");
+    }
+    Ok(BuiltPage {
+        output: rendered,
+        nodes,
+        targets,
+    })
+}
+
 fn format_ax_snapshot(
     snapshot_id: &str,
     built: &BuiltAxEntries,
@@ -1524,7 +1875,7 @@ use serde::Deserialize;
 pub const NOVA_INSTRUCTIONS: &str = "\
 Nova controls the macOS and Windows desktop. `ax_read` is the canonical `ax:read` \
 capability and the FIRST operation for labels, controls, fields, structured text, and \
-semantic state. It reads Accessibility/UIA directly without a screenshot; `read_ui` is \
+semantic state. By default it reads Accessibility/UIA without a screenshot; `read_ui` is \
 only a compatibility alias.
 
 For routine Chrome page automation and debugging, prefer the official Chrome DevTools MCP \
@@ -1533,13 +1884,16 @@ apps, and visual fallback. Nova's separately installed Secure Chrome Bridge rema
 least-privilege option when a user explicitly pairs one page and broad profile access is \
 not acceptable.
 
-When using the Secure Chrome Bridge, first call `chrome_status`. When the user has \
-explicitly paired the active page, prefer `chrome_read` and the exact `chrome_activate`, \
-`chrome_focus`, `chrome_set_value`, or `chrome_scroll` tools over browser AX and pixels. Pairing is bound \
-to one tab/document/page nonce/epoch and is revoked by navigation or disconnect. Run a \
-fresh `chrome_read` immediately before every mutation; Chrome semantic tools never accept \
-or fall back to screen coordinates. If unpaired, call `chrome_pair` and ask the user to \
-confirm the origin in the Nova extension popup within 30 seconds.
+When using the Secure Chrome Bridge, first call `chrome_status`. For an already \
+consented document, use `ax_read(target=\"paired_page\", mode=\"all\")` and exact \
+`ax_activate(snapshot_id, node_id)` tokens. This is page-only: provider=chrome_extension, \
+no native marks/global bounds/window association, and no simultaneous window selector. \
+Only activate-capable nodes are actionable. The captured Session/route cannot retarget \
+action to a new pairing. Accepted tokens are consumed before I/O; page failures never \
+fall back to native AX/UIA, AppleScript, app raising, OCR or coordinates. Read fresh and \
+inspect after every result. Direct chrome_* tools remain available. If unpaired, use \
+chrome_pair and the existing extension-popup origin confirmation. Page-only operations \
+need Chrome consent, not a new macOS TCC grant.
 
 READ in this order:
 1. Call `ax_read(window?, mode=\"all\")`. Respect its coverage/status. \
@@ -1553,8 +1907,8 @@ layout, icon, color, image, canvas, or visual verification. Raw coordinates are 
 ACT in this order:
 1. Immediately before acting, run a fresh `ax_read`, then call \
 `ax_activate(snapshot_id, node_id)` on the exact actionable node. It fails closed on a \
-stale generation and reports route=ax|uia|web_dom|element_center. Every activation attempt \
-consumes the generation before provider dispatch, so rerun ax_read after any result.
+stale generation and reports route=chrome_extension|ax|uia|web_dom|element_center. \
+An accepted current actionable token consumes the generation before provider dispatch, so rerun ax_read after any result.
 2. Let ax_activate use its freshly verified element-center fallback when semantic \
 activation is unsupported. For AX-less rendered text, use the center returned by OCR.
 3. Only then click coordinates from a focused screenshot/zoom. Never guess from a \
@@ -1829,6 +2183,10 @@ pub struct OcrParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadUiParams {
+    /// `native` (default) reads AX/UIA. `paired_page` reads only the already
+    /// consented Chrome document; mutually exclusive with `window`.
+    #[serde(default)]
+    pub target: Option<String>,
     /// Target a single on-screen window: a case-insensitive substring of its
     /// title or app name (e.g. "Safari", "Settings"). Omit to read the current
     /// target app — the last window-captured or read_ui'd app, otherwise the
@@ -2638,11 +2996,13 @@ impl NovaServer {
         name = "ax_activate",
         description = "Activate one actionable node from the immediately preceding ax_read using \
                        its snapshot_id and node_id. This generation-safe action fails closed when \
-                       the UI has been read again. It uses the web DOM bridge for scriptable \
+                       the UI has been read again. Paired-page nodes use their captured Chrome \
+                       Session/route and provider IDs; DOM errors never use native/coordinate \
+                       fallback. Native nodes use the web DOM bridge for scriptable \
                        browser content, native AX/UIA activation otherwise, then a freshly \
                        verified element-center fallback. \
-                       The result reports route=ax|uia|web_dom|element_center. Every activation \
-                       attempt consumes that generation before provider dispatch, so rerun \
+                       The result reports route=chrome_extension|ax|uia|web_dom|element_center. An accepted \
+                       current actionable token consumes that generation before provider dispatch, so rerun \
                        ax_read after any result."
     )]
     #[tracing::instrument(skip_all, fields(snapshot_id = %p.snapshot_id, node_id = %p.node_id), level = "info")]
@@ -2689,7 +3049,11 @@ impl NovaServer {
 
     #[tool(
         name = "ax_read",
-        description = "Canonical `ax:read` capability. Read visible semantic UI directly from \
+        description = "Canonical `ax:read` capability. target=paired_page selects only the already \
+                       consented Chrome document, before native targeting; mutually exclusive with \
+                       window. Page nodes have provider=chrome_extension and no native marks/global \
+                       bounds; page failures require inspection/re-pairing and never native or pixel \
+                       fallback. target=native (default) reads visible semantic UI directly from \
                        macOS Accessibility or Windows UI Automation without taking a screenshot. \
                        Returns an ephemeral snapshot_id, deterministic node ids, role/name/\
                        description/value/actions/state, optional global-logical bounds, explicit \
@@ -3954,6 +4318,7 @@ mod tests {
         );
         let result = server
             .ax_read(Parameters(ReadUiParams {
+                target: None,
                 window: None,
                 filter: None,
                 max: None,
@@ -4272,6 +4637,7 @@ mod tests {
     async fn ax_read_and_read_ui_alias_share_the_headless_typed_outcome() {
         fn params() -> ReadUiParams {
             ReadUiParams {
+                target: None,
                 window: None,
                 filter: None,
                 max: None,
