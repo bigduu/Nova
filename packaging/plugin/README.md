@@ -68,6 +68,35 @@ the selected profile. It requires Chrome 144+, and Chrome chooses its default
 profile when several are active. Nova's separately installed Secure Chrome
 Bridge remains the least-privilege choice for an explicitly paired page.
 
+Application-level consumers should accept an app name/bundle ID and use Nova's
+app discovery internally. The following endpoint flags and separate sidecar
+configuration are advanced/internal transport compatibility; full automatic
+app-to-provider routing remains a separate integration slice. Discovery is not
+authorization for broad CDP access.
+
+To attach to an already selected, running browser, use either
+`--browser-url http://127.0.0.1:9222` or
+`--ws-endpoint ws://[::1]:9222/devtools/browser/<id>`. Do not combine either with
+`--profile` (even `isolated`), `--headless`, or the other endpoint. HTTP(S) accepts
+only the browser root; WS(S) requires `/devtools/browser/<id>` with an ID of
+letters, digits, hyphen or underscore. The raw address must contain a loopback
+IP literal and explicit nonzero port; credentials, query and fragment are
+rejected before npx. The isolated default and telemetry/header privacy defaults
+are unchanged. Endpoint mode adds no browser launch flags or fallback launch;
+`--enable-webmcp` only exposes the category and warns that the running browser
+must already have the WebMCP feature enabled.
+
+Treat the selected endpoint as trusted: Puppeteer can follow HTTP discovery
+results and WebSocket redirects to other addresses. This is not network
+confinement. See [endpoint contracts and pinned primary sources](https://github.com/bigduu/Nova#chrome-devtools-mcp-sidecar).
+Use `list_pages`, then explicit `pageId` for every page-scoped read/action,
+including across two windows. Browser-level CDP is required; renderer-only
+sockets and Node main-process inspectors do not satisfy this contract.
+Electron/CEF remain experimental/unverified per runtime. Detaching the sidecar
+preserves an attached application. Connection failure does not require quitting
+Bodhi; refresh the selected app's discovery/setup and retry only the sidecar,
+while native AX and the separately paired extension remain available.
+
 The sidecar still runs as an `npx` process launched from Bamboo's process
 chain. Nova dispatches it before calling Nova's desktop APIs; this is not a
 promise about macOS responsible-process attribution for arbitrary child
