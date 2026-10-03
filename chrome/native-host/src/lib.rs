@@ -9,6 +9,9 @@ pub mod app;
 pub mod framing;
 pub mod protocol;
 
+#[cfg(any(unix, windows))]
+mod peer;
+
 #[cfg(windows)]
 mod registration;
 #[cfg(unix)]

@@ -144,7 +144,9 @@ fn extension(
             let request = host.receive();
             assert_eq!(request["action"], action);
             let body = match action {
-                "status" => json!({"paired":false}),
+                "status" => {
+                    json!({"paired":false,"ownership":{"status":"verified_chrome","kernelPeerPid":1}})
+                }
                 "pair" => json!({"route":route()}),
                 "read" => {
                     assert_eq!(request["route"], route());
@@ -174,17 +176,34 @@ fn ready_status(mcp: &mut Mcp) -> Value {
     }
 }
 
+fn ownership(response: &Value) -> Value {
+    let terminal: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    terminal["result"]["ownership"].clone()
+}
+
+fn observed_host(status: &Value, host: &Host) {
+    assert_eq!(status["status"], "process_relationship_observed");
+    assert_eq!(status["kernelPeerPid"], host.child.id());
+    assert_eq!(status["host"]["pid"], host.child.id());
+    assert_eq!(status["parentCandidate"]["pid"], std::process::id());
+    assert_eq!(status["launchKind"], "direct_parent");
+    assert_eq!(status["browserIdentity"], "unproven");
+    assert_eq!(status["nativeWindowAssociation"], "unproven");
+}
+
 #[test]
 fn windows_managed_mcp_pair_read_receipts_second_process_reconnect_and_shutdown() {
     let path = endpoint();
     let mut mcp = Mcp::spawn(&["mcp"], &path, Some(ID));
     mcp.handshake();
     let driver = extension(&path, vec!["status", "pair", "read"]);
-    ready_status(&mut mcp);
+    let first = ownership(&ready_status(&mut mcp));
     assert!(successful(&mcp.chrome(11, "chrome_pair")));
     assert!(successful(&mcp.chrome(12, "chrome_read")));
     let (mut host, requests) = driver.join().unwrap();
     assert_eq!(requests.len(), 3);
+    observed_host(&first, &host);
     let mut second = Mcp::spawn(&["mcp"], &path, Some(ID));
     assert!(!second.wait().success());
     assert!(second.stderr().contains("another broker"));
@@ -195,8 +214,10 @@ fn windows_managed_mcp_pair_read_receipts_second_process_reconnect_and_shutdown(
         "broker ownership must survive host loss"
     );
     let driver = extension(&path, vec!["status"]);
-    ready_status(&mut mcp);
+    let recovered = ownership(&ready_status(&mut mcp));
     let (mut host, _) = driver.join().unwrap();
+    observed_host(&recovered, &host);
+    assert_ne!(recovered["host"], first["host"]);
     drop(mcp.input.take());
     assert!(mcp.wait().success());
     assert!(
