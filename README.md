@@ -32,8 +32,8 @@ implied. The reproduction notes explain the `--npx` adapter and isolated browser
 | [Published v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1) | macOS/Windows binaries with the earlier screenshot, mark, and input tools. Start with [Install](#install). |
 | Current source | AX-first `ax_read`/`ax_activate`, managed `nova mcp`, the Nova.app development preview, and the optional Chrome DevTools launcher. Build from source for the workflows described below. |
 
-The source manifest still says `0.2.1`; that does **not** make post-tag features
-available in the released binary. Nova.app is a development preview, not a
+The source manifest now says `0.3.0` in preparation for the next release; until
+the `v0.3.0` tag is published, post-tag features are **not** available in a released binary. Nova.app is a development preview, not a
 notarized production app. [Audit evidence](docs/readme-audit.md).
 
 ## Start with one task
@@ -778,8 +778,8 @@ Run the hermetic release checks before tagging:
 scripts/test-release-workflow.sh
 ```
 
-The current crate version is already published as `v0.2.1`; bump it before
-creating the next release tag. Release tags must be protected from force updates;
+The source manifest is `0.3.0` (not yet published); make sure the tag matches the
+manifest version before creating the next release tag. Release tags must be protected from force updates;
 the workflow also serializes runs by tag and re-verifies the tag before its first
 upload. The Nova.app asset must remain labeled
 **DEVELOPMENT ONLY** until all production distribution gates are complete:
