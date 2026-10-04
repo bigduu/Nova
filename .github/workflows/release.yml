@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ needs.release-meta.outputs.version }}"
           ASSET="nova-v${VERSION}-universal-apple-darwin.tar.gz"
-          tar -czf "$ASSET" nova
+          tar -czf "$ASSET" nova LICENSE
           SHA="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
           echo "$SHA  $ASSET" > "$ASSET.sha256"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
@@ -245,7 +245,7 @@ jobs:
           $target  = "${{ matrix.target }}"
           $asset   = "nova-v$version-$target.zip"
           Copy-Item "target/$target/release/nova.exe" -Destination "nova.exe"
-          Compress-Archive -Path "nova.exe" -DestinationPath $asset -Force
+          Compress-Archive -Path "nova.exe", "LICENSE" -DestinationPath $asset -Force
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
           "$hash  $asset" | Set-Content -Encoding ascii "$asset.sha256"
           echo "asset=$asset" >> $env:GITHUB_OUTPUT
@@ -361,7 +361,8 @@ jobs:
             dist/nova-plugin/plugin.json > /dev/null
 
           cp dist/nova-plugin/plugin.json "dist/nova-plugin-v${VERSION}.json"
-          tar -czf "dist/nova-plugin-v${VERSION}.tar.gz" -C dist/nova-plugin plugin.json skills README.md
+          cp LICENSE dist/nova-plugin/LICENSE
+          tar -czf "dist/nova-plugin-v${VERSION}.tar.gz" -C dist/nova-plugin plugin.json skills README.md LICENSE
           # Bundle checksum sidecar: `bamboo plugin install <url> --sha256 <hex>`
           # verifies the downloaded bundle against this (secure-by-default —
           # a URL install without a checksum is refused). Same `<hex>  <file>`

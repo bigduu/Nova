@@ -67,6 +67,7 @@ rm -rf "$APP"
 rm -f "$ASSET" "$ASSET.sha256"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+cp "$SCRIPT_DIRECTORY/../../LICENSE" "$APP/Contents/Resources/LICENSE"
 cp "$SOURCE_BINARY" "$APP_BINARY"
 chmod 0755 "$APP_BINARY"
 
