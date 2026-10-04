@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Private Chrome Native Messaging bridge for Nova.app"
 license = "MIT"
+license-file = "../../LICENSE"
 publish = false
 
 [lib]
