@@ -1,144 +1,63 @@
 # Nova
 
-![Nova brand illustration: a mechanical arm operating a symbolic interface in a forest.](docs/assets/nova-nature-hero.png)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-*Brand illustration, not a software screenshot. A mechanical arm represents computer interaction.*
+**Let any MCP agent use your real Mac or Windows apps.** Nova is a single Rust
+binary, with no Python runtime, that gives Claude Desktop, Cursor, Codex, Claude
+Code and other MCP clients screenshots, native OCR, keyboard and mouse input,
+clipboard access, window/app control and Accessibility/UIA actions on macOS and
+Windows.
 
-**Let your agent work with desktop apps through MCP.** Nova provides semantic
-UI reads and actions, screenshots, keyboard/mouse input, OCR, and clipboard
-access on macOS and Windows. Use it when a task needs a real application's UI:
-read a dialog, activate a control, or check the result on screen.
+[Releases](https://github.com/bigduu/Nova/releases/latest) · Part of [Bodhi](https://github.com/bigduu/Zenith) · [Bodhi desktop app](https://github.com/bigduu/Bodhi-AI/releases/latest) · [MIT](LICENSE)
 
-Nova supplies the computer/browser tools; your MCP host supplies the model,
-planning, and approval policy. In [Zenith](https://github.com/bigduu/Zenith),
-[Bamboo](https://github.com/bigduu/Bamboo-agent) is the agent runtime and Nova
-is an optional tool provider, also usable by other MCP clients.
+- **Your real desktop, not a VM:** macOS 14+ (Apple Silicon and Intel) and
+  Windows x64/ARM64.
+- **Reads before it clicks:** Accessibility/UIA controls, Apple Vision or
+  Windows OCR, and per-window screenshots with zoom. Clicks are given in the
+  screenshot's pixel space and mapped back to the screen.
+- **Types any text:** full Unicode keyboard input, including Chinese, Japanese,
+  Korean and emoji.
+- **On `master`, for the next release:** AX-first `ax_read` / `ax_activate`
+  that reject stale snapshots, a 64-step `batch_actions` limit with structured
+  failure reports, the Nova.app permission owner and an optional Chrome DevTools
+  sidecar. The latest published release is **v0.2.1**; see
+  [Choose a version](#choose-a-version).
 
-## Watch a browser task from source
-
-![Nova uses real browser MCP actions to check two demo items and prepare a review.](docs/demos/browser-checklist.gif)
+<p align="center"><img src="docs/demos/browser-checklist.gif" alt="Nova uses real browser MCP actions to check two demo items and prepare a review." width="720"></p>
 
 [Static image](docs/demos/browser-checklist.png) · [Reproduce and inspect MCP evidence](docs/demos/README.md)
 
-Recorded on Linux from the source checkout, **not the v0.2.1 release**. A dedicated
-fixture page and recording adapter are used; navigation and clicks are real MCP
-calls. No model reasoning, native desktop operation or actual release review is
-implied. The reproduction notes explain the `--npx` adapter and isolated browser.
+This recording shows Nova's **browser tool path** (`master` source, a fixture
+page and real MCP navigation/click calls). It was captured on Linux, so it does
+not show native macOS/Windows desktop control, model reasoning or a release
+binary. The reproduction notes explain the `--npx` adapter and isolated browser.
 
-## Choose a version
-
-| Path | What you get |
-| --- | --- |
-| [Published v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1) | macOS/Windows binaries with the earlier screenshot, mark, and input tools. Start with [Install](#install). |
-| Current source | AX-first `ax_read`/`ax_activate`, managed `nova mcp`, the Nova.app development preview, and the optional Chrome DevTools launcher. Build from source for the workflows described below. |
-
-The source manifest now says `0.3.0` in preparation for the next release; until
-the `v0.3.0` tag is published, post-tag features are **not** available in a released binary. Nova.app is a development preview, not a
-notarized production app. [Audit evidence](docs/readme-audit.md).
-
-## Start with one task
-
-1. [Install or build Nova](#install) for the chosen version and connect it to
-   your [MCP host](#use-it-from-an-mcp-client).
-2. On a supported desktop, open a non-sensitive test window and grant the
-   [required permissions](#requirements).
-3. With current source, ask the agent to read the window with `ax_read`, activate
-   a returned control with `ax_activate`, then read again to verify the result.
-   Use focused OCR or a screenshot when the UI does not expose enough semantics.
-
-Native desktop tools use platform APIs without a Python/JavaScript runtime.
-The optional Chrome DevTools launcher has separate Node/Chrome requirements;
-it is not the paired-page [Chrome bridge](chrome/README.md).
-
-## Tools (current source)
-
-| Tool | What it does |
-| --- | --- |
-| `ax_read` | Canonical `ax:read`: read semantic labels, text, values, roles, actions, state, and optional bounds through macOS Accessibility or Windows UIA, without a screenshot. Returns an ephemeral snapshot/node protocol and explicit coverage/status. |
-| `read_ui` | Compatibility alias backed by the same `ax_read` traversal and cache generation. |
-| `ax_activate` | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
-| `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
-| `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
-| `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. `mode=auto` uses Fast first with confidence-based Accurate fallback; `mode=fast\|accurate` forces either policy. An optional strict `roi={x,y,width,height}` re-captures a rectangle from the current image through the native region path. Returns each line with a clickable center. |
-| `click_mark` | Compatibility action for the latest numbered mark; prefer generation-safe `ax_activate`. |
-| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input in the pixel space of the last screenshot. |
-| `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
-| `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
-| `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
-| `inspect_app` | Optional macOS app capability discovery. Accepts an app name/bundle ID, or discovers running Chromium candidates when omitted; no caller-supplied port or permission prompt. |
-| `read_clipboard` / `write_clipboard` | Clipboard access. |
-| `ax_click` / `ax_set_value` / `ax_focus` | Drive controls by Accessibility role/label. |
-| `dump_ax` | Read the raw AX/UIA tree for diagnostics and coverage debugging. |
-| `batch_actions` | Run a sequence of input actions in one call. |
-| `wait` | Pause for a specified number of seconds. |
-
-`batch_actions` runs at most 64 actions sequentially and stops at the first
-failure, without retry or rollback. Success keeps the newline-separated status
-lines. Failure sets MCP `isError=true` and returns the same JSON in text content
-and `structuredContent`: `completed: [{index, result}]`, `failed_index`, `reason`,
-and `not_executed: {start, end_exclusive}`. Indices are zero-based; the half-open
-range includes only actions after the failed step, which may already have partial
-side effects. More than 64 actions is rejected before any action runs, with
-`failed_index: null` and the whole batch marked unexecuted. Each acknowledgement
-or reason is limited to 512 Unicode characters, retaining its beginning and end
-with `…` in the middle when shortened. Typed text keeps character/UTF-8 byte
-counts rather than plaintext. Inspect progress and obtain fresh `ax_read` state
-before deciding what to retry; replaying the whole batch could repeat completed
-side effects.
-
-## Requirements
-
-- **Linux:** the source builds a headless MCP server for protocol checks; native
-  desktop actions return an unsupported/headless error. This is not Linux
-  desktop automation.
-- **macOS 14+** for the macOS desktop backend. The release archive is universal
-  and runs on Apple Silicon and Intel Macs.
-- **Windows x86_64 or ARM64** for the Windows desktop backend. GitHub Releases
-  provide a native archive for each architecture.
-- On Windows, `ocr` uses installed Windows OCR language packs. Use
-  `nova --ocr-langs` to inspect available languages; install the needed pack if
-  recognition reports that it is unavailable.
-- Building on macOS requires the macOS 15 SDK / Xcode 16+ because of a
-  transitive `apple-metal` build dependency; that is a build-time requirement,
-  not Nova's minimum macOS runtime version.
-- On macOS, **Screen Recording** permission is required for `screenshot`, `ocr`,
-  and `list_windows`; **Accessibility** is required for `ax_read`, semantic
-  activation, and input.
-
-> macOS grants these permissions to the process it identifies as responsible
-> for Nova. The managed `nova mcp` entrypoint and Bamboo plugin use the independent
-> Nova.app on macOS. Legacy direct stdio/HTTP can use the host app, terminal, or
-> directly launched binary as the permission subject. See
-> [Permissions & code signing](#permissions--code-signing-macos).
-
-## Run
-
-```sh
-cargo run                      # stdio transport (default)
-cargo run -- mcp                # managed MCP: Nova.app on macOS, stdio elsewhere
-cargo run -- --http            # Streamable HTTP on 127.0.0.1:3100
-cargo run -- --http --addr 127.0.0.1:8080
-```
-
-> The Swift runtime that ScreenCaptureKit links is located via an `LC_RPATH`
-> baked in by `build.rs`, so no `DYLD_*` environment variable is needed for
-> `cargo run`/`cargo test` or the standalone binary.
 
 ## Install
 
-The supported public installation paths are a source build and the verified
-prebuilt archives on the [`v0.2.1` GitHub
-Release](https://github.com/bigduu/Nova/releases/tag/v0.2.1). That release
-provides:
-
-| Platform | Archive |
+| Platform | Published v0.2.1 |
 | --- | --- |
-| macOS, Apple Silicon + Intel | `nova-v<version>-universal-apple-darwin.tar.gz` |
-| Windows x86_64 | `nova-v<version>-x86_64-pc-windows-msvc.zip` |
-| Windows ARM64 | `nova-v<version>-aarch64-pc-windows-msvc.zip` |
+| macOS 14+ (Homebrew) | `brew install bigduu/tap/nova` |
+| macOS 14+ (manual) | `nova-v0.2.1-universal-apple-darwin.tar.gz` from [Releases](https://github.com/bigduu/Nova/releases/tag/v0.2.1) |
+| Windows x86_64 | `nova-v0.2.1-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `nova-v0.2.1-aarch64-pc-windows-msvc.zip` |
+| Linux | Desktop control is not supported (headless protocol checks only) |
 
-Download the matching `.sha256` file from the same release and verify the
-archive before extracting it. On macOS:
+**Homebrew (macOS):**
+
+```sh
+brew tap bigduu/tap
+brew install bigduu/tap/nova
+nova --version
+```
+
+The formula installs the CLI from the release archive. It does not configure an
+MCP client or grant macOS permissions. Run `which nova` to find the path to use
+below: usually `/opt/homebrew/bin/nova` on Apple Silicon and
+`/usr/local/bin/nova` on Intel Macs.
+
+**Manual download:** download the matching `.sha256` file from the same release
+and verify the archive before extracting it. On macOS:
 
 ```sh
 tar -xzf nova-v*-universal-apple-darwin.tar.gz
@@ -148,14 +67,10 @@ sudo install -m 0755 nova /usr/local/bin/nova
 
 On Windows, extract the archive for the machine's architecture and invoke
 `nova.exe` directly or place its directory on `PATH`. The Windows binaries are
-not Authenticode-signed, so SmartScreen may warn on first run.
+not Authenticode-signed, so SmartScreen may warn on first run. The macOS binary
+is ad-hoc signed, not notarized.
 
-> `v0.2.1` predates the current AX-first tools (`ax_read`, `read_ui`, and
-> `ax_activate`), the managed `mcp` command, and Nova.app. Its archives provide
-> the earlier screenshot/mark/input tool set. Build the current source below
-> when using this workflow; those features are not in the `v0.2.1` binaries.
-
-To build from source:
+**Build from source** (for the features on `master`):
 
 ```sh
 git clone https://github.com/bigduu/Nova.git
@@ -163,57 +78,77 @@ cd Nova
 cargo build --release --locked
 ```
 
-The result is `target/release/nova` on macOS or
-`target/release/nova.exe` on Windows. The macOS release binary is ad-hoc signed,
-not notarized.
+The result is `target/release/nova` on macOS or `target/release/nova.exe` on
+Windows. Do not use `cargo install nova`: that crates.io name belongs to an
+unrelated project. Nova is not published on npm.
 
-### Nova.app development preview
+## Choose a version
 
-Releases cut from a revision containing the app packaging workflow also attach:
+| Path | What you get |
+| --- | --- |
+| [Published v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1) (Homebrew and release archives) | Screenshots, `zoom_region`, OCR, numbered marks with `click_mark`, mouse/keyboard input, `ax_click` / `ax_set_value` / `ax_focus`, `dump_ax`, windows/apps, clipboard, `batch_actions`, `wait`. |
+| `master` (next release, build from source) | Everything above plus AX-first `ax_read` / `read_ui` / `ax_activate`, `inspect_app`, managed `nova mcp`, the Nova.app development preview, the Chrome DevTools sidecar and the paired-page [Chrome bridge](chrome/README.md). |
 
-`nova-v<version>-universal-apple-darwin-development-app.zip`
-
-This archive contains a universal `Nova.app` that runs Nova's per-user app
-service without a Dock icon. It gives Screen Recording and Accessibility a Nova
-application identity instead of making the MCP host (for example, Bodhi) the
-permission subject. Install and start it with:
-
-```sh
-shasum -a 256 -c nova-v*-universal-apple-darwin-development-app.zip.sha256
-unzip nova-v*-universal-apple-darwin-development-app.zip
-ditto Nova.app /Applications/Nova.app
-open -gj -b com.zenith.nova
-```
-
-Install the app independently of Bodhi and the plugin's downloaded CLI. Keep it
-at `/Applications/Nova.app` (or `~/Applications/Nova.app`), outside Bodhi.app and
-the plugin directory. The plugin still downloads the CLI archive and uses it
-only as the connector on macOS; installing/updating the plugin does not install
-or update Nova.app. Use a CLI and app built from the same current version.
-
-Configure a stdio MCP client with `nova mcp`, as shown in
-[Use it from an MCP client](#use-it-from-an-mcp-client) below. If no app archive
-has been published for the current code, build both macOS architectures,
-combine them into a universal binary, then assemble the app with
-[`package-development-app.sh`](packaging/macos/package-development-app.sh),
-which requires a universal binary and the matching Cargo version as arguments.
-
-> [!WARNING]
-> The app archive is **DEVELOPMENT ONLY**. It is ad-hoc signed, not Developer ID
-> signed, not notarized, and not stapled. Gatekeeper can block it, and replacing
-> it with a differently signed build can require granting TCC permissions again.
-> The existing universal CLI `.tar.gz` remains the supported artifact consumed
-> by Homebrew, npm, and Bamboo; the app `.zip` does not replace it.
+The source manifest on `master` says `0.3.0`; until a `v0.3.0` release is
+published, those additions are **not** in any released binary or in the
+Homebrew formula. Nova.app is a development preview, not a notarized production
+app. [Audit evidence](docs/readme-audit.md).
 
 ## Use it from an MCP client
 
-For **v0.2.1**, configure `"args": []` for direct stdio. The managed
-configuration below requires current source and, on macOS, Nova.app.
+These snippets use **direct stdio** (no arguments). It works with the v0.2.1
+release and with a `master` build. Replace the path with your own `which nova`
+output, the extracted binary or `target/release/nova`. GUI clients do not
+always inherit your shell `PATH`, so use an absolute path.
 
-**Claude Desktop** (or any stdio MCP client) — add Nova to the client's MCP
-config. Claude Desktop uses
-`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS and
-`%APPDATA%\Claude\claude_desktop_config.json` on Windows:
+**Claude Desktop:** edit
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows.
+**Cursor:** edit `~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` in
+one project.
+
+```json
+{
+  "mcpServers": {
+    "nova": { "command": "/opt/homebrew/bin/nova", "args": [] }
+  }
+}
+```
+
+**Claude Code:**
+
+```sh
+claude mcp add --scope user nova -- /opt/homebrew/bin/nova
+```
+
+**Codex:** add to `~/.codex/config.toml`, or run
+`codex mcp add nova -- /opt/homebrew/bin/nova`:
+
+```toml
+[mcp_servers.nova]
+command = "/opt/homebrew/bin/nova"
+args = []
+```
+
+On Windows, use the full path to `nova.exe`, escaped in JSON
+(`"C:\\Tools\\nova\\nova.exe"`) or as a TOML literal string
+(`'C:\Tools\nova\nova.exe'`).
+
+**macOS permissions:** in direct stdio mode, macOS usually attributes Nova to the
+app that launches it. Grant **Accessibility** (input and UI control) and
+**Screen Recording** (`screenshot`, `ocr`, `list_windows`) to Claude Desktop,
+Cursor, or the terminal/IDE that runs Claude Code or Codex. If that does not
+work, add the `nova` binary itself. Then restart or reconnect the MCP server.
+On `master`, you can instead let [Nova.app](#novaapp-development-preview) own
+the permissions; see [Managed mode](#managed-mode-with-novaapp-master).
+
+Try: *"Use Nova to list my open windows, take a screenshot of the frontmost one
+and tell me which buttons you can see."*
+
+### Managed mode with Nova.app (`master`)
+
+Not in v0.2.1. With a `master` build, `nova mcp` is the cross-platform managed
+entrypoint used by the Bamboo plugin:
 
 ```json
 {
@@ -223,13 +158,12 @@ config. Claude Desktop uses
 }
 ```
 
-`mcp` is the cross-platform managed entrypoint used by the Bamboo plugin.
-Windows and Linux headless builds serve ordinary stdio MCP. On macOS it only
-connects to the independent Nova.app, launching it through LaunchServices when
-needed. Install the app separately, open it once, and grant **Accessibility** to
-Nova; **Screen Recording** is needed for capture, OCR, and `list_windows` (the
-app menu requests it only when you explicitly choose that action). The bundled
-executable can also be used as the connector:
+Windows and Linux headless builds serve ordinary stdio MCP. On macOS, `mcp`
+only connects to the independent Nova.app, launching it through LaunchServices
+when needed. Install the app separately, open it once, and grant
+**Accessibility** to Nova; **Screen Recording** is needed for capture, OCR, and
+`list_windows` (the app menu requests it only when you explicitly choose that
+action). The bundled executable can also be used as the connector:
 
 ```json
 {
@@ -272,7 +206,7 @@ embedded runtime.
 
 ### Chrome DevTools MCP sidecar
 
-For advanced Chrome page automation and debugging, Nova can launch the official
+*`master` only; not in v0.2.1.* For advanced Chrome page automation and debugging, Nova can launch the official
 [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 next to the desktop server. This is a transparent stdio sidecar, not a second
 browser implementation inside Nova. It requires npm/`npx`, Node.js
@@ -450,11 +384,127 @@ Write diagnostics retain character/UTF-8 byte counts and native operation
 details without echoing the value. Explicit reads such as `read_clipboard`
 and `ax_read` still return the requested content.
 
+## Requirements
+
+- **Linux:** the source builds a headless MCP server for protocol checks; native
+  desktop actions return an unsupported/headless error. This is not Linux
+  desktop automation.
+- **macOS 14+** for the macOS desktop backend. The release archive is universal
+  and runs on Apple Silicon and Intel Macs.
+- **Windows x86_64 or ARM64** for the Windows desktop backend. GitHub Releases
+  provide a native archive for each architecture.
+- On Windows, `ocr` uses installed Windows OCR language packs. Use
+  `nova --ocr-langs` to inspect available languages; install the needed pack if
+  recognition reports that it is unavailable.
+- Building on macOS requires the macOS 15 SDK / Xcode 16+ because of a
+  transitive `apple-metal` build dependency; that is a build-time requirement,
+  not Nova's minimum macOS runtime version.
+- On macOS, **Screen Recording** permission is required for `screenshot`, `ocr`,
+  and `list_windows`; **Accessibility** is required for `ax_read`, semantic
+  activation, and input.
+
+> macOS grants these permissions to the process it identifies as responsible
+> for Nova. On `master`, the managed `nova mcp` entrypoint and Bamboo plugin use the
+> independent Nova.app on macOS. Direct stdio/HTTP (the only mode in v0.2.1) can use the host app, terminal, or
+> directly launched binary as the permission subject. See
+> [Permissions & code signing](#permissions--code-signing-macos).
+
+## Tools
+
+Tools marked *(master)* are not in the v0.2.1 release.
+
+| Tool | What it does |
+| --- | --- |
+| `ax_read` *(master)* | Canonical `ax:read`: read semantic labels, text, values, roles, actions, state, and optional bounds through macOS Accessibility or Windows UIA, without a screenshot. Returns an ephemeral snapshot/node protocol and explicit coverage/status. |
+| `read_ui` *(master)* | Compatibility alias backed by the same `ax_read` traversal and cache generation. |
+| `ax_activate` *(master)* | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
+| `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
+| `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
+| `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. `mode=auto` uses Fast first with confidence-based Accurate fallback; `mode=fast\|accurate` forces either policy. An optional strict `roi={x,y,width,height}` re-captures a rectangle from the current image through the native region path. Returns each line with a clickable center. |
+| `click_mark` | Compatibility action for the latest numbered mark; prefer generation-safe `ax_activate`. |
+| `left_click` / `right_click` / `double_click` / `mouse_move` / `scroll` | Pointer input in the pixel space of the last screenshot. |
+| `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
+| `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
+| `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
+| `inspect_app` *(master)* | Optional macOS app capability discovery. Accepts an app name/bundle ID, or discovers running Chromium candidates when omitted; no caller-supplied port or permission prompt. |
+| `read_clipboard` / `write_clipboard` | Clipboard access. |
+| `ax_click` / `ax_set_value` / `ax_focus` | Drive controls by Accessibility role/label. |
+| `dump_ax` | Read the raw AX/UIA tree for diagnostics and coverage debugging. |
+| `batch_actions` | Run a sequence of input actions in one call. |
+| `wait` | Pause for a specified number of seconds. |
+
+On `master`, `batch_actions` runs at most 64 actions sequentially and stops at the first
+failure, without retry or rollback. Success keeps the newline-separated status
+lines. Failure sets MCP `isError=true` and returns the same JSON in text content
+and `structuredContent`: `completed: [{index, result}]`, `failed_index`, `reason`,
+and `not_executed: {start, end_exclusive}`. Indices are zero-based; the half-open
+range includes only actions after the failed step, which may already have partial
+side effects. More than 64 actions is rejected before any action runs, with
+`failed_index: null` and the whole batch marked unexecuted. Each acknowledgement
+or reason is limited to 512 Unicode characters, retaining its beginning and end
+with `…` in the middle when shortened. Typed text keeps character/UTF-8 byte
+counts rather than plaintext. Inspect progress and obtain fresh `ax_read` state
+before deciding what to retry; replaying the whole batch could repeat completed
+side effects.
+
+In v0.2.1, `batch_actions` also runs sequentially and stops at the first failure, without the 64-action limit or the structured failure report.
+
+## Run
+
+```sh
+cargo run                      # stdio transport (default)
+cargo run -- mcp                # managed MCP: Nova.app on macOS, stdio elsewhere
+cargo run -- --http            # Streamable HTTP on 127.0.0.1:3100
+cargo run -- --http --addr 127.0.0.1:8080
+```
+
+> The Swift runtime that ScreenCaptureKit links is located via an `LC_RPATH`
+> baked in by `build.rs`, so no `DYLD_*` environment variable is needed for
+> `cargo run`/`cargo test` or the standalone binary.
+
+## Nova.app development preview
+
+Releases cut from a revision containing the app packaging workflow also attach:
+
+`nova-v<version>-universal-apple-darwin-development-app.zip`
+
+This archive contains a universal `Nova.app` that runs Nova's per-user app
+service without a Dock icon. It gives Screen Recording and Accessibility a Nova
+application identity instead of making the MCP host (for example, Bodhi) the
+permission subject. Install and start it with:
+
+```sh
+shasum -a 256 -c nova-v*-universal-apple-darwin-development-app.zip.sha256
+unzip nova-v*-universal-apple-darwin-development-app.zip
+ditto Nova.app /Applications/Nova.app
+open -gj -b com.zenith.nova
+```
+
+Install the app independently of Bodhi and the plugin's downloaded CLI. Keep it
+at `/Applications/Nova.app` (or `~/Applications/Nova.app`), outside Bodhi.app and
+the plugin directory. The plugin still downloads the CLI archive and uses it
+only as the connector on macOS; installing/updating the plugin does not install
+or update Nova.app. Use a CLI and app built from the same current version.
+
+Configure a stdio MCP client with `nova mcp`, as shown in
+[Use it from an MCP client](#use-it-from-an-mcp-client) below. If no app archive
+has been published for the current code, build both macOS architectures,
+combine them into a universal binary, then assemble the app with
+[`package-development-app.sh`](packaging/macos/package-development-app.sh),
+which requires a universal binary and the matching Cargo version as arguments.
+
+> [!WARNING]
+> The app archive is **DEVELOPMENT ONLY**. It is ad-hoc signed, not Developer ID
+> signed, not notarized, and not stapled. Gatekeeper can block it, and replacing
+> it with a differently signed build can require granting TCC permissions again.
+> The existing universal CLI `.tar.gz` remains the supported artifact consumed
+> by Homebrew and Bamboo; the app `.zip` does not replace it.
+
 ## Permissions & code signing (macOS)
 
 ### Inspect an application's interaction options
 
-Use `inspect_app` when setting up an application or checking which interaction
+*`master` only; not in v0.2.1.* Use `inspect_app` when setting up an application or checking which interaction
 route is available. It is optional; ordinary native interaction still starts
 with `ax_read`.
 
@@ -541,7 +591,7 @@ stale-inventory failure; it is expected to fail.
 
 ### Permission ownership
 
-The packaged macOS app has a **Nova** menu-bar entry. It shows the local
+*The Nova.app menu is on `master`; real-desktop acceptance is tracked in [#34](https://github.com/bigduu/Nova/issues/34).* The packaged macOS app has a **Nova** menu-bar entry. It shows the local
 service's **Starting**, **Ready**, or **Failed** state separately from
 **Accessibility** and **Screen Recording**. Ready means the local service is
 listening; it does not imply either permission is granted or Chrome is paired.
@@ -635,7 +685,7 @@ the host keeping a stable signing identity.
 
 ## Coordinate grounding
 
-In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
+*The virtual cursor below is part of the Nova.app preview on `master`; real-desktop acceptance is tracked in [#70](https://github.com/bigduu/Nova/issues/70).* In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
 also show a purple virtual arrow at the supplied logical point. Click rings
 and scroll direction cues fade after 400 ms; the arrow clears after 1.2 seconds
 of inactivity. The panel passes through mouse input and cannot take keyboard
@@ -769,7 +819,7 @@ commit, and makes every source-building job check out that immutable commit. It
 builds and smoke-tests the universal macOS CLI and development-only Nova.app,
 creates the Release with those assets, then sequenced jobs attach native Windows
 x86_64/ARM64 archives and the Bamboo plugin bundle. The CLI `.tar.gz` name and
-checksum outputs stay unchanged for Homebrew, npm, and the Bamboo plugin
+checksum outputs stay unchanged for Homebrew and the Bamboo plugin
 manifest.
 
 Run the hermetic release checks before tagging:
