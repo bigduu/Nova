@@ -1,5 +1,9 @@
 # Nova for Chrome (developer preview)
 
+This source-only preview is not included in the published v0.2.1 workflow.
+It is distinct from `nova chrome-devtools`, the optional Node-based launcher
+for the official Chrome DevTools MCP server.
+
 This directory contains the Chrome-specific half of Nova. It is deliberately
 isolated from the desktop/OCR server:
 

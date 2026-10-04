@@ -1,0 +1,135 @@
+{
+  "source": "Nova current checkout; source-only, not release v0.2.1",
+  "adapter": "--npx runner appends browserUrl to dedicated Playwright browser; all interactions use MCP",
+  "calls": [
+    {
+      "name": "list_pages",
+      "arguments": {},
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "## Pages\n1: about:blank [selected] isolatedContext=isolated-context-1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "navigate_page",
+      "arguments": {
+        "pageId": 1,
+        "type": "url",
+        "url": "http://127.0.0.1:9751"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Successfully navigated to http://127.0.0.1:9751.\n## Pages\n1: Nova demo · release checklist (http://127.0.0.1:9751/) [selected] isolatedContext=isolated-context-1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "take_snapshot",
+      "arguments": {
+        "pageId": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "## Latest page snapshot\nuid=1_0 RootWebArea \"Nova demo · release checklist\" url=\"http://127.0.0.1:9751/\"\n  uid=1_1 main\n    uid=1_2 StaticText \"NOVA / BROWSER MCP · SOURCE CHECKOUT\"\n    uid=1_3 heading \"Turn a checklist into a finished task.\" level=\"1\"\n    uid=1_4 StaticText \"A local demonstration page. Nova's Chrome DevTools MCP launcher connects tools to the browser.\"\n    uid=1_5 heading \"Documentation release\" level=\"2\"\n    uid=1_6 checkbox \"Verify README links\"\n    uid=1_7 checkbox \"Review recorded demo\"\n    uid=1_8 button \"Prepare review\"\n    uid=1_9 status atomic live=\"polite\" relevant=\"additions text\"\n      uid=1_10 StaticText \"Waiting for checklist completion.\"\n    uid=1_11 StaticText \"Dedicated fixture data · real MCP browser actions · Linux Chromium\"\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "click",
+      "arguments": {
+        "pageId": 1,
+        "uid": "1_6"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Successfully clicked on the element"
+          }
+        ]
+      }
+    },
+    {
+      "name": "take_snapshot",
+      "arguments": {
+        "pageId": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "## Latest page snapshot\nuid=1_0 RootWebArea \"Nova demo · release checklist\" url=\"http://127.0.0.1:9751/\"\n  uid=1_1 main\n    uid=1_2 StaticText \"NOVA / BROWSER MCP · SOURCE CHECKOUT\"\n    uid=1_3 heading \"Turn a checklist into a finished task.\" level=\"1\"\n    uid=1_4 StaticText \"A local demonstration page. Nova's Chrome DevTools MCP launcher connects tools to the browser.\"\n    uid=1_5 heading \"Documentation release\" level=\"2\"\n    uid=1_6 checkbox \"Verify README links\" checked focusable focused\n    uid=1_7 checkbox \"Review recorded demo\"\n    uid=1_8 button \"Prepare review\"\n    uid=1_9 status atomic live=\"polite\" relevant=\"additions text\"\n      uid=1_10 StaticText \"Waiting for checklist completion.\"\n    uid=1_11 StaticText \"Dedicated fixture data · real MCP browser actions · Linux Chromium\"\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "click",
+      "arguments": {
+        "pageId": 1,
+        "uid": "1_7"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Successfully clicked on the element"
+          }
+        ]
+      }
+    },
+    {
+      "name": "take_snapshot",
+      "arguments": {
+        "pageId": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "## Latest page snapshot\nuid=1_0 RootWebArea \"Nova demo · release checklist\" url=\"http://127.0.0.1:9751/\"\n  uid=1_1 main\n    uid=1_2 StaticText \"NOVA / BROWSER MCP · SOURCE CHECKOUT\"\n    uid=1_3 heading \"Turn a checklist into a finished task.\" level=\"1\"\n    uid=1_4 StaticText \"A local demonstration page. Nova's Chrome DevTools MCP launcher connects tools to the browser.\"\n    uid=1_5 heading \"Documentation release\" level=\"2\"\n    uid=1_6 checkbox \"Verify README links\" checked\n    uid=1_7 checkbox \"Review recorded demo\" checked focusable focused\n    uid=1_8 button \"Prepare review\"\n    uid=1_9 status atomic live=\"polite\" relevant=\"additions text\"\n      uid=1_10 StaticText \"Waiting for checklist completion.\"\n    uid=1_11 StaticText \"Dedicated fixture data · real MCP browser actions · Linux Chromium\"\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "click",
+      "arguments": {
+        "pageId": 1,
+        "uid": "1_8"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Successfully clicked on the element"
+          }
+        ]
+      }
+    },
+    {
+      "name": "take_snapshot",
+      "arguments": {
+        "pageId": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "## Latest page snapshot\nuid=1_0 RootWebArea \"Nova demo · release checklist\" url=\"http://127.0.0.1:9751/\"\n  uid=1_1 main\n    uid=1_2 StaticText \"NOVA / BROWSER MCP · SOURCE CHECKOUT\"\n    uid=1_3 heading \"Turn a checklist into a finished task.\" level=\"1\"\n    uid=1_4 StaticText \"A local demonstration page. Nova's Chrome DevTools MCP launcher connects tools to the browser.\"\n    uid=1_5 heading \"Documentation release\" level=\"2\"\n    uid=1_6 checkbox \"Verify README links\" checked\n    uid=1_7 checkbox \"Review recorded demo\" checked\n    uid=1_8 button \"Prepare review\" focusable focused\n    uid=1_9 status atomic live=\"polite\" relevant=\"additions text\"\n      uid=4_0 StaticText \"Ready for review — 2 of 2 checks complete.\"\n    uid=1_11 StaticText \"Dedicated fixture data · real MCP browser actions · Linux Chromium\"\n"
+          }
+        ]
+      }
+    }
+  ]
+}
