@@ -17,30 +17,30 @@ Windows.
   screenshot's pixel space and mapped back to the screen.
 - **Types any text:** full Unicode keyboard input, including Chinese, Japanese,
   Korean and emoji.
-- **On `master`, for the next release:** AX-first `ax_read` / `ax_activate`
+- **Accessibility-first control (v0.3.0):** AX-first `ax_read` / `ax_activate`
   that reject stale snapshots, a 64-step `batch_actions` limit with structured
-  failure reports, the Nova.app permission owner and an optional Chrome DevTools
-  sidecar. The latest published release is **v0.2.1**; see
-  [Choose a version](#choose-a-version).
+  failure reports, the Nova.app permission owner (development preview) and an
+  optional Chrome DevTools sidecar. Latest release: **v0.3.0** —
+  [Releases](https://github.com/bigduu/Nova/releases/tag/v0.3.0).
 
 <p align="center"><img src="docs/demos/browser-checklist.gif" alt="Nova uses real browser MCP actions to check two demo items and prepare a review." width="720"></p>
 
 [Static image](docs/demos/browser-checklist.png) · [Reproduce and inspect MCP evidence](docs/demos/README.md)
 
-This recording shows Nova's **browser tool path** (`master` source, a fixture
-page and real MCP navigation/click calls). It was captured on Linux, so it does
-not show native macOS/Windows desktop control, model reasoning or a release
-binary. The reproduction notes explain the `--npx` adapter and isolated browser.
+This recording shows Nova's **browser tool path** (fixture page and real MCP
+navigation/click calls). It was captured on Linux, so it does not show native
+macOS/Windows desktop control or model reasoning. The reproduction notes explain
+the `--npx` adapter and isolated browser.
 
 
 ## Install
 
-| Platform | Published v0.2.1 |
+| Platform | Published v0.3.0 |
 | --- | --- |
 | macOS 14+ (Homebrew) | `brew install bigduu/tap/nova` |
-| macOS 14+ (manual) | `nova-v0.2.1-universal-apple-darwin.tar.gz` from [Releases](https://github.com/bigduu/Nova/releases/tag/v0.2.1) |
-| Windows x86_64 | `nova-v0.2.1-x86_64-pc-windows-msvc.zip` |
-| Windows ARM64 | `nova-v0.2.1-aarch64-pc-windows-msvc.zip` |
+| macOS 14+ (manual) | `nova-v0.3.0-universal-apple-darwin.tar.gz` from [Releases](https://github.com/bigduu/Nova/releases/tag/v0.3.0) |
+| Windows x86_64 | `nova-v0.3.0-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `nova-v0.3.0-aarch64-pc-windows-msvc.zip` |
 | Linux | Desktop control is not supported (headless protocol checks only) |
 
 **Homebrew (macOS):**
@@ -70,7 +70,7 @@ On Windows, extract the archive for the machine's architecture and invoke
 not Authenticode-signed, so SmartScreen may warn on first run. The macOS binary
 is ad-hoc signed, not notarized.
 
-**Build from source** (for the features on `master`):
+**Build from source:**
 
 ```sh
 git clone https://github.com/bigduu/Nova.git
@@ -86,17 +86,14 @@ unrelated project. Nova is not published on npm.
 
 | Path | What you get |
 | --- | --- |
-| [Published v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1) (Homebrew and release archives) | Screenshots, `zoom_region`, OCR, numbered marks with `click_mark`, mouse/keyboard input, `ax_click` / `ax_set_value` / `ax_focus`, `dump_ax`, windows/apps, clipboard, `batch_actions`, `wait`. |
-| `master` (next release, build from source) | Everything above plus AX-first `ax_read` / `read_ui` / `ax_activate`, `inspect_app`, managed `nova mcp`, the Nova.app development preview, the Chrome DevTools sidecar and the paired-page [Chrome bridge](chrome/README.md). |
+| [Published v0.3.0](https://github.com/bigduu/Nova/releases/tag/v0.3.0) (Homebrew and release archives) | Screenshots, `zoom_region`, OCR, numbered marks with `click_mark`, mouse/keyboard input, AX/UIA actions including `ax_read` / `read_ui` / `ax_activate`, `inspect_app`, managed `nova mcp`, Nova.app development preview, optional Chrome DevTools sidecar, consent-based [Chrome bridge](chrome/README.md), windows/apps, clipboard, `batch_actions` (64-step limit + structured failure), `wait`. |
+| `master` (tip of development) | Whatever lands after v0.3.0 — build from source for unreleased work. |
 
-The source manifest on `master` says `0.3.0`; until a `v0.3.0` release is
-published, those additions are **not** in any released binary or in the
-Homebrew formula. Nova.app is a development preview, not a notarized production
-app. [Audit evidence](docs/readme-audit.md).
+Nova.app remains a **development preview** (ad-hoc signed, not notarized). Menu-bar status and virtual cursor are labelled **Preview** pending live-device acceptance ([#34](https://github.com/bigduu/Nova/issues/34), [#70](https://github.com/bigduu/Nova/issues/70)). [Audit evidence](docs/readme-audit.md).
 
 ## Use it from an MCP client
 
-These snippets use **direct stdio** (no arguments). It works with the v0.2.1
+These snippets use **direct stdio** (no arguments). They work with the v0.3.0
 release and with a `master` build. Replace the path with your own `which nova`
 output, the extracted binary or `target/release/nova`. GUI clients do not
 always inherit your shell `PATH`, so use an absolute path.
@@ -139,16 +136,16 @@ app that launches it. Grant **Accessibility** (input and UI control) and
 **Screen Recording** (`screenshot`, `ocr`, `list_windows`) to Claude Desktop,
 Cursor, or the terminal/IDE that runs Claude Code or Codex. If that does not
 work, add the `nova` binary itself. Then restart or reconnect the MCP server.
-On `master`, you can instead let [Nova.app](#novaapp-development-preview) own
-the permissions; see [Managed mode](#managed-mode-with-novaapp-master).
+You can instead let [Nova.app](#novaapp-development-preview) own the
+permissions; see [Managed mode](#managed-mode-with-novaapp).
 
 Try: *"Use Nova to list my open windows, take a screenshot of the frontmost one
 and tell me which buttons you can see."*
 
-### Managed mode with Nova.app (`master`)
+### Managed mode with Nova.app
 
-Not in v0.2.1. With a `master` build, `nova mcp` is the cross-platform managed
-entrypoint used by the Bamboo plugin:
+`nova mcp` is the cross-platform managed entrypoint used by the Bamboo plugin
+(v0.3.0+):
 
 ```json
 {
@@ -206,7 +203,7 @@ embedded runtime.
 
 ### Chrome DevTools MCP sidecar
 
-*`master` only; not in v0.2.1.* For advanced Chrome page automation and debugging, Nova can launch the official
+For advanced Chrome page automation and debugging, Nova can launch the official
 [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 next to the desktop server. This is a transparent stdio sidecar, not a second
 browser implementation inside Nova. It requires npm/`npx`, Node.js
@@ -234,8 +231,8 @@ compatibility. On macOS:
 }
 ```
 
-For a standalone binary built from current source, use its absolute path and
-`["chrome-devtools"]`. Published v0.2.1 does not include this subcommand. If a GUI client cannot find `npx`, add
+For a standalone binary from the v0.3.0 release or current source, use its absolute path and
+`["chrome-devtools"]`. If a GUI client cannot find `npx`, add
 `"--npx", "/absolute/path/to/npx"` after the subcommand.
 
 The default launches a new temporary, isolated Chrome profile. Usage
@@ -404,20 +401,19 @@ and `ax_read` still return the requested content.
   activation, and input.
 
 > macOS grants these permissions to the process it identifies as responsible
-> for Nova. On `master`, the managed `nova mcp` entrypoint and Bamboo plugin use the
-> independent Nova.app on macOS. Direct stdio/HTTP (the only mode in v0.2.1) can use the host app, terminal, or
+> for Nova. The managed `nova mcp` entrypoint and Bamboo plugin use the
+> independent Nova.app on macOS. Direct stdio/HTTP can use the host app, terminal, or
 > directly launched binary as the permission subject. See
 > [Permissions & code signing](#permissions--code-signing-macos).
 
 ## Tools
 
-Tools marked *(master)* are not in the v0.2.1 release.
 
 | Tool | What it does |
 | --- | --- |
-| `ax_read` *(master)* | Canonical `ax:read`: read semantic labels, text, values, roles, actions, state, and optional bounds through macOS Accessibility or Windows UIA, without a screenshot. Returns an ephemeral snapshot/node protocol and explicit coverage/status. |
-| `read_ui` *(master)* | Compatibility alias backed by the same `ax_read` traversal and cache generation. |
-| `ax_activate` *(master)* | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
+| `ax_read` | Canonical `ax:read`: read semantic labels, text, values, roles, actions, state, and optional bounds through macOS Accessibility or Windows UIA, without a screenshot. Returns an ephemeral snapshot/node protocol and explicit coverage/status. |
+| `read_ui` | Compatibility alias backed by the same `ax_read` traversal and cache generation. |
+| `ax_activate` | Activate an exact actionable node from a fresh `ax_read`; rejects stale snapshot IDs and reports `route=ax\|uia\|web_dom\|element_center`. Every attempt consumes its generation before provider dispatch. |
 | `screenshot` | Capture the whole display or a single `window=` — use for layout, icons, colors, images, canvas, and visual verification after semantic/OCR paths. |
 | `zoom_region` | Magnify a rectangle of the last screenshot at native resolution — reads small targets on surfaces with no Accessibility tree. |
 | `ocr` | Recognize on-screen text with Apple Vision on macOS or Windows Media OCR on Windows. `mode=auto` uses Fast first with confidence-based Accurate fallback; `mode=fast\|accurate` forces either policy. An optional strict `roi={x,y,width,height}` re-captures a rectangle from the current image through the native region path. Returns each line with a clickable center. |
@@ -426,14 +422,14 @@ Tools marked *(master)* are not in the v0.2.1 release.
 | `cursor_position` | Read the cursor in OS-global logical coordinates; it is not converted into the last screenshot's pixel space. |
 | `type_text` / `key_combo` | Keyboard input (full Unicode, incl. CJK + emoji). |
 | `list_windows` / `list_applications` / `open_application` | Window & app introspection. |
-| `inspect_app` *(master)* | Optional macOS app capability discovery. Accepts an app name/bundle ID, or discovers running Chromium candidates when omitted; no caller-supplied port or permission prompt. |
+| `inspect_app` | Optional macOS app capability discovery. Accepts an app name/bundle ID, or discovers running Chromium candidates when omitted; no caller-supplied port or permission prompt. |
 | `read_clipboard` / `write_clipboard` | Clipboard access. |
 | `ax_click` / `ax_set_value` / `ax_focus` | Drive controls by Accessibility role/label. |
 | `dump_ax` | Read the raw AX/UIA tree for diagnostics and coverage debugging. |
 | `batch_actions` | Run a sequence of input actions in one call. |
 | `wait` | Pause for a specified number of seconds. |
 
-On `master`, `batch_actions` runs at most 64 actions sequentially and stops at the first
+`batch_actions` runs at most 64 actions sequentially and stops at the first
 failure, without retry or rollback. Success keeps the newline-separated status
 lines. Failure sets MCP `isError=true` and returns the same JSON in text content
 and `structuredContent`: `completed: [{index, result}]`, `failed_index`, `reason`,
@@ -446,8 +442,6 @@ with `…` in the middle when shortened. Typed text keeps character/UTF-8 byte
 counts rather than plaintext. Inspect progress and obtain fresh `ax_read` state
 before deciding what to retry; replaying the whole batch could repeat completed
 side effects.
-
-In v0.2.1, `batch_actions` also runs sequentially and stops at the first failure, without the 64-action limit or the structured failure report.
 
 ## Run
 
@@ -504,7 +498,7 @@ which requires a universal binary and the matching Cargo version as arguments.
 
 ### Inspect an application's interaction options
 
-*`master` only; not in v0.2.1.* Use `inspect_app` when setting up an application or checking which interaction
+Use `inspect_app` when setting up an application or checking which interaction
 route is available. It is optional; ordinary native interaction still starts
 with `ax_read`.
 
@@ -591,7 +585,7 @@ stale-inventory failure; it is expected to fail.
 
 ### Permission ownership
 
-*The Nova.app menu is on `master`; real-desktop acceptance is tracked in [#34](https://github.com/bigduu/Nova/issues/34).* The packaged macOS app has a **Nova** menu-bar entry. It shows the local
+*The Nova.app menu is a **Preview** in v0.3.0; real-desktop acceptance is tracked in [#34](https://github.com/bigduu/Nova/issues/34).* The packaged macOS app has a **Nova** menu-bar entry. It shows the local
 service's **Starting**, **Ready**, or **Failed** state separately from
 **Accessibility** and **Screen Recording**. Ready means the local service is
 listening; it does not imply either permission is granted or Chrome is paired.
@@ -685,7 +679,7 @@ the host keeping a stable signing identity.
 
 ## Coordinate grounding
 
-*The virtual cursor below is part of the Nova.app preview on `master`; real-desktop acceptance is tracked in [#70](https://github.com/bigduu/Nova/issues/70).* In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
+*The virtual cursor below is part of the Nova.app **Preview** in v0.3.0; real-desktop acceptance is tracked in [#70](https://github.com/bigduu/Nova/issues/70).* In macOS **Nova.app**, coordinate-backed mouse movement, clicks and scrolls
 also show a purple virtual arrow at the supplied logical point. Click rings
 and scroll direction cues fade after 400 ms; the arrow clears after 1.2 seconds
 of inactivity. The panel passes through mouse input and cannot take keyboard
@@ -828,8 +822,8 @@ Run the hermetic release checks before tagging:
 scripts/test-release-workflow.sh
 ```
 
-The source manifest is `0.3.0` (not yet published); make sure the tag matches the
-manifest version before creating the next release tag. Release tags must be protected from force updates;
+The published release is **v0.3.0**. When cutting the next release, make sure the tag matches the
+manifest version. Release tags must be protected from force updates;
 the workflow also serializes runs by tag and re-verifies the tag before its first
 upload. The Nova.app asset must remain labeled
 **DEVELOPMENT ONLY** until all production distribution gates are complete:
