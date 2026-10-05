@@ -14,27 +14,27 @@
 - **先看清再点击**：读取 Accessibility/UIA 控件，使用 Apple Vision 或 Windows OCR
   识别文字，支持单窗口截图和局部放大。点击坐标按截图的像素空间给出，再映射回屏幕。
 - **什么文字都能输入**：键盘输入支持完整 Unicode，包括中文、日文、韩文和 emoji。
-- **`master` 分支上、下一个版本才有的能力**：AX 优先的 `ax_read` / `ax_activate`
+- **优先走无障碍语义的控制（v0.3.0）：** AX 优先的 `ax_read` / `ax_activate`
   （会拒绝过期快照）、上限 64 步并返回结构化失败信息的 `batch_actions`、负责权限的
-  Nova.app，以及可选的 Chrome DevTools 旁路服务。目前最新的已发布版本是 **v0.2.1**，
-  见[选择版本](#选择版本)。
+  Nova.app（开发预览版），以及可选的 Chrome DevTools 旁路服务。最新发布版：**v0.3.0** —
+  [Releases](https://github.com/bigduu/Nova/releases/tag/v0.3.0)。
 
 <p align="center"><img src="docs/demos/browser-checklist.gif" alt="Nova 通过真实的浏览器 MCP 操作勾选两个演示条目并准备审阅。" width="720"></p>
 
 [静态图片](docs/demos/browser-checklist.png) · [复现方法与 MCP 记录](docs/demos/README.md)
 
-这段录屏展示的是 Nova 的**浏览器工具路径**（`master` 源码、专用演示页面，导航和点击都是
+这段录屏展示的是 Nova 的**浏览器工具路径**（专用演示页面，导航和点击都是
 真实的 MCP 调用）。它在 Linux 上录制，因此不代表 macOS/Windows 原生桌面操作，不包含模型
 推理，也不是发布版二进制。复现说明里解释了 `--npx` 适配器和隔离浏览器的用法。
 
 ## 安装
 
-| 平台 | 已发布的 v0.2.1 |
+| 平台 | 已发布的 v0.3.0 |
 | --- | --- |
 | macOS 14+（Homebrew） | `brew install bigduu/tap/nova` |
-| macOS 14+（手动） | 从 [Releases](https://github.com/bigduu/Nova/releases/tag/v0.2.1) 下载 `nova-v0.2.1-universal-apple-darwin.tar.gz` |
-| Windows x86_64 | `nova-v0.2.1-x86_64-pc-windows-msvc.zip` |
-| Windows ARM64 | `nova-v0.2.1-aarch64-pc-windows-msvc.zip` |
+| macOS 14+（手动） | 从 [Releases](https://github.com/bigduu/Nova/releases/tag/v0.3.0) 下载 `nova-v0.3.0-universal-apple-darwin.tar.gz` |
+| Windows x86_64 | `nova-v0.3.0-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `nova-v0.3.0-aarch64-pc-windows-msvc.zip` |
 | Linux | 不支持桌面操作（只能做无界面的协议检查） |
 
 **Homebrew（macOS）：**
@@ -61,7 +61,7 @@ Windows 上解压与本机架构对应的压缩包，直接运行 `nova.exe`，�
 Windows 二进制没有 Authenticode 签名，首次运行时 SmartScreen 可能会提示。macOS
 二进制是 ad-hoc 签名，没有公证。
 
-**从源码构建**（使用 `master` 上的新功能）：
+**从源码构建：**
 
 ```sh
 git clone https://github.com/bigduu/Nova.git
@@ -76,16 +76,14 @@ macOS 上产物是 `target/release/nova`，Windows 上是 `target/release/nova.e
 
 | 途径 | 能用到什么 |
 | --- | --- |
-| [已发布的 v0.2.1](https://github.com/bigduu/Nova/releases/tag/v0.2.1)（Homebrew 和 release 压缩包） | 截图、`zoom_region`、OCR、编号标记与 `click_mark`、鼠标键盘输入、`ax_click` / `ax_set_value` / `ax_focus`、`dump_ax`、窗口/应用、剪贴板、`batch_actions`、`wait`。 |
-| `master`（下一个版本，需从源码构建） | 以上全部，另加 AX 优先的 `ax_read` / `read_ui` / `ax_activate`、`inspect_app`、托管的 `nova mcp`、Nova.app 开发预览版、Chrome DevTools 旁路服务和需逐页配对的 [Chrome 桥](chrome/README.md)。 |
+| [已发布的 v0.3.0](https://github.com/bigduu/Nova/releases/tag/v0.3.0)（Homebrew 和 release 压缩包） | 截图、`zoom_region`、OCR、编号标记与 `click_mark`、鼠标键盘输入、含 `ax_read` / `read_ui` / `ax_activate` 的 AX/UIA 操作、`inspect_app`、托管的 `nova mcp`、Nova.app 开发预览版、可选 Chrome DevTools 旁路服务、需逐页配对的 [Chrome 桥](chrome/README.md)、窗口/应用、剪贴板、`batch_actions`（64 步上限 + 结构化失败）、`wait`。 |
+| `master`（开发前沿） | v0.3.0 之后尚未发版的改动 — 需要从源码构建。 |
 
-`master` 上的源码版本号已经是 `0.3.0`；在 `v0.3.0` 正式发布之前，这些新增功能**不在**任何
-已发布的二进制里，也不在 Homebrew formula 里。Nova.app 是开发预览版，不是经过公证的正式
-应用。[审计记录](docs/readme-audit.md)。
+Nova.app 仍是**开发预览版**（ad-hoc 签名，未公证）。菜单栏状态和虚拟光标标为**预览**，真机验收尚未完成（[#34](https://github.com/bigduu/Nova/issues/34)、[#70](https://github.com/bigduu/Nova/issues/70)）。[审计记录](docs/readme-audit.md)。
 
 ## 在 MCP 客户端中使用
 
-下面的配置都使用**直连 stdio**（不带参数），v0.2.1 发布版和 `master` 构建都适用。把路径
+下面的配置都使用**直连 stdio**（不带参数），v0.3.0 发布版和 `master` 构建都适用。把路径
 换成你自己 `which nova` 的输出、解压出的二进制或 `target/release/nova`。图形界面客户端不一定
 继承你 shell 的 `PATH`，所以请写绝对路径。
 
@@ -123,14 +121,14 @@ TOML 里可以用字面量字符串（`'C:\Tools\nova\nova.exe'`）。
 **macOS 权限**：直连 stdio 模式下，macOS 通常把 Nova 算在启动它的应用名下。请给 Claude
 Desktop、Cursor，或运行 Claude Code / Codex 的终端或 IDE 授予**辅助功能**（输入和界面控制）
 和**屏幕录制**（`screenshot`、`ocr`、`list_windows`）权限。如果不起作用，再把 `nova`
-二进制本身加进去。授权后重启或重新连接 MCP 服务。在 `master` 上，也可以改由
-[Nova.app](#novaapp-开发预览版) 持有权限，见[托管模式](#通过-novaapp-的托管模式master)。
+二进制本身加进去。授权后重启或重新连接 MCP 服务。也可以改由
+[Nova.app](#novaapp-开发预览版) 持有权限，见[托管模式](#通过-novaapp-的托管模式)。
 
 试试对 agent 说：*“用 Nova 列出我打开的窗口，给最前面的窗口截个图，告诉我能看到哪些按钮。”*
 
-### 通过 Nova.app 的托管模式（`master`）
+### 通过 Nova.app 的托管模式
 
-v0.2.1 没有这个模式。用 `master` 构建时，`nova mcp` 是 Bamboo 插件使用的跨平台托管入口：
+`nova mcp` 是 Bamboo 插件使用的跨平台托管入口（v0.3.0+）：
 
 ```json
 {
@@ -176,7 +174,7 @@ stdin 变得可取消。
 
 ### Chrome DevTools MCP sidecar
 
-*仅 `master` 提供，v0.2.1 没有。*如果需要更高级的 Chrome 页面自动化和调试，Nova 可以在桌面
+如果需要更高级的 Chrome 页面自动化和调试，Nova 可以在桌面
 服务旁边启动官方的 [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)。
 它是一个透明的 stdio 旁路服务，不是 Nova 内部的第二套浏览器实现。需要 npm/`npx`、Node.js
 `^20.19.0`、`^22.12.0` 或 `>=23`，以及当前稳定版（或更新）的 Chrome。Nova 把审阅过的上游包
@@ -202,7 +200,7 @@ endpoint 和下面单独的 MCP 配置属于高级传输兼容用法。macOS 上
 ```
 
 如果是从当前源码构建的独立二进制，就写它的绝对路径和 `["chrome-devtools"]`。已发布的
-v0.2.1 没有这个子命令。如果图形界面客户端找不到 `npx`，在子命令后面加上
+如果图形界面客户端找不到 `npx`，在子命令后面加上
 `"--npx", "/absolute/path/to/npx"`。
 
 默认会启动一个全新的、临时的隔离 Chrome 配置文件。默认关闭使用统计、包更新检查和 CrUX URL
@@ -336,20 +334,19 @@ TextPattern 的控件没有值的回退。
 - macOS 上，`screenshot`、`ocr` 和 `list_windows` 需要**屏幕录制**权限；`ax_read`、语义
   激活和输入需要**辅助功能**权限。
 
-> macOS 会把这些权限授予它认定为对 Nova “负责”的那个进程。在 `master` 上，托管的
-> `nova mcp` 入口和 Bamboo 插件在 macOS 上使用独立的 Nova.app。直连 stdio/HTTP（v0.2.1
-> 只有这种模式）可能以宿主应用、终端或直接启动的二进制作为权限主体。见
+> macOS 会把这些权限授予它认定为对 Nova “负责”的那个进程。托管的
+> `nova mcp` 入口和 Bamboo 插件在 macOS 上使用独立的 Nova.app。直连 stdio/HTTP
+> 可能以宿主应用、终端或直接启动的二进制作为权限主体。见
 > [权限与代码签名](#权限与代码签名macos)。
 
 ## 工具
 
-标注 *(master)* 的工具不在 v0.2.1 发布版中。
 
 | 工具 | 作用 |
 | --- | --- |
-| `ax_read` *(master)* | 标准的 `ax:read`：通过 macOS Accessibility 或 Windows UIA 读取语义标签、文本、值、角色、可执行动作、状态和可选的边界框，不需要截图。返回临时的快照/节点协议，以及明确的覆盖范围和状态。 |
-| `read_ui` *(master)* | 兼容别名，底层使用同一套 `ax_read` 遍历和缓存代际。 |
-| `ax_activate` *(master)* | 激活最新一次 `ax_read` 中某个确切的可操作节点；拒绝过期的快照 ID，并报告 `route=ax\|uia\|web_dom\|element_center`。每次尝试都会在分发给 provider 之前消耗掉对应代际。 |
+| `ax_read` | 标准的 `ax:read`：通过 macOS Accessibility 或 Windows UIA 读取语义标签、文本、值、角色、可执行动作、状态和可选的边界框，不需要截图。返回临时的快照/节点协议，以及明确的覆盖范围和状态。 |
+| `read_ui` | 兼容别名，底层使用同一套 `ax_read` 遍历和缓存代际。 |
+| `ax_activate` | 激活最新一次 `ax_read` 中某个确切的可操作节点；拒绝过期的快照 ID，并报告 `route=ax\|uia\|web_dom\|element_center`。每次尝试都会在分发给 provider 之前消耗掉对应代际。 |
 | `screenshot` | 截取整个显示器或单个 `window=`：用于布局、图标、颜色、图片、画布，以及在语义/OCR 路径之后做视觉验证。 |
 | `zoom_region` | 以原生分辨率放大上一张截图中的一个矩形区域，用于在没有无障碍树的界面上看清小目标。 |
 | `ocr` | macOS 上用 Apple Vision、Windows 上用 Windows Media OCR 识别屏幕文字。`mode=auto` 先用 Fast，置信度不够时回退到 Accurate；`mode=fast\|accurate` 强制使用其中一种。可选的严格 `roi={x,y,width,height}` 会通过原生区域路径重新截取当前图像中的一个矩形。返回每一行文字及其可点击的中心点。 |
@@ -358,14 +355,14 @@ TextPattern 的控件没有值的回退。
 | `cursor_position` | 读取鼠标在操作系统全局逻辑坐标中的位置；不会换算到上一张截图的像素空间。 |
 | `type_text` / `key_combo` | 键盘输入（完整 Unicode，包括中日韩文字和 emoji）。 |
 | `list_windows` / `list_applications` / `open_application` | 窗口和应用信息查询与启动。 |
-| `inspect_app` *(master)* | 可选的 macOS 应用能力发现。接受应用名称/bundle ID；省略时会发现正在运行的 Chromium 类候选应用。不需要调用方提供端口，也不会弹出权限请求。 |
+| `inspect_app` | 可选的 macOS 应用能力发现。接受应用名称/bundle ID；省略时会发现正在运行的 Chromium 类候选应用。不需要调用方提供端口，也不会弹出权限请求。 |
 | `read_clipboard` / `write_clipboard` | 剪贴板读写。 |
 | `ax_click` / `ax_set_value` / `ax_focus` | 按无障碍角色/标签操作控件。 |
 | `dump_ax` | 读取原始 AX/UIA 树，用于诊断和排查覆盖问题。 |
 | `batch_actions` | 一次调用中执行一系列输入操作。 |
 | `wait` | 暂停指定的秒数。 |
 
-在 `master` 上，`batch_actions` 最多按顺序执行 64 个操作，遇到第一个失败就停止，不重试也不
+`batch_actions` 最多按顺序执行 64 个操作，遇到第一个失败就停止，不重试也不
 回滚。成功时保留按行分隔的状态信息。失败时设置 MCP `isError=true`，并在文本内容和
 `structuredContent` 中返回同样的 JSON：`completed: [{index, result}]`、`failed_index`、
 `reason` 和 `not_executed: {start, end_exclusive}`。索引从 0 开始；这个左闭右开区间只包含失败
@@ -374,9 +371,6 @@ TextPattern 的控件没有值的回退。
 字符，超长时保留首尾、中间用 `…` 省略。输入的文字只保留字符数/UTF-8 字节数，不保留明文。
 决定重试什么之前，请先查看进度并重新 `ax_read` 获取最新状态；整批重放可能会重复已完成步骤的
 副作用。
-
-在 v0.2.1 中，`batch_actions` 同样按顺序执行、遇到第一个失败就停止，但没有 64 步上限，也没有
-结构化的失败报告。
 
 ## 运行
 
@@ -427,7 +421,7 @@ open -gj -b com.zenith.nova
 
 ### 检查应用可用的交互方式
 
-*仅 `master` 提供，v0.2.1 没有。*在设置某个应用或检查有哪些交互路径可用时，可以使用
+在设置某个应用或检查有哪些交互路径可用时，可以使用
 `inspect_app`。它是可选的；普通的原生交互仍然从 `ax_read` 开始。
 
 ```json
@@ -489,7 +483,7 @@ Windows/Linux 返回明确的 unsupported 结果；它们已有的原生工具�
 
 ### 权限归属
 
-*Nova.app 菜单在 `master` 上；真机验收记录在 [#34](https://github.com/bigduu/Nova/issues/34)。*
+*Nova.app 菜单在 v0.3.0 中为**预览**；真机验收记录在 [#34](https://github.com/bigduu/Nova/issues/34)。*
 打包的 macOS 应用有一个 **Nova** 菜单栏入口。它把本地服务的 **Starting**、**Ready** 或
 **Failed** 状态与**辅助功能**和**屏幕录制**权限分开显示。Ready 表示本地服务正在监听，并不代表
 任一权限已授予或 Chrome 已配对。如果启动失败，菜单仍然可用并显示失败状态。重复启动会直接退出，
@@ -559,8 +553,7 @@ cargo build --release
 
 ## 坐标定位
 
-*下面的虚拟光标属于 `master` 上的 Nova.app 预览版；真机验收记录在
-[#70](https://github.com/bigduu/Nova/issues/70)。*在 macOS **Nova.app** 中，基于坐标的鼠标
+*下面的虚拟光标属于 v0.3.0 中 Nova.app 的**预览**功能；真机验收记录在 [#70](https://github.com/bigduu/Nova/issues/70)。*在 macOS **Nova.app** 中，基于坐标的鼠标
 移动、点击和滚动还会在给定的逻辑坐标处显示一个紫色虚拟箭头。点击光圈和滚动方向提示会在 400
 毫秒后淡出；无操作 1.2 秒后箭头消失。这个面板会让鼠标输入穿透，也无法获得键盘焦点。前台输入
 仍会移动真实指针；按 PID/后台投递保持原有行为。批量操作使用同一个原生后端。元素中心回退后的
@@ -676,7 +669,7 @@ cargo clippy --all-targets
 scripts/test-release-workflow.sh
 ```
 
-源码版本号是 `0.3.0`（尚未发布）；创建下一个发布 tag 之前，请确认 tag 与版本号一致。发布 tag
+当前已发布版本是 **v0.3.0**。创建下一个发布 tag 之前，请确认 tag 与版本号一致。发布 tag
 必须禁止强制更新；工作流也会按 tag 串行运行，并在第一次上传前重新校验 tag。在所有正式分发关卡
 完成之前，Nova.app 资产必须一直标注为**仅供开发使用（DEVELOPMENT ONLY）**：
 
