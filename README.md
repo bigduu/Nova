@@ -494,6 +494,43 @@ which requires a universal binary and the matching Cargo version as arguments.
 > The existing universal CLI `.tar.gz` remains the supported artifact consumed
 > by Homebrew and Bamboo; the app `.zip` does not replace it.
 
+#### Initial app setup from source
+
+The current source adds `nova app status` and an explicit initial installer:
+
+```sh
+nova app status
+nova app install --archive /absolute/path/to/nova-v0.3.0-universal-apple-darwin-development-app.zip \
+  --sha256 <64-hex-digits-from-a-trusted-release-or-catalogue>
+```
+
+These commands are **not included in the already published v0.3.0 connector**.
+Build this source to use them; installing the existing Bamboo plugin does not
+invoke them or install Nova.app automatically.
+
+Both commands print one JSON report with `state`, `success`, `message`, and
+`next_action`; valid apps also report their path, version, signing type,
+`development`, and `connector_compatible`. Status checks the current account's
+`~/Applications/Nova.app`, then `/Applications/Nova.app`, without creating
+directories, starting the app, capturing the desktop, or requesting permissions.
+States are `missing`, `installed`, `already_installed`, `unsupported`, and
+`error`; refused or unsupported installation exits unsuccessfully.
+
+Installation accepts a local ZIP and independently supplied SHA256. It checks
+the archive, bundle identity, both Mac CPU architectures and code signature,
+and requires the app version to match this connector. It publishes only an
+absent `~/Applications/Nova.app`, refusing any existing canonical app, symlink,
+or unsafe installation directory. Download quarantine and app metadata are
+retained. The archive stays unchanged. There is no replacement/update command
+and no automatic signing, quarantine removal, Gatekeeper bypass, or privacy
+grant. SHA256 verifies the selected bytes; obtain it from a trusted publisher.
+
+An ad-hoc signed app stays labelled as a development artifact. This helper does
+not establish notarization or desktop readiness. Open Nova.app through macOS
+and explicitly grant the permissions you need, then reconnect only Nova MCP;
+Bodhi can remain open. Production signing, upgrades, and TCC continuity remain
+separate work tracked in [#36](https://github.com/bigduu/Nova/issues/36).
+
 ## Permissions & code signing (macOS)
 
 ### Inspect an application's interaction options

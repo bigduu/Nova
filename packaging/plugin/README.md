@@ -135,6 +135,16 @@ an already installed `v0.2.1` plugin. An unavailable app causes a clear
 connection error, with no fallback to running desktop tools inside Bamboo/Bodhi.
 Windows needs no separate Nova.app installation.
 
+The current Nova source also offers passive `nova app status` and explicit
+`nova app install --archive <local-app.zip> --sha256 <trusted-hex>` for an
+initial user-level app installation. These commands are not in the published
+v0.3.0 connector, and this plugin does not invoke them yet. The helper refuses
+existing canonical apps, validates the matching app and preserves quarantine;
+it neither launches the app nor requests permissions. App upgrades/replacement
+remain separate from plugin updates. See the source README's
+[initial app setup](https://github.com/bigduu/Nova#initial-app-setup-from-source) for JSON
+states and the development-signing limitation.
+
 A URL install is verified against the bundle's checksum by default — grab the
 `.sha256` published next to the bundle on the release page and pass it:
 

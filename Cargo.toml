@@ -83,6 +83,12 @@ nova-chrome-bridge = { path = "chrome/native-host" }
 # `src/platform/mod.rs`), but that should be a fast, clean failure, not a
 # dependency-compile failure.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Verified, user-triggered initial Nova.app setup. Only stored/deflated ZIPs
+# are needed; native ditto preserves app metadata and download quarantine.
+sha2 = "0.10.9"
+tempfile = "3.27"
+zip = { version = "6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
 # Screenshot capture (Apple ScreenCaptureKit)
 screencapturekit = { version = "7.0", features = ["macos_14_0"] }
 

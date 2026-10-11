@@ -147,6 +147,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Inspect or explicitly install the independent Nova.app (macOS only).
+    App {
+        #[command(subcommand)]
+        command: nova::app_setup::AppCommand,
+    },
+
     /// Start the managed MCP transport. On macOS, connect to the independent
     /// Nova.app (install it separately); on Windows/Linux, serve over stdio.
     Mcp,
@@ -215,6 +221,17 @@ fn main() -> Result<()> {
     // responsible-process and TCC attribution for the processes involved.
     if let Some(Commands::ChromeDevtools(options)) = cli.command.as_ref() {
         return nova::chrome_devtools::run(options);
+    }
+
+    // Setup/status never initializes desktop APIs, launches Nova.app, or
+    // requests privacy permissions. Keep its JSON output separate from MCP.
+    if let Some(Commands::App { command }) = cli.command.as_ref() {
+        let report = nova::app_setup::run(command);
+        println!("{}", serde_json::to_string(&report)?);
+        if !report.success {
+            anyhow::bail!("{}", report.message);
+        }
+        return Ok(());
     }
 
     #[cfg(windows)]
@@ -1107,6 +1124,38 @@ mod cli_tests {
             vec!["nova", "chrome-host", "uninstall", "--force"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn app_setup_is_explicit_and_has_no_destination_or_replacement_flags() {
+        assert!(matches!(
+            Cli::try_parse_from(["nova", "app", "status"])
+                .unwrap()
+                .command,
+            Some(Commands::App {
+                command: nova::app_setup::AppCommand::Status
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "nova",
+            "app",
+            "install",
+            "--archive",
+            "/tmp/app.zip",
+            "--sha256",
+            &"a".repeat(64),
+        ])
+        .is_ok());
+        for arguments in [
+            vec!["nova", "app", "install"],
+            vec!["nova", "app", "install", "--archive", "/tmp/app.zip"],
+            vec!["nova", "app", "status", "--destination", "/tmp/other"],
+            vec!["nova", "app", "install", "--force"],
+            vec!["nova", "--selftest", "app", "status"],
+            vec!["nova", "--http", "app", "status"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
         }
     }
 
