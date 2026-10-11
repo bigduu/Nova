@@ -240,6 +240,7 @@ fn existing_app_is_not_replaced_or_reopened() {
         &AppCommand::Install {
             archive: root.path().join("missing.zip"),
             sha256: "invalid".into(),
+            local_sign: false,
         },
         &locations,
     )
@@ -352,4 +353,137 @@ fn bundle_identity_and_signature_failures_do_not_publish() {
     let app = locations(root.path()).user_app();
     fs::write(app.join("Contents/unsealed"), "unexpected").unwrap();
     assert!(inspect_bundle(&app).is_err());
+}
+
+struct RefusingSigner(std::cell::Cell<usize>);
+impl local_sign::Signer for RefusingSigner {
+    fn sign(&self, app: &Path, home: &Path) -> Result<()> {
+        self.0.set(self.0.get() + 1);
+        assert!(app.starts_with(home.join("Applications")));
+        assert!(app.to_string_lossy().contains(".nova-app-setup-"));
+        assert!(app.ends_with("extracted/Nova.app"));
+        anyhow::bail!("mock keychain failure; manual action required")
+    }
+}
+
+#[test]
+fn local_sign_is_never_reached_for_hash_structure_or_original_signature_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let signer = RefusingSigner(std::cell::Cell::new(0));
+    let archive = app_archive(root.path());
+    assert!(install_with_signer(
+        &archive,
+        &"0".repeat(64),
+        &locations(root.path()),
+        true,
+        &signer
+    )
+    .is_err());
+    let archive = archive_with(root.path(), &[("../unsafe", b"bad")]);
+    assert!(install_with_signer(
+        &archive,
+        &digest(&archive),
+        &locations(root.path()),
+        true,
+        &signer
+    )
+    .is_err());
+    let archive = archive_with(root.path(), &[("Nova.app/Contents/Info.plist", b"invalid")]);
+    assert!(install_with_signer(
+        &archive,
+        &digest(&archive),
+        &locations(root.path()),
+        true,
+        &signer
+    )
+    .is_err());
+    // Alter signed resource bytes while preserving the archive layout.
+    let original = app_archive(root.path());
+    let extraction = root.path().join("tampered");
+    fs::create_dir(&extraction).unwrap();
+    native("/usr/bin/ditto", &["-x", "-k"], &[&original, &extraction]).unwrap();
+    fs::write(extraction.join("Nova.app/Contents/unsealed"), "bad").unwrap();
+    let tampered = root.path().join("tampered.zip");
+    native(
+        "/usr/bin/ditto",
+        &["-c", "-k", "--keepParent"],
+        &[&extraction.join(APP), &tampered],
+    )
+    .unwrap();
+    assert!(install_with_signer(
+        &tampered,
+        &digest(&tampered),
+        &locations(root.path()),
+        true,
+        &signer
+    )
+    .is_err());
+    assert_eq!(signer.0.get(), 0);
+    assert!(!locations(root.path()).user_app().exists());
+    assert!(staging_leftovers(root.path()).is_empty());
+}
+
+#[test]
+fn local_sign_failure_cleans_private_stage_and_preserves_archive_and_quarantine() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = app_archive(root.path());
+    native(
+        "/usr/bin/xattr",
+        &[
+            "-w",
+            "com.apple.quarantine",
+            "0081;00000000;NovaSetupFixture;",
+        ],
+        &[&archive],
+    )
+    .unwrap();
+    let before = digest(&archive);
+    let quarantine = native(
+        "/usr/bin/xattr",
+        &["-p", "com.apple.quarantine"],
+        &[&archive],
+    )
+    .unwrap()
+    .stdout;
+    let signer = RefusingSigner(std::cell::Cell::new(0));
+    let error =
+        install_with_signer(&archive, &before, &locations(root.path()), true, &signer).unwrap_err();
+    assert!(error.to_string().contains("mock keychain failure"));
+    assert_eq!(signer.0.get(), 1);
+    assert_eq!(digest(&archive), before);
+    assert_eq!(
+        native(
+            "/usr/bin/xattr",
+            &["-p", "com.apple.quarantine"],
+            &[&archive]
+        )
+        .unwrap()
+        .stdout,
+        quarantine
+    );
+    assert!(!locations(root.path()).user_app().exists());
+    assert!(staging_leftovers(root.path()).is_empty());
+}
+
+#[test]
+fn status_and_existing_app_refusal_never_access_local_signer() {
+    let root = tempfile::tempdir().unwrap();
+    let signer = RefusingSigner(std::cell::Cell::new(0));
+    let locations = locations(root.path());
+    execute_with_signer(&AppCommand::Status, &locations, &signer).unwrap();
+    assert!(!root.path().join("Applications").exists());
+    let archive = app_archive(root.path());
+    install(&archive, &digest(&archive), &locations).unwrap();
+    let report = execute_with_signer(
+        &AppCommand::Install {
+            archive: root.path().join("absent.zip"),
+            sha256: "invalid".into(),
+            local_sign: true,
+        },
+        &locations,
+        &signer,
+    )
+    .unwrap();
+    assert_eq!(report.state, SetupState::AlreadyInstalled);
+    assert_eq!(signer.0.get(), 0);
 }

@@ -136,7 +136,7 @@ connection error, with no fallback to running desktop tools inside Bamboo/Bodhi.
 Windows needs no separate Nova.app installation.
 
 The current Nova source also offers passive `nova app status` and explicit
-`nova app install --archive <local-app.zip> --sha256 <trusted-hex>` for an
+`nova app install --archive <local-app.zip> --sha256 <trusted-hex> [--local-sign]` for an
 initial user-level app installation. These commands are not in the published
 v0.3.0 connector, and this plugin does not invoke them yet. The helper refuses
 existing canonical apps, validates the matching app and preserves quarantine;
@@ -244,3 +244,10 @@ built-in x64 emulation on ARM64, whereas an ARM64-only binary would not run
 on the far more common x64 hosts). Native ARM64 users get a slightly slower
 emulated binary until the plugin schema grows a per-arch key (e.g.
 `windows-arm64`) — tracked as a follow-up, not solved in this bundle.
+
+The 0.3.1 source's explicit `--local-sign` mode reuses/creates a unique stable
+local keychain identity, signs only the verified private app stage, and removes
+only that stage's quarantine. It remains a local self-signed development app,
+not an Apple-notarized artifact. `app status` stays passive. The app archive and
+connector must have the same release version. No plugin install/update may
+silently enable this operation, replace an existing Nova.app, or grant TCC.

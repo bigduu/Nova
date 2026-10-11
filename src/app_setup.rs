@@ -20,6 +20,10 @@ pub enum AppCommand {
         /// SHA256 obtained from a trusted release/catalogue (64 hex digits).
         #[arg(long)]
         sha256: String,
+        /// Explicitly reuse/create the stable local self-signing identity,
+        /// sign only the verified staged app, and remove its quarantine.
+        #[arg(long)]
+        local_sign: bool,
     },
 }
 
@@ -95,6 +99,7 @@ mod tests {
             AppCommand::Install {
                 archive: PathBuf::from("/does-not-exist.zip"),
                 sha256: "invalid".into(),
+                local_sign: false,
             },
         ] {
             assert_eq!(run(&command).state, SetupState::Unsupported);

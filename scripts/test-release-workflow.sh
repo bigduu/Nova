@@ -165,6 +165,8 @@ required_text = (
     "Developer ID",
     "notarized",
     "stapled",
+    "--local-sign",
+    "local self-signed, not Apple-notarized",
 )
 for needle in required_text:
     if needle not in text:
