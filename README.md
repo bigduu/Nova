@@ -520,10 +520,10 @@ Installation accepts a local ZIP and independently supplied SHA256. It checks
 the archive, bundle identity, both Mac CPU architectures and code signature,
 and requires the app version to match this connector. It publishes only an
 absent `~/Applications/Nova.app`, refusing any existing canonical app, symlink,
-or unsafe installation directory. App metadata and source ZIP bytes stay unchanged. By default, download
-quarantine is retained and no signing identity is accessed. SHA256 verifies the
-selected bytes; obtain it from a trusted publisher. There is no replacement or
-update command, automatic launch, or privacy grant.
+or unsafe installation directory. Source ZIP bytes stay unchanged. By default,
+app metadata and download quarantine are retained, and no signing identity is
+accessed. SHA256 verifies the selected bytes; obtain it from a trusted publisher.
+There is no replacement or update command, automatic launch, or privacy grant.
 
 For the explicitly selected local self-sign distribution path, add
 `--local-sign` to the same install command. After hash, ZIP, app identity,
@@ -542,7 +542,7 @@ match, deletes/replaces an identity, or retries partial creation automatically.
 If key import fails after certificate import, inspect the certificate-only entry
 manually before retrying. A small owned `.nova-local-sign.lock` in Keychains
 serializes this explicit operation; an active operation returns a retry error.
-The supported app layout contains only `Contents/MacOS/nova`; unexpected nested
+The supported app's only executable is `Contents/MacOS/nova`; unexpected nested
 executables are rejected before accessing the keychain.
 
 A locally signed app reports `signing: "local_self_signed"` and

@@ -139,10 +139,11 @@ The current Nova source also offers passive `nova app status` and explicit
 `nova app install --archive <local-app.zip> --sha256 <trusted-hex> [--local-sign]` for an
 initial user-level app installation. These commands are not in the published
 v0.3.0 connector, and this plugin does not invoke them yet. The helper refuses
-existing canonical apps, validates the matching app and preserves quarantine;
-it neither launches the app nor requests permissions. App upgrades/replacement
-remain separate from plugin updates. See the source README's
-[initial app setup](https://github.com/bigduu/Nova#initial-app-setup-from-source) for JSON
+existing canonical apps, validates the matching app and preserves quarantine
+unless `--local-sign` is selected. It neither launches the app nor requests TCC
+permissions; macOS may ask for access to the local signing key. App upgrades
+and replacement remain separate from plugin updates. See the source README's
+[initial app setup](https://github.com/bigduu/Nova#initial-app-setup-and-explicit-local-signing-031-source) for JSON
 states and the development-signing limitation.
 
 A URL install is verified against the bundle's checksum by default — grab the
