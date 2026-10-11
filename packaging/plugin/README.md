@@ -141,7 +141,7 @@ initial user-level app installation. These commands are not in the published
 v0.3.0 connector, and this plugin does not invoke them yet. The helper refuses
 existing canonical apps, validates the matching app and preserves quarantine
 unless `--local-sign` is selected. It neither launches the app nor requests TCC
-permissions; macOS may ask for access to the local signing key. App upgrades
+permissions or accesses a keychain. App upgrades
 and replacement remain separate from plugin updates. See the source README's
 [initial app setup](https://github.com/bigduu/Nova#initial-app-setup-and-explicit-local-signing-031-source) for JSON
 states and the development-signing limitation.
@@ -246,9 +246,12 @@ on the far more common x64 hosts). Native ARM64 users get a slightly slower
 emulated binary until the plugin schema grows a per-arch key (e.g.
 `windows-arm64`) — tracked as a follow-up, not solved in this bundle.
 
-The 0.3.1 source's explicit `--local-sign` mode reuses/creates a unique stable
-local keychain identity, signs only the verified private app stage, and removes
-only that stage's quarantine. It remains a local self-signed development app,
-not an Apple-notarized artifact. `app status` stays passive. The app archive and
-connector must have the same release version. No plugin install/update may
-silently enable this operation, replace an existing Nova.app, or grant TCC.
+The 0.3.1 source's explicit `--local-sign` option selects `local_ad_hoc` mode:
+it removes only the verified private app stage's quarantine, ad-hoc signs its
+executable and app inside out, and verifies both signatures. It never accesses
+a keychain, creates a certificate or changes trust. The result reports
+`signing: "ad_hoc"` and `development: true`, and is not Apple-notarized. A fixed
+bundle identifier does not preserve TCC grants across ad-hoc app updates.
+`app status` stays passive. The app archive and connector must have the same
+release version. No plugin install/update may silently enable this operation,
+replace an existing Nova.app, or grant TCC.

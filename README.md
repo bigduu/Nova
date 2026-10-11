@@ -525,35 +525,28 @@ app metadata and download quarantine are retained, and no signing identity is
 accessed. SHA256 verifies the selected bytes; obtain it from a trusted publisher.
 There is no replacement or update command, automatic launch, or privacy grant.
 
-For the explicitly selected local self-sign distribution path, add
+For the explicitly selected `local_ad_hoc` distribution path, add
 `--local-sign` to the same install command. After hash, ZIP, app identity,
-architecture, original signature and version checks pass, setup signs only the
-private stage and removes only its app's download quarantine. It reuses the
-unique `Zenith Nova Code Signing` identity in the current account's
-`~/Library/Keychains/login.keychain-db`, or creates it when both certificate
-and identity are absent. macOS may ask for access to that signing key; setup
-does not unlock the keychain or change its trust, search list or global ACL.
-Keep this identity: the certificate binding and fixed `com.zenith.nova`
-designated requirement give later manual builds a stable signing identity.
+architecture, original signature and version checks pass, setup removes only
+the private staged app's download quarantine and ad-hoc signs its executable
+and app, inside out, with the fixed `com.zenith.nova` identifier. It then verifies
+the signatures before initial publication. The supported app's only executable
+is `Contents/MacOS/nova`; unexpected nested executables are rejected.
 
-Certificate-only, duplicate, expired, malformed or inaccessible identities fail
-with an `error` JSON report and manual guidance. Setup never picks the first
-match, deletes/replaces an identity, or retries partial creation automatically.
-If key import fails after certificate import, inspect the certificate-only entry
-manually before retrying. A small owned `.nova-local-sign.lock` in Keychains
-serializes this explicit operation; an active operation returns a retry error.
-The supported app's only executable is `Contents/MacOS/nova`; unexpected nested
-executables are rejected before accessing the keychain.
+This mode never accesses a keychain, creates a certificate, changes certificate
+trust, or grants privacy permissions. Signing or quarantine errors return an
+`error` JSON report with manual guidance and clean up the private stage. The
+original archive and any existing canonical app remain unchanged.
 
-A locally signed app reports `signing: "local_self_signed"` and
-`development: true`; the unmodified archive reports `ad_hoc`. Neither is
-Developer ID signed or Apple-notarized, and setup does not prove desktop
-readiness or upgrade permission continuity. Status remains passive and never
-accesses the keychain. Open Nova.app through macOS and grant the permissions
-you need, then reconnect only Nova MCP; Bodhi can remain open. Existing apps,
-including `/Applications/Nova.app`, remain untouched even with `--local-sign`.
-Production Apple signing and real upgrade/TCC acceptance remain separate work
-tracked in [#36](https://github.com/bigduu/Nova/issues/36).
+Both the original development archive and a `local_ad_hoc` installation report
+`signing: "ad_hoc"` and `development: true`. Neither is Developer ID signed or
+Apple-notarized. Ad-hoc signatures depend on the app's bytes: the fixed bundle
+identifier does **not** establish TCC continuity across app updates. Status stays
+passive. Open Nova.app through macOS and grant the permissions you need, then
+reconnect only Nova MCP; Bodhi can remain open. Existing apps, including
+`/Applications/Nova.app`, remain untouched even with `--local-sign`. Production
+Apple signing, upgrades and real TCC acceptance remain separate work tracked in
+[#36](https://github.com/bigduu/Nova/issues/36).
 
 ## Permissions & code signing (macOS)
 

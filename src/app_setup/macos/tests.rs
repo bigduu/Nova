@@ -357,12 +357,11 @@ fn bundle_identity_and_signature_failures_do_not_publish() {
 
 struct RefusingSigner(std::cell::Cell<usize>);
 impl local_sign::Signer for RefusingSigner {
-    fn sign(&self, app: &Path, home: &Path) -> Result<()> {
+    fn sign(&self, app: &Path) -> Result<()> {
         self.0.set(self.0.get() + 1);
-        assert!(app.starts_with(home.join("Applications")));
         assert!(app.to_string_lossy().contains(".nova-app-setup-"));
         assert!(app.ends_with("extracted/Nova.app"));
-        anyhow::bail!("mock keychain failure; manual action required")
+        anyhow::bail!("mock signing failure; manual action required")
     }
 }
 
@@ -418,8 +417,113 @@ fn local_sign_is_never_reached_for_hash_structure_or_original_signature_failures
         &signer
     )
     .is_err());
+    // A newly signed app can have a valid outer signature while containing an
+    // unsupported nested executable. Reject its layout before local signing.
+    fs::remove_file(extraction.join("Nova.app/Contents/unsealed")).unwrap();
+    fs::copy(
+        extraction.join("Nova.app/Contents/MacOS/nova"),
+        extraction.join("Nova.app/Contents/extra"),
+    )
+    .unwrap();
+    // The copied main signature binds the app plist. Give the standalone
+    // nested fixture its own valid signature before sealing the outer app.
+    native(
+        "/usr/bin/codesign",
+        &[
+            "--force",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            "--identifier",
+            "com.zenith.nova.fixture",
+        ],
+        &[&extraction.join("Nova.app/Contents/extra")],
+    )
+    .unwrap();
+    native(
+        "/usr/bin/codesign",
+        &["--force", "--sign", "-", "--timestamp=none"],
+        &[&extraction.join(APP)],
+    )
+    .unwrap();
+    let nested = root.path().join("nested.zip");
+    native(
+        "/usr/bin/ditto",
+        &["-c", "-k", "--keepParent"],
+        &[&extraction.join(APP), &nested],
+    )
+    .unwrap();
+    let error = install_with_signer(
+        &nested,
+        &digest(&nested),
+        &locations(root.path()),
+        true,
+        &signer,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("Unexpected nested executable"),
+        "{error:#}"
+    );
     assert_eq!(signer.0.get(), 0);
     assert!(!locations(root.path()).user_app().exists());
+    assert!(staging_leftovers(root.path()).is_empty());
+}
+
+#[test]
+fn local_ad_hoc_install_signs_owned_native_fixture_and_preserves_source_archive() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = app_archive(root.path());
+    native(
+        "/usr/bin/xattr",
+        &[
+            "-w",
+            "com.apple.quarantine",
+            "0081;00000000;NovaSetupFixture;",
+        ],
+        &[&archive],
+    )
+    .unwrap();
+    let original = digest(&archive);
+    let source_quarantine = native(
+        "/usr/bin/xattr",
+        &["-p", "com.apple.quarantine"],
+        &[&archive],
+    )
+    .unwrap()
+    .stdout;
+    let locations = locations(root.path());
+    let report = install_with_signer(
+        &archive,
+        &original,
+        &locations,
+        true,
+        &local_sign::NativeSigner,
+    )
+    .unwrap();
+    assert_eq!(report.state, SetupState::Installed);
+    assert!(report.success);
+    assert_eq!(report.signing.as_deref(), Some("ad_hoc"));
+    assert_eq!(report.development, Some(true));
+    assert!(report.message.contains("local_ad_hoc"));
+    assert_eq!(digest(&archive), original);
+    assert_eq!(
+        native(
+            "/usr/bin/xattr",
+            &["-p", "com.apple.quarantine"],
+            &[&archive],
+        )
+        .unwrap()
+        .stdout,
+        source_quarantine
+    );
+    let installed = locations.user_app();
+    for path in [&installed, &installed.join("Contents/MacOS/nova")] {
+        let attrs = native("/usr/bin/xattr", &[], &[path]).unwrap();
+        assert!(!String::from_utf8_lossy(&attrs.stdout).contains("com.apple.quarantine"));
+    }
+    assert_eq!(inspect_bundle(&installed).unwrap().signing, "ad_hoc");
+    assert!(!root.path().join("Library").exists());
     assert!(staging_leftovers(root.path()).is_empty());
 }
 
@@ -448,7 +552,7 @@ fn local_sign_failure_cleans_private_stage_and_preserves_archive_and_quarantine(
     let signer = RefusingSigner(std::cell::Cell::new(0));
     let error =
         install_with_signer(&archive, &before, &locations(root.path()), true, &signer).unwrap_err();
-    assert!(error.to_string().contains("mock keychain failure"));
+    assert!(error.to_string().contains("mock signing failure"));
     assert_eq!(signer.0.get(), 1);
     assert_eq!(digest(&archive), before);
     assert_eq!(

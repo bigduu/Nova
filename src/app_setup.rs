@@ -20,8 +20,8 @@ pub enum AppCommand {
         /// SHA256 obtained from a trusted release/catalogue (64 hex digits).
         #[arg(long)]
         sha256: String,
-        /// Explicitly reuse/create the stable local self-signing identity,
-        /// sign only the verified staged app, and remove its quarantine.
+        /// Explicit local_ad_hoc mode: ad-hoc sign only the verified staged
+        /// app and remove its quarantine, without accessing any keychain.
         #[arg(long)]
         local_sign: bool,
     },

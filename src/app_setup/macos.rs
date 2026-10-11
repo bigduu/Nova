@@ -78,7 +78,7 @@ pub(super) fn run(command: &AppCommand) -> SetupReport {
             SetupState::Error,
             false,
             &format!("{error:#}"),
-            "Keep existing apps unchanged. Check the trusted archive/checksum. For --local-sign failures, inspect the login keychain manually for duplicate, expired, certificate-only or inaccessible Zenith Nova Code Signing entries; a failed creation may have imported a certificate. Do not delete/recreate the stable identity automatically. Setup never grants privacy permissions.",
+            "Keep existing apps unchanged. Check the trusted archive/checksum. For --local-sign failures, inspect the reported local ad-hoc signing error before retrying. Setup never accesses the keychain or grants privacy permissions.",
         ),
     }
 }
@@ -249,18 +249,22 @@ fn install_with_signer(
     );
     if local_sign {
         // Every archive, tree, original signature and version check above must
-        // pass before the explicit mode can access a mutable signing identity.
+        // pass before the explicit mode can change the private staged app.
         local_sign::validate_code_layout(&app)?;
-        signer.sign(&app, &locations.home)?;
+        signer.sign(&app)?;
         identity = inspect_bundle(&app)?;
         ensure!(
-            identity.signing == "local_self_signed",
-            "Local signature postcondition failed."
+            identity.signing == "ad_hoc",
+            "Local ad-hoc signature postcondition failed."
         );
     }
     publish_initial(&extracted, &applications)?;
     let mut report = identity.report(&applications.join(APP));
-    report.message = "Verified Nova.app was installed without replacing an existing app.".into();
+    report.message = if local_sign {
+        "Verified Nova.app was installed with local_ad_hoc signing without replacing an existing app."
+    } else {
+        "Verified Nova.app was installed without replacing an existing app."
+    }.into();
     Ok(report)
 }
 
@@ -448,8 +452,6 @@ impl BundleIdentity {
             "Nova.app bundle identity and code signature are valid; desktop readiness has not been tested.",
             if !compatible {
                 "Use a connector and Nova.app from the same release. Initial setup does not upgrade existing apps."
-            } else if self.signing == "local_self_signed" {
-                "This app is locally self-signed, not Apple-notarized. Open Nova.app through macOS and grant required permissions explicitly, then reconnect only Nova MCP. Keep its stable keychain identity for later manual builds; upgrade permission continuity has not been tested."
             } else if development {
                 "This is a development app, not a notarized production installation. Open Nova.app through macOS, handle any Gatekeeper prompt yourself, and grant permissions explicitly before reconnecting Nova MCP."
             } else {
@@ -537,25 +539,6 @@ fn inspect_bundle(app: &Path) -> Result<BundleIdentity> {
         .any(|line| line.starts_with("Authority=Developer ID Application:"))
     {
         "developer_id"
-    } else if signature
-        .lines()
-        .any(|line| line == format!("Authority={}", local_sign::IDENTITY_NAME))
-    {
-        let requirements = native(
-            "/usr/bin/codesign",
-            &["--display", "--requirements", "-"],
-            &[app],
-        )?;
-        let requirements = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&requirements.stdout),
-            String::from_utf8_lossy(&requirements.stderr)
-        );
-        if local_sign::has_stable_requirement(&requirements) {
-            "local_self_signed"
-        } else {
-            "other"
-        }
     } else {
         "other"
     };
