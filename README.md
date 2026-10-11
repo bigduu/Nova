@@ -494,19 +494,19 @@ which requires a universal binary and the matching Cargo version as arguments.
 > The existing universal CLI `.tar.gz` remains the supported artifact consumed
 > by Homebrew and Bamboo; the app `.zip` does not replace it.
 
-#### Initial app setup from source
+#### Initial app setup and explicit local signing (0.3.1 source)
 
 The current source adds `nova app status` and an explicit initial installer:
 
 ```sh
 nova app status
-nova app install --archive /absolute/path/to/nova-v0.3.0-universal-apple-darwin-development-app.zip \
+nova app install --archive /absolute/path/to/nova-v0.3.1-universal-apple-darwin-development-app.zip \
   --sha256 <64-hex-digits-from-a-trusted-release-or-catalogue>
 ```
 
 These commands are **not included in the already published v0.3.0 connector**.
-Build this source to use them; installing the existing Bamboo plugin does not
-invoke them or install Nova.app automatically.
+Build this source or use the matching 0.3.1 release when published; installing
+the existing v0.3.0 Bamboo plugin does not invoke setup or install Nova.app.
 
 Both commands print one JSON report with `state`, `success`, `message`, and
 `next_action`; valid apps also report their path, version, signing type,
@@ -520,16 +520,33 @@ Installation accepts a local ZIP and independently supplied SHA256. It checks
 the archive, bundle identity, both Mac CPU architectures and code signature,
 and requires the app version to match this connector. It publishes only an
 absent `~/Applications/Nova.app`, refusing any existing canonical app, symlink,
-or unsafe installation directory. Download quarantine and app metadata are
-retained. The archive stays unchanged. There is no replacement/update command
-and no automatic signing, quarantine removal, Gatekeeper bypass, or privacy
-grant. SHA256 verifies the selected bytes; obtain it from a trusted publisher.
+or unsafe installation directory. Source ZIP bytes stay unchanged. By default,
+app metadata and download quarantine are retained, and no signing identity is
+accessed. SHA256 verifies the selected bytes; obtain it from a trusted publisher.
+There is no replacement or update command, automatic launch, or privacy grant.
 
-An ad-hoc signed app stays labelled as a development artifact. This helper does
-not establish notarization or desktop readiness. Open Nova.app through macOS
-and explicitly grant the permissions you need, then reconnect only Nova MCP;
-Bodhi can remain open. Production signing, upgrades, and TCC continuity remain
-separate work tracked in [#36](https://github.com/bigduu/Nova/issues/36).
+For the explicitly selected `local_ad_hoc` distribution path, add
+`--local-sign` to the same install command. After hash, ZIP, app identity,
+architecture, original signature and version checks pass, setup removes only
+the private staged app's download quarantine and ad-hoc signs its executable
+and app, inside out, with the fixed `com.zenith.nova` identifier. It then verifies
+the signatures before initial publication. The supported app's only executable
+is `Contents/MacOS/nova`; unexpected nested executables are rejected.
+
+This mode never accesses a keychain, creates a certificate, changes certificate
+trust, or grants privacy permissions. Signing or quarantine errors return an
+`error` JSON report with manual guidance and clean up the private stage. The
+original archive and any existing canonical app remain unchanged.
+
+Both the original development archive and a `local_ad_hoc` installation report
+`signing: "ad_hoc"` and `development: true`. Neither is Developer ID signed or
+Apple-notarized. Ad-hoc signatures depend on the app's bytes: the fixed bundle
+identifier does **not** establish TCC continuity across app updates. Status stays
+passive. Open Nova.app through macOS and grant the permissions you need, then
+reconnect only Nova MCP; Bodhi can remain open. Existing apps, including
+`/Applications/Nova.app`, remain untouched even with `--local-sign`. Production
+Apple signing, upgrades and real TCC acceptance remain separate work tracked in
+[#36](https://github.com/bigduu/Nova/issues/36).
 
 ## Permissions & code signing (macOS)
 

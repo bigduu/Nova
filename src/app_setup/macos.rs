@@ -11,6 +11,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod local_sign;
+
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -76,12 +78,20 @@ pub(super) fn run(command: &AppCommand) -> SetupReport {
             SetupState::Error,
             false,
             &format!("{error:#}"),
-            "Keep existing apps unchanged. Check the trusted archive/checksum and retry; setup never bypasses Gatekeeper or privacy permissions.",
+            "Keep existing apps unchanged. Check the trusted archive/checksum. For --local-sign failures, inspect the reported local ad-hoc signing error before retrying. Setup never accesses the keychain or grants privacy permissions.",
         ),
     }
 }
 
 fn execute(command: &AppCommand, locations: &Locations) -> Result<SetupReport> {
+    execute_with_signer(command, locations, &local_sign::NativeSigner)
+}
+
+fn execute_with_signer(
+    command: &AppCommand,
+    locations: &Locations,
+    signer: &dyn local_sign::Signer,
+) -> Result<SetupReport> {
     let user_app = locations.user_app();
     let applications = user_app.parent().context("Missing Applications parent")?;
     if fs::symlink_metadata(applications).is_ok() {
@@ -118,7 +128,11 @@ fn execute(command: &AppCommand, locations: &Locations) -> Result<SetupReport> {
             report.path = Some(user_app);
             Ok(report)
         }
-        AppCommand::Install { archive, sha256 } => install(archive, sha256, locations),
+        AppCommand::Install {
+            archive,
+            sha256,
+            local_sign,
+        } => install_with_signer(archive, sha256, locations, *local_sign, signer),
     }
 }
 
@@ -139,7 +153,24 @@ fn validate_owned_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn install(archive: &Path, expected: &str, locations: &Locations) -> Result<SetupReport> {
+    install_with_signer(
+        archive,
+        expected,
+        locations,
+        false,
+        &local_sign::NativeSigner,
+    )
+}
+
+fn install_with_signer(
+    archive: &Path,
+    expected: &str,
+    locations: &Locations,
+    local_sign: bool,
+    signer: &dyn local_sign::Signer,
+) -> Result<SetupReport> {
     ensure!(
         expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "SHA256 must be exactly 64 hexadecimal digits."
@@ -209,16 +240,31 @@ fn install(archive: &Path, expected: &str, locations: &Locations) -> Result<Setu
         &[&canonical_path, &extracted],
     )?;
     let app = extracted.join(APP);
-    let identity = inspect_bundle(&app)?;
+    let mut identity = inspect_bundle(&app)?;
     ensure!(
         identity.version == env!("CARGO_PKG_VERSION"),
         "App version {} does not match this connector ({}). Obtain a matching release.",
         identity.version,
         env!("CARGO_PKG_VERSION")
     );
+    if local_sign {
+        // Every archive, tree, original signature and version check above must
+        // pass before the explicit mode can change the private staged app.
+        local_sign::validate_code_layout(&app)?;
+        signer.sign(&app)?;
+        identity = inspect_bundle(&app)?;
+        ensure!(
+            identity.signing == "ad_hoc",
+            "Local ad-hoc signature postcondition failed."
+        );
+    }
     publish_initial(&extracted, &applications)?;
     let mut report = identity.report(&applications.join(APP));
-    report.message = "Verified Nova.app was installed without replacing an existing app.".into();
+    report.message = if local_sign {
+        "Verified Nova.app was installed with local_ad_hoc signing without replacing an existing app."
+    } else {
+        "Verified Nova.app was installed without replacing an existing app."
+    }.into();
     Ok(report)
 }
 

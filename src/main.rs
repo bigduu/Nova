@@ -1147,7 +1147,28 @@ mod cli_tests {
             &"a".repeat(64),
         ])
         .is_ok());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "nova",
+                "app",
+                "install",
+                "--archive",
+                "/tmp/app.zip",
+                "--sha256",
+                &"a".repeat(64),
+                "--local-sign"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::App {
+                command: nova::app_setup::AppCommand::Install {
+                    local_sign: true,
+                    ..
+                }
+            })
+        ));
         for arguments in [
+            vec!["nova", "app", "status", "--local-sign"],
             vec!["nova", "app", "install"],
             vec!["nova", "app", "install", "--archive", "/tmp/app.zip"],
             vec!["nova", "app", "status", "--destination", "/tmp/other"],

@@ -162,6 +162,12 @@ jobs:
             > is a **DEVELOPMENT ONLY** preview. It is ad-hoc signed and is not
             > Developer ID signed, notarized, or stapled. Expect Gatekeeper/TCC
             > friction; do not treat this app archive as a production release.
+            > The matching CLI supports explicit initial `nova app install
+            > --archive <local-zip> --sha256 <trusted-sha256> --local-sign`.
+            > This selects local_ad_hoc mode: remove only the verified staged
+            > app's quarantine and ad-hoc re-sign it without keychain access.
+            > It is not Apple-notarized and does not establish TCC upgrade
+            > continuity; existing apps are not replaced.
           files: |
             ${{ steps.pkg.outputs.asset }}
             ${{ steps.pkg.outputs.asset }}.sha256

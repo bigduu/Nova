@@ -136,13 +136,14 @@ connection error, with no fallback to running desktop tools inside Bamboo/Bodhi.
 Windows needs no separate Nova.app installation.
 
 The current Nova source also offers passive `nova app status` and explicit
-`nova app install --archive <local-app.zip> --sha256 <trusted-hex>` for an
+`nova app install --archive <local-app.zip> --sha256 <trusted-hex> [--local-sign]` for an
 initial user-level app installation. These commands are not in the published
 v0.3.0 connector, and this plugin does not invoke them yet. The helper refuses
-existing canonical apps, validates the matching app and preserves quarantine;
-it neither launches the app nor requests permissions. App upgrades/replacement
-remain separate from plugin updates. See the source README's
-[initial app setup](https://github.com/bigduu/Nova#initial-app-setup-from-source) for JSON
+existing canonical apps, validates the matching app and preserves quarantine
+unless `--local-sign` is selected. It neither launches the app nor requests TCC
+permissions or accesses a keychain. App upgrades
+and replacement remain separate from plugin updates. See the source README's
+[initial app setup](https://github.com/bigduu/Nova#initial-app-setup-and-explicit-local-signing-031-source) for JSON
 states and the development-signing limitation.
 
 A URL install is verified against the bundle's checksum by default — grab the
@@ -244,3 +245,13 @@ built-in x64 emulation on ARM64, whereas an ARM64-only binary would not run
 on the far more common x64 hosts). Native ARM64 users get a slightly slower
 emulated binary until the plugin schema grows a per-arch key (e.g.
 `windows-arm64`) — tracked as a follow-up, not solved in this bundle.
+
+The 0.3.1 source's explicit `--local-sign` option selects `local_ad_hoc` mode:
+it removes only the verified private app stage's quarantine, ad-hoc signs its
+executable and app inside out, and verifies both signatures. It never accesses
+a keychain, creates a certificate or changes trust. The result reports
+`signing: "ad_hoc"` and `development: true`, and is not Apple-notarized. A fixed
+bundle identifier does not preserve TCC grants across ad-hoc app updates.
+`app status` stays passive. The app archive and connector must have the same
+release version. No plugin install/update may silently enable this operation,
+replace an existing Nova.app, or grant TCC.

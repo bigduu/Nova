@@ -165,6 +165,10 @@ required_text = (
     "Developer ID",
     "notarized",
     "stapled",
+    "--local-sign",
+    "local_ad_hoc mode",
+    "without keychain access",
+    "not Apple-notarized",
 )
 for needle in required_text:
     if needle not in text:
