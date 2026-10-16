@@ -1,5 +1,7 @@
 # Never publish a locally-downloaded binary — it's fetched per-version on
-# install. Only the launcher, installer, and README ship (see package.json
-# "files", which is the real allowlist; this is belt-and-braces).
+# install. Only the launcher, installer, README, and LICENSE ship (see
+# package.json "files", which is the real allowlist; this is belt-and-braces).
 bin/nova
+bin/nova.exe
 *.tar.gz
+*.zip

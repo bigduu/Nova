@@ -6,8 +6,9 @@ name: Release
 # the same arm64 + x86_64 binary. In parallel, it also builds real (linked, not
 # just checked) Windows exes for x86_64 + aarch64 and attaches those to the same
 # Release as .zip + .sha256 — see the `build-windows`/`release-windows` jobs
-# below. Windows has no Homebrew/npm equivalent here; it is release-artifact-
-# only (consumed by URL+checksum, e.g. by a plugin manifest).
+# below. The npm launcher (npm/install.js) downloads the matching Windows zip
+# on win32 x64 and ARM64. Homebrew remains macOS-only. Plugin manifests still
+# consume the archives by URL+checksum.
 # Finally, `plugin-manifest` fills in the committed `packaging/plugin/plugin.json`
 # template with this release's real version + archive checksums and publishes
 # it (bare, and as a `nova-plugin-v<ver>.tar.gz` bundle with the `skills/`
