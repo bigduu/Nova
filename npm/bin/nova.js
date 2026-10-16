@@ -12,17 +12,17 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync, execFileSync } = require("child_process");
-
-const BIN = path.join(__dirname, "nova");
+const { releaseFor, unsupportedMessage, binaryPath } = require("../install.js");
 
 function die(msg) {
   process.stderr.write(`[nova] ${msg}\n`);
   process.exit(1);
 }
 
-if (os.platform() !== "darwin") {
-  die("Nova runs on macOS only (it uses ScreenCaptureKit / Accessibility).");
-}
+const release = releaseFor(os.platform(), os.arch());
+if (!release) die(unsupportedMessage(os.platform(), os.arch()));
+
+const BIN = binaryPath(release.binaryName);
 
 if (!fs.existsSync(BIN)) {
   // Run the postinstall downloader synchronously, then continue.
@@ -30,7 +30,9 @@ if (!fs.existsSync(BIN)) {
     execFileSync(process.execPath, [path.join(__dirname, "..", "install.js")], { stdio: "inherit" });
   } catch {}
   if (!fs.existsSync(BIN)) {
-    die("the Nova binary is missing and could not be downloaded — check your network or install manually from https://github.com/bigduu/Nova/releases");
+    die(
+      "the Nova binary is missing and could not be downloaded — check your network or install manually from https://github.com/bigduu/Nova/releases",
+    );
   }
 }
 

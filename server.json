@@ -7,5 +7,15 @@
     "source": "github"
   },
   "version": "0.3.1",
-  "websiteUrl": "https://github.com/bigduu/Nova#install"
+  "websiteUrl": "https://github.com/bigduu/Nova#install",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@bigduu/nova",
+      "version": "0.3.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
 }

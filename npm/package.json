@@ -1,10 +1,11 @@
 {
   "name": "@bigduu/nova",
-  "version": "0.3.0",
-  "description": "Computer Use MCP server \u2014 macOS desktop control for LLM agents (screenshots, mouse, keyboard, windows). npx launcher that fetches the prebuilt universal binary.",
+  "version": "0.3.1",
+  "description": "Computer Use MCP server for macOS and Windows. npx launcher that downloads the matching prebuilt GitHub Release binary.",
   "keywords": [
     "mcp",
     "macos",
+    "windows",
     "computer-use",
     "automation",
     "screenshot",
@@ -13,7 +14,8 @@
   "homepage": "https://github.com/bigduu/Nova",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bigduu/Nova.git"
+    "url": "git+https://github.com/bigduu/Nova.git",
+    "directory": "npm"
   },
   "license": "MIT",
   "bin": {
@@ -25,13 +27,22 @@
   "files": [
     "bin/nova.js",
     "install.js",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "os": [
-    "darwin"
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
   ],
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "mcpName": "io.github.bigduu/nova"
 }

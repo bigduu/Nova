@@ -49,6 +49,31 @@ nova --version
 权限。用 `which nova` 查看下面配置要填的路径：Apple Silicon 通常是
 `/opt/homebrew/bin/nova`，Intel Mac 通常是 `/usr/local/bin/nova`。
 
+**npm（macOS 和 Windows）：** macOS 上仍然推荐 Homebrew。`@bigduu/nova`（包版本
+0.3.1）是一个 Node 启动器，会下载对应的
+[v0.3.1](https://github.com/bigduu/Nova/releases/tag/v0.3.1) GitHub Release
+二进制：macOS universal，或 Windows x64 / ARM64。它不会安装 Linux 桌面二进制。
+MCP Registry 名称是 `io.github.bigduu/nova`。
+
+```sh
+npx @bigduu/nova --version
+npm i -g @bigduu/nova
+```
+
+MCP 客户端如果不能回答安装提示，请给 `npx` 加上 `-y`：
+
+```json
+{
+  "mcpServers": {
+    "nova": { "command": "npx", "args": ["-y", "@bigduu/nova"] }
+  }
+}
+```
+
+启动器会先核对 release 压缩包的 `.sha256`，再写入 `nova` 或 `nova.exe`。macOS
+二进制是 ad-hoc 签名，没有公证。Windows 二进制没有 Authenticode 签名，首次运行时
+SmartScreen 可能会提示。
+
 **手动下载：**从同一个 release 下载对应的 `.sha256` 文件，校验压缩包后再解压。macOS 上：
 
 ```sh
@@ -70,7 +95,8 @@ cargo build --release --locked
 ```
 
 macOS 上产物是 `target/release/nova`，Windows 上是 `target/release/nova.exe`。不要用
-`cargo install nova`：crates.io 上的这个名字属于另一个不相关的项目。Nova 没有发布到 npm。
+`cargo install nova`：crates.io 上的这个名字属于另一个不相关的项目。npm 包名是
+`@bigduu/nova`（见上文）。
 
 ## 选择版本
 

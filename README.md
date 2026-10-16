@@ -56,6 +56,31 @@ MCP client or grant macOS permissions. Run `which nova` to find the path to use
 below: usually `/opt/homebrew/bin/nova` on Apple Silicon and
 `/usr/local/bin/nova` on Intel Macs.
 
+**npm (macOS and Windows):** Homebrew stays the recommended macOS install.
+`@bigduu/nova` (package version 0.3.1) is a Node launcher that downloads the
+matching [v0.3.1](https://github.com/bigduu/Nova/releases/tag/v0.3.1) GitHub
+Release binary: universal macOS, or Windows x64 / ARM64. It does not install a
+Linux desktop binary. The MCP Registry name is `io.github.bigduu/nova`.
+
+```sh
+npx @bigduu/nova --version
+npm i -g @bigduu/nova
+```
+
+An MCP client that cannot answer an install prompt should call `npx` with `-y`:
+
+```json
+{
+  "mcpServers": {
+    "nova": { "command": "npx", "args": ["-y", "@bigduu/nova"] }
+  }
+}
+```
+
+The launcher checks the release archive's `.sha256` before writing `nova` or
+`nova.exe`. The macOS binary is ad-hoc signed, not notarized. Windows binaries
+are not Authenticode-signed, so SmartScreen may warn on first run.
+
 **Manual download:** download the matching `.sha256` file from the same release
 and verify the archive before extracting it. On macOS:
 
@@ -80,7 +105,7 @@ cargo build --release --locked
 
 The result is `target/release/nova` on macOS or `target/release/nova.exe` on
 Windows. Do not use `cargo install nova`: that crates.io name belongs to an
-unrelated project. Nova is not published on npm.
+unrelated project. The npm package is `@bigduu/nova` (see above).
 
 ## Choose a version
 
