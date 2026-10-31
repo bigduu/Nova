@@ -207,10 +207,24 @@ if guard_index > upload_index:
     raise SystemExit("the immutability guard must run before the first upload")
 
 guard_step = build_steps[guard_index]
-if guard_step.get("env", {}).get("RELEASE_VERIFY_REPO") != "${{ github.repository }}":
+guard_env = guard_step.get("env", {})
+if guard_env.get("RELEASE_VERIFY_REPO") != "${{ github.repository }}":
     raise SystemExit("the immutability guard is not scoped to this repository")
 if "verify-release-immutable.sh" not in str(guard_step.get("run", "")):
     raise SystemExit("the immutability guard does not invoke its script")
+
+# The guard shells out to `gh`, which does NOT reuse the checkout's git
+# credentials, and this workflow configures no CLI host. Without a token every
+# lookup fails, and the guard's fail-closed branch would then block publishing
+# even a brand-new tag — so the token is part of the contract, not a detail.
+if "GH_TOKEN" not in guard_env:
+    raise SystemExit(
+        "the immutability guard does not pass GH_TOKEN; gh would be unauthenticated"
+    )
+if "github.token" not in str(guard_env["GH_TOKEN"]):
+    raise SystemExit(
+        f"the immutability guard GH_TOKEN is not the workflow token: {guard_env['GH_TOKEN']}"
+    )
 
 # Parse-check every bash/default-shell run block. PowerShell blocks are skipped.
 for job_name, job in jobs.items():
@@ -587,6 +601,17 @@ grep -F "now broken" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
 # An unverifiable lookup must fail closed rather than authorize a publish.
 expect_immutable_exit 1 'gh: Bad credentials (HTTP 401)' 1 v9.9.9
 grep -F "could not determine" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+
+# A missing token must be diagnosed as an authentication problem, not reported
+# as a policy refusal — otherwise a misconfigured workflow silently blocks every
+# release, including brand-new tags. `gh` emits this when GH_TOKEN is unset.
+expect_immutable_exit 1 \
+  'To get started with GitHub CLI, please run:  gh auth login
+Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.' \
+  1 v9.9.9
+grep -F "could not authenticate; publishing is blocked" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "GH_TOKEN" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "does not authenticate the CLI" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
 
 # Usage errors are distinct from a policy refusal.
 expect_immutable_exit 2 '{}' 0

@@ -68,6 +68,16 @@ if [[ $STATUS -ne 0 ]]; then
     echo "No release exists for $TAG; nothing to overwrite."
     exit 0
   fi
+  # An unauthenticated CLI is a configuration bug, not a policy decision: say so
+  # explicitly, because the fail-closed branch would otherwise look identical to
+  # a genuine refusal and block every release.
+  if grep -qiE "gh auth login|GH_TOKEN|GITHUB_TOKEN|authentication" <<<"$RESPONSE"; then
+    refuse \
+      "the release guard could not authenticate; publishing is blocked" \
+      "$(grep -viE '^$' <<<"$RESPONSE" | head -1)" \
+      "Set GH_TOKEN on this step (e.g. GH_TOKEN: \${{ github.token }});" \
+      "the workflow's contents:write permission does not authenticate the CLI."
+  fi
   # Fail closed: an unverifiable state must not authorize a publish.
   refuse \
     "could not determine whether $TAG already has a published release" \
