@@ -150,6 +150,27 @@ jobs:
           RELEASE_VERIFY_REMOTE: origin
         run: scripts/verify-release-tag.sh "$RELEASE_TAG"
 
+      # Source identity is pinned above; this pins ARTIFACT identity. Consumers
+      # (Bamboo, Homebrew, npm, plugin manifests) pin these assets by SHA-256, so
+      # re-uploading a same-named file to an existing release silently breaks
+      # every pinned checksum — exactly what happened when v0.3.1's assets were
+      # replaced on 2026-10-25. This rejects that before anything is uploaded.
+      #
+      # Only this job runs it: later jobs legitimately attach to the release this
+      # job just created and would otherwise see their own published assets.
+      # A partial run must ship the next patch version rather than re-upload.
+      #
+      # GH_TOKEN is required: `gh` does not reuse the checkout's git credentials
+      # and this workflow configures no CLI host, so without a token every lookup
+      # fails — and the guard's fail-closed branch would then block publishing
+      # even a brand-new tag.
+      - name: Refuse to replace already-published assets
+        env:
+          RELEASE_TAG: ${{ needs.release-meta.outputs.tag }}
+          RELEASE_VERIFY_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/verify-release-immutable.sh "$RELEASE_TAG"
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v3
         with:

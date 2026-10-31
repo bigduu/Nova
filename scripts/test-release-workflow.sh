@@ -11,6 +11,7 @@ WORKFLOW="$ROOT/.github/workflows/release.yml"
 
 bash -n \
   "$ROOT/packaging/macos/package-development-app.sh" \
+  "$ROOT/scripts/verify-release-immutable.sh" \
   "$ROOT/scripts/verify-release-tag.sh"
 
 # Keep the committed master artwork suitable for the largest macOS icon
@@ -174,6 +175,57 @@ for needle in required_text:
     if needle not in text:
         raise SystemExit(f"release.yml is missing required contract text: {needle}")
 
+# Published asset bytes are immutable: the guard must run in `build`, which owns
+# a release's first upload, and immediately before that upload. Later jobs
+# legitimately attach to the release `build` just created, so running the guard
+# there would reject their own published assets.
+guard_jobs = [
+    job_name
+    for job_name, job in jobs.items()
+    if any(
+        step.get("name") == "Refuse to replace already-published assets"
+        for step in job.get("steps", [])
+    )
+]
+if guard_jobs != ["build"]:
+    raise SystemExit(
+        f"the immutability guard must run only in the build job: {guard_jobs}"
+    )
+
+build_steps = jobs["build"].get("steps", [])
+guard_index = next(
+    index
+    for index, step in enumerate(build_steps)
+    if step.get("name") == "Refuse to replace already-published assets"
+)
+upload_index = next(
+    index
+    for index, step in enumerate(build_steps)
+    if str(step.get("uses", "")).startswith("softprops/action-gh-release@")
+)
+if guard_index > upload_index:
+    raise SystemExit("the immutability guard must run before the first upload")
+
+guard_step = build_steps[guard_index]
+guard_env = guard_step.get("env", {})
+if guard_env.get("RELEASE_VERIFY_REPO") != "${{ github.repository }}":
+    raise SystemExit("the immutability guard is not scoped to this repository")
+if "verify-release-immutable.sh" not in str(guard_step.get("run", "")):
+    raise SystemExit("the immutability guard does not invoke its script")
+
+# The guard shells out to `gh`, which does NOT reuse the checkout's git
+# credentials, and this workflow configures no CLI host. Without a token every
+# lookup fails, and the guard's fail-closed branch would then block publishing
+# even a brand-new tag — so the token is part of the contract, not a detail.
+if "GH_TOKEN" not in guard_env:
+    raise SystemExit(
+        "the immutability guard does not pass GH_TOKEN; gh would be unauthenticated"
+    )
+if "github.token" not in str(guard_env["GH_TOKEN"]):
+    raise SystemExit(
+        f"the immutability guard GH_TOKEN is not the workflow token: {guard_env['GH_TOKEN']}"
+    )
+
 # Parse-check every bash/default-shell run block. PowerShell blocks are skipped.
 for job_name, job in jobs.items():
     for index, step in enumerate(job.get("steps", [])):
@@ -191,7 +243,6 @@ for job_name, job in jobs.items():
 
 print(f"release workflow YAML/DAG/shell checks passed ({len(jobs)} jobs)")
 PY
-
 # The development app is additive. These three existing distribution paths
 # must continue to resolve the original universal CLI tarball name.
 grep -F 'nova-v${VERSION}-universal-apple-darwin.tar.gz' "$ROOT/npm/install.js" >/dev/null
@@ -491,3 +542,78 @@ diff -u "$TEST_DIRECTORY/expected-thin-lipo.log" "$THIN_LIPO_LOG"
 [[ ! -e "$THIN_OUTPUT/nova-v1.2.3-universal-apple-darwin-development-app.zip" ]]
 
 echo "mock Nova.app assembly/signing/archive and thin-binary rejection checks passed"
+
+# ── Published release assets are immutable ────────────────────────────────
+# Consumers (Bamboo, Homebrew, npm, plugin manifests) pin asset bytes by
+# SHA-256. Replacing an asset on an existing release silently breaks every one
+# of them, which is exactly what happened when v0.3.1's assets were re-uploaded
+# on 2026-10-25. Exercise the guard hermetically by stubbing `gh`.
+IMMUTABLE_BIN="$TEST_DIRECTORY/immutable-bin"
+mkdir -p "$IMMUTABLE_BIN"
+cat > "$IMMUTABLE_BIN/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  api) printf '%s' "$MOCK_GH_BODY"; exit "${MOCK_GH_EXIT:-0}" ;;
+  *) echo "mock gh: unsupported invocation: $*" >&2; exit 64 ;;
+esac
+MOCK_GH
+chmod +x "$IMMUTABLE_BIN/gh"
+
+# expect_immutable_exit <expected-exit> <body> <gh-exit> [args...]
+expect_immutable_exit() {
+  local expected="$1" body="$2" gh_exit="$3"
+  shift 3
+  local stderr_file="$TEST_DIRECTORY/immutable-stderr"
+  local actual=0
+  PATH="$IMMUTABLE_BIN:$PATH" \
+  MOCK_GH_BODY="$body" MOCK_GH_EXIT="$gh_exit" \
+  RELEASE_VERIFY_REPO="bigduu/Nova" \
+    "$ROOT/scripts/verify-release-immutable.sh" "$@" >/dev/null 2>"$stderr_file" || actual=$?
+  if [[ "$actual" != "$expected" ]]; then
+    echo "error: verify-release-immutable.sh $* exited $actual, expected $expected" >&2
+    cat "$stderr_file" >&2
+    exit 1
+  fi
+}
+
+# A brand-new tag has nothing to overwrite.
+expect_immutable_exit 0 'gh: Not Found (HTTP 404)' 1 v9.9.9
+# A draft is not published yet, so resuming one is legitimate.
+expect_immutable_exit 0 '{"draft":true,"assets":[{"name":"a.tar.gz"}]}' 0 v9.9.9
+# Published with no assets: nothing to replace.
+expect_immutable_exit 0 '{"draft":false,"assets":[]}' 0 v9.9.9
+
+# The regression: a published release whose assets already exist must refuse.
+expect_immutable_exit 1 \
+  '{"draft":false,"assets":[{"name":"nova-v9.9.9-universal-apple-darwin.tar.gz"},{"name":"nova-v9.9.9-universal-apple-darwin-development-app.zip"}]}' \
+  0 v9.9.9
+grep -F "already published with 2 asset(s); refusing to replace them" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "nova-v9.9.9-universal-apple-darwin.tar.gz" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F -- "--allow-asset-replace" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+
+# Deliberate replacement stays possible, but announces the breakage.
+expect_immutable_exit 0 \
+  '{"draft":false,"assets":[{"name":"nova-v9.9.9-universal-apple-darwin.tar.gz"}]}' \
+  0 v9.9.9 --allow-asset-replace
+grep -F "explicitly allowed" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "now broken" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+
+# An unverifiable lookup must fail closed rather than authorize a publish.
+expect_immutable_exit 1 'gh: Bad credentials (HTTP 401)' 1 v9.9.9
+grep -F "could not determine" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+
+# A missing token must be diagnosed as an authentication problem, not reported
+# as a policy refusal — otherwise a misconfigured workflow silently blocks every
+# release, including brand-new tags. `gh` emits this when GH_TOKEN is unset.
+expect_immutable_exit 1 \
+  'To get started with GitHub CLI, please run:  gh auth login
+Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.' \
+  1 v9.9.9
+grep -F "could not authenticate; publishing is blocked" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "GH_TOKEN" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+grep -F "does not authenticate the CLI" "$TEST_DIRECTORY/immutable-stderr" >/dev/null
+
+# Usage errors are distinct from a policy refusal.
+expect_immutable_exit 2 '{}' 0
+expect_immutable_exit 2 '{}' 0 v9.9.9 --bogus-flag
+echo "published-asset immutability guard checks passed"
