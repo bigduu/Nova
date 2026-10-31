@@ -95,6 +95,25 @@ On Windows, extract the archive for the machine's architecture and invoke
 not Authenticode-signed, so SmartScreen may warn on first run. The macOS binary
 is ad-hoc signed, not notarized.
 
+**Published release assets never change.** Every consumer pins these files by
+SHA-256 — Homebrew and npm formulas, Bamboo's plugin catalogue (bundle, manifest,
+per-platform executable and app archive digests), and any manual `--sha256`
+install. Re-uploading a same-named asset to an existing release would silently
+break all of them, so the release workflow refuses to publish when the tag
+already has assets:
+
+```
+error: v0.3.1 was already published with 2 asset(s); refusing to replace them.
+```
+
+A re-cut ships a **new version tag** (bump the patch version) rather than
+replacing bytes under the old one. Deliberately replacing an existing release's
+assets requires `scripts/verify-release-immutable.sh <tag>
+--allow-asset-replace`, which warns that every pinned consumer is now broken.
+Because a tag's assets are immutable, an already-published release can no longer
+be re-run to add missing files: if a partial publish happened, ship the next
+patch version. Draft releases are exempt, since a draft is not published yet.
+
 **Build from source:**
 
 ```sh
